@@ -1286,6 +1286,11 @@ static bool handle_admin_join(const zdb_http_request *req,
     int rc = zdb_cluster_join(g_cluster, addr->valuestring,
                               port->valueint);
     cJSON_Delete(body);
+    if (rc == -2) {
+        respond_error(res, 409, "rebalance in progress: one node may"
+                                " join at a time; retry later");
+        return true;
+    }
     if (rc != 0) {
         respond_error(res, 502, "cannot reach seed peer");
         return true;

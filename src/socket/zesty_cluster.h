@@ -94,7 +94,9 @@ const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex);
 /* Contacts seed_addr:seed_port, exchanges membership so both sides join
  * the same mesh, then returns. The persistent mesh connection is
  * re-established by the background maintainer afterwards. Returns 0 on
- * success. Blocks up to a few seconds. */
+ * success, -1 when the seed is unreachable, -2 when the seed refused
+ * because a rebalance wave is pending (one join at a time; retry after
+ * the wave completes). Blocks up to a few seconds. */
 int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port);
 
 /* Installs a per-cluster dispatcher for inbound REPL/QUERY frames.

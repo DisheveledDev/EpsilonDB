@@ -10,16 +10,22 @@
  *
  * Stage 4 types carry membership gossip. Stage 5 adds request/reply
  * pairs for data replication: REPL/ACK for writes, QUERY/RESULT for
- * quorum reads. Every connection still starts with HELLO.
+ * quorum reads. Stage 6b adds SNAP_REQ/SNAP_DATA for shard snapshot
+ * transfer (raw file bytes, not JSON). Every connection still starts
+ * with HELLO.
  */
 
 #ifndef ZSTP_WIRE_H
 #define ZSTP_WIRE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #define ZSTP_VERSION      1
 #define ZSTP_HEADER_SIZE  10
+/* JSON payloads stay well under this; SNAP_DATA frames carry raw shard
+ * file bytes up to the cap, chunked by the sender when a shard is
+ * bigger. 4 MB keeps a single frame within sane socket buffer sizes. */
 #define ZSTP_MAX_PAYLOAD  (4 * 1024 * 1024)
 
 typedef enum {
@@ -28,7 +34,10 @@ typedef enum {
     ZSTP_REPL   = 3,   /* replicate a write; answered by ACK */
     ZSTP_ACK    = 4,   /* acknowledgement of a REPL frame */
     ZSTP_QUERY  = 5,   /* quorum read request; answered by RESULT */
-    ZSTP_RESULT = 6    /* answer to a QUERY frame */
+    ZSTP_RESULT = 6,   /* answer to a QUERY frame */
+    ZSTP_SNAP_REQ  = 7, /* {key} request a shard snapshot */
+    ZSTP_SNAP_DATA = 8, /* raw shard bytes; empty payload = EOF */
+    ZSTP_SNAP_ACK  = 9  /* {ok:bool} end of transfer status */
 } zstp_type;
 
 /* Sends one framed message. send_lock (optional) serialises writes on a
@@ -40,6 +49,11 @@ int zstp_send_frame(int fd, zstp_type type, const char *json,
  * terminated buffer the caller frees (NULL when plen == 0). Returns the
  * message type, or -1 on EOF/protocol error. */
 int zstp_recv_frame(int fd, char **payload_out);
+
+/* Reads one framed message like zstp_recv_frame but also returns the
+ * raw payload byte count in *plen_out (JSON frames are NUL-terminated on
+ * top of that; SNAP_DATA frames are binary and not NUL-terminated). */
+int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out);
 
 /* True when the type byte is a known message type. */
 bool zstp_type_valid(int type);

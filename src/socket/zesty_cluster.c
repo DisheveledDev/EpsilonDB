@@ -166,7 +166,7 @@ static int read_full(int fd, void *buf, size_t len)
 
 bool zstp_type_valid(int type)
 {
-    return type >= ZSTP_HELLO && type <= ZSTP_RESULT;
+    return type >= ZSTP_HELLO && type <= ZSTP_SNAP_ACK;
 }
 
 static zstp_dispatch_fn g_dispatcher;
@@ -209,9 +209,12 @@ int zstp_send_frame(int fd, zstp_type type, const char *json,
     return rc;
 }
 
-int zstp_recv_frame(int fd, char **payload_out)
+int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
 {
     *payload_out = NULL;
+    if (plen_out) {
+        *plen_out = 0;
+    }
     unsigned char hdr[ZSTP_HEADER_SIZE];
     if (read_full(fd, hdr, sizeof(hdr)) != 0) {
         return -1;
@@ -229,7 +232,7 @@ int zstp_recv_frame(int fd, char **payload_out)
     }
     char *payload = NULL;
     if (plen) {
-        payload = malloc(plen + 1);
+        payload = malloc((size_t)plen + 1);
         if (!payload) {
             return -1;
         }
@@ -240,7 +243,15 @@ int zstp_recv_frame(int fd, char **payload_out)
         payload[plen] = '\0';
     }
     *payload_out = payload;
+    if (plen_out) {
+        *plen_out = plen;
+    }
     return hdr[5];
+}
+
+int zstp_recv_frame(int fd, char **payload_out)
+{
+    return zstp_recv_frame_raw(fd, payload_out, NULL);
 }
 
 int zstp_dial(const char *addr, int port)
@@ -458,6 +469,15 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                 }
             }
         }
+        /* a live table promoted to this generation supersedes any
+         * pending target of the same or older generation: the wave is
+         * over, so drop our stale copy (otherwise it would be gossiped
+         * back to the leader forever) */
+        if (cl->target_generation > 0 && gen >= cl->target_generation) {
+            cl->target_generation = 0;
+            cl->ntarget_ranges = 0;
+            changed = true;
+        }
     }
 
     /* stage 6: pending target table merges independently */
@@ -466,7 +486,9 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
         cJSON_GetObjectItemCaseSensitive(jt, "generation");
     if (cJSON_IsNumber(jtgen)) {
         long long tgen = (long long)jtgen->valuedouble;
-        if (tgen > cl->target_generation) {
+        /* never adopt a target at or below our live generation: that is
+         * a stale copy from before a promotion */
+        if (tgen > cl->target_generation && tgen > cl->generation) {
             const cJSON *assigns =
                 cJSON_GetObjectItemCaseSensitive(jt, "assignments");
             if (cJSON_IsArray(assigns)) {
@@ -860,6 +882,13 @@ static void leader_react(zdb_cluster *cl, bool changed)
     persist_state(cl);
     pthread_mutex_unlock(&cl->lock);
 
+    /* the leader holds the global rebalance lock for the whole wave so
+     * only one structure change runs at a time (released on promotion
+     * or when the wave is voided by a departure) */
+    if (target_published) {
+        zdb_cluster_acquire_rebalance_lock(cl);
+    }
+
     /* a fresh target means the structure changed: gossip immediately so
      * the wave starts everywhere without waiting for the next heartbeat
      * (also unblocks tests that join and wait right away) */
@@ -911,6 +940,38 @@ static void *conn_thread(void *arg)
                 snprintf(c->node_id, sizeof(c->node_id), "%s",
                          jid->valuestring);
                 is_self = strcmp(c->node_id, cl->self_id) == 0;
+            }
+            /* stage 6a: one node may join at a time. A brand-new node
+             * dialling in while a rebalance wave is pending is refused:
+             * reply with a rejecting HELLO and hang up without
+             * registering it. Known peers (redials, restarts), our own
+             * wake-up connection, and one-shot data-plane RPCs (which
+             * identify as "ephemeral" and never join the mesh) are
+             * always let through. */
+            if (!is_self && c->node_id[0] &&
+                strcmp(c->node_id, "ephemeral") != 0) {
+                bool known = false;
+                pthread_mutex_lock(&cl->lock);
+                for (size_t i = 0; i < cl->npeers; i++) {
+                    if (strcmp(cl->peers[i].id, c->node_id) == 0) {
+                        known = true;
+                        break;
+                    }
+                }
+                bool busy = cl->target_generation > 0;
+                pthread_mutex_unlock(&cl->lock);
+                if (!known && busy) {
+                    cJSON *r = cJSON_CreateObject();
+                    cJSON_AddStringToObject(r, "node_id", cl->self_id);
+                    cJSON_AddStringToObject(r, "reject", "rebalance");
+                    char *rs = r ? cJSON_PrintUnformatted(r) : NULL;
+                    cJSON_Delete(r);
+                    zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
+                    free(rs);
+                    close(c->fd);
+                    free(c);
+                    return NULL;
+                }
             }
             /* adopt the caller's self-declared address/port for
              * membership so we know where to dial them back */
@@ -968,24 +1029,26 @@ static void *conn_thread(void *arg)
     c->last_recv = epoch_now();
     c->next = cl->conns;
     cl->conns = c;
+    recompute_leader(cl);
+    bool became_online = false;
     for (size_t i = 0; i < cl->npeers; i++) {
         if (strcmp(cl->peers[i].id, c->node_id) == 0) {
+            /* a peer we already knew about coming back is not a
+             * membership change; only a brand-new member starts a wave */
+            became_online = !cl->peers[i].online &&
+                            cl->peers[i].last_seen == 0;
             cl->peers[i].online = true;
             break;
         }
     }
-    recompute_leader(cl);
-    bool changed = false;
-    /* adopt their address/port for this peer from their HELLO if unknown:
-     * handled implicitly because they gossiped themselves in their STATE */
     pthread_mutex_unlock(&cl->lock);
 
-    /* a newly registered connection changes membership: let the leader
-     * publish a target structure right away instead of waiting for the
-     * next heartbeat round */
-    leader_react(cl, true);
-    changed = false;
+    /* a new member changes the topology: let the leader publish a
+     * target structure right away instead of waiting for the next
+     * heartbeat round */
+    leader_react(cl, became_online);
 
+    bool changed = false;
     for (;;) {
         t = zstp_recv(c->fd, &payload);
         if (t < 0) {
@@ -1092,6 +1155,7 @@ static void *conn_thread(void *arg)
          * departed node); any pending target is void */
         cl->target_generation = 0;
         cl->ntarget_ranges = 0;
+        zdb_setting_delete(cl->cfg, SETTING_LOCK);
         if (cl->nranges > 0) {
             const char *ids[MAX_PEERS];
             size_t n = 0;
@@ -1467,13 +1531,18 @@ size_t zdb_cluster_peers(zdb_cluster *cl, zdb_peer_info *out, size_t cap)
 
 const char *zdb_cluster_leader(zdb_cluster *cl)
 {
+    static _Thread_local char buf[ZDB_NODE_ID_MAX];
     if (!cl) {
         return NULL;
     }
     pthread_mutex_lock(&cl->lock);
-    const char *l = cl->leader[0] ? cl->leader : NULL;
+    if (cl->leader[0]) {
+        snprintf(buf, sizeof(buf), "%s", cl->leader);
+    } else {
+        buf[0] = '\0';
+    }
     pthread_mutex_unlock(&cl->lock);
-    return l;
+    return buf[0] ? buf : NULL;
 }
 
 const char *zdb_cluster_self_id(zdb_cluster *cl)
@@ -1538,8 +1607,10 @@ const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex)
 }
 
 /* One-shot join: dial the seed, exchange HELLO+STATE both ways so both
- * membership views merge, then hang up (the maintainer re-dials). */
-static void join_exchange(zdb_cluster *cl, int fd)
+ * membership views merge, then hang up (the maintainer re-dials).
+ * Returns 0 on success, -2 when the seed refused because a rebalance
+ * wave is pending. */
+static int join_exchange(zdb_cluster *cl, int fd)
 {
     send_hello_state(cl, fd, true);
 
@@ -1551,7 +1622,17 @@ static void join_exchange(zdb_cluster *cl, int fd)
         if (t < 0) {
             break;
         }
-        if (t == ZSTP_STATE && payload) {
+        if (t == ZSTP_HELLO && payload) {
+            cJSON *h = cJSON_Parse(payload);
+            const cJSON *jr =
+                h ? cJSON_GetObjectItemCaseSensitive(h, "reject") : NULL;
+            if (cJSON_IsString(jr) && jr->valuestring) {
+                cJSON_Delete(h);
+                free(payload);
+                return -2;
+            }
+            cJSON_Delete(h);
+        } else if (t == ZSTP_STATE && payload) {
             cJSON *doc = cJSON_Parse(payload);
             if (doc) {
                 pthread_mutex_lock(&cl->lock);
@@ -1564,6 +1645,7 @@ static void join_exchange(zdb_cluster *cl, int fd)
         }
         free(payload);
     }
+    return 0;
 }
 
 int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
@@ -1576,9 +1658,9 @@ int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
     if (fd < 0) {
         return -1;
     }
-    join_exchange(cl, fd);
+    int rc = join_exchange(cl, fd);
     close(fd);
-    return 0;
+    return rc;
 }
 
 void zdb_cluster_set_dispatcher(zdb_cluster *cl,
