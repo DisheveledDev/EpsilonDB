@@ -68,6 +68,17 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
 bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
                        const char *keyspace);
 
+/* --- stage 6d: shard GC ------------------------------------------------ */
+
+/* Fills keys[] with up to cap 32-char md5 shard keys present on disk in
+ * the store root. Returns the number written. */
+size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap);
+
+/* Removes the shard file identified by a 32-char md5 key (and its cached
+ * handle, if open) from disk. Returns true when the file is gone. Used
+ * to GC redundant shards after a rebalance moves them to another node. */
+bool zdb_shard_gc(zdb_engine *mgr, const char key[33]);
+
 /* Store a JSON document under id in partition/keyspace.
  * ttl_seconds: seconds until expiry, or -1 for no expiry.
  * filters: array of "key=value" strings used for later query filtering,

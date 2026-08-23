@@ -237,8 +237,13 @@ static void test_two_node_wave_lock_and_promotion(void)
     char done_name[96];
     snprintf(done_name, sizeof(done_name), DONE_PREFIX"%.63s", other_id);
     CHECK(zdb_setting_set(leader_cfg, done_name, val));
-    CHECK(zdb_cluster_target_compliant(leader));
-    CHECK(zdb_cluster_promote_target(leader));
+    /* stage 6d: the maintainer auto-promotes once compliance is fully
+     * visible to the leader, so the wave may already be promoted by now
+     * (pending target cleared). Promote explicitly only if still pending. */
+    if (zdb_cluster_target_generation(leader) != 0) {
+        CHECK(zdb_cluster_target_compliant(leader));
+        CHECK(zdb_cluster_promote_target(leader));
+    }
 
     /* lock released by promotion */
     lock = zdb_setting_get(leader_cfg, LOCK_SETTING);

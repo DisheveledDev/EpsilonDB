@@ -157,4 +157,9 @@ bool zdb_setting_delete(zdb_config *cfg, const char *name);
 /* Returns a NULL-terminated array of malloc'd setting names. */
 char **zdb_setting_list(zdb_config *cfg, size_t *count_out);
 
+/* True when `key` is one of the reserved __system__ config shard keys
+ * (databases/groups/users/partitions/keyspaces/settings). GC must never
+ * remove these: every node needs its own config view. */
+bool zdb_config_is_system_key(zdb_config *cfg, const char key[33]);
+
 #endif

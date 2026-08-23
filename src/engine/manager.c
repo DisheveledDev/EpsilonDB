@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "md5.h"
 
@@ -266,6 +267,71 @@ void zdb_engine_close(zdb_engine *mgr)
 const char *zdb_engine_path(zdb_engine *mgr)
 {
     return mgr ? mgr->path : NULL;
+}
+
+size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap)
+{
+    if (!mgr || !keys || cap == 0) {
+        return 0;
+    }
+    size_t n = 0;
+    DIR *dir = opendir(mgr->path);
+    if (!dir) {
+        return 0;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && n < cap) {
+        size_t nlen = strlen(entry->d_name);
+        if (nlen != 32 + sizeof(".sqlite") - 1 ||
+            strcmp(entry->d_name + 32, ".sqlite") != 0) {
+            continue;
+        }
+        memcpy(keys[n], entry->d_name, 32);
+        keys[n][32] = '\0';
+        n++;
+    }
+    closedir(dir);
+    return n;
+}
+
+bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
+{
+    if (!mgr || !key || strlen(key) != 32) {
+        return false;
+    }
+
+    /* drop the cached handle (if any) before removing the file so a
+     * later reopen starts from a clean, empty shard */
+    zdb_shard *sh = NULL;
+    pthread_mutex_lock(&mgr->lock);
+    struct shard_link **pp = &mgr->buckets[bucket_for(key)];
+    while (*pp && strcmp((*pp)->shard->key, key) != 0) {
+        pp = &(*pp)->next;
+    }
+    if (*pp) {
+        struct shard_link *victim = *pp;
+        sh = victim->shard;
+        *pp = victim->next;
+        free(victim);
+    }
+    pthread_mutex_unlock(&mgr->lock);
+    if (sh) {
+        zdb_shard_free(sh);
+    }
+
+    /* remove the file and any SQLite sidecars */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.sqlite", mgr->path, key);
+    int rc = unlink(path);
+    char side[1060];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    unlink(side);
+    snprintf(side, sizeof(side), "%s-journal", path);
+    unlink(side);
+    if (rc != 0 && errno == ENOENT) {
+        rc = 0;   /* already gone */
+    }
+    return rc == 0;
 }
 
 bool zdb_shard_path(zdb_engine *mgr, const char *partition,

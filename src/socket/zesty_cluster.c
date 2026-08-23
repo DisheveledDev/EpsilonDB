@@ -303,6 +303,10 @@ static cJSON *state_to_json(const zdb_cluster *cl)
         cJSON_AddNumberToObject(n, "port", cl->peers[i].port);
         cJSON_AddNumberToObject(n, "last_seen",
                                 (double)cl->peers[i].last_seen);
+        if (cl->peers[i].compliant_gen > 0) {
+            cJSON_AddNumberToObject(n, "compliant",
+                                    (double)cl->peers[i].compliant_gen);
+        }
         cJSON_AddItemToArray(nodes, n);
     }
 
@@ -357,6 +361,8 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                 cJSON_GetObjectItemCaseSensitive(item, "port");
             const cJSON *jseen =
                 cJSON_GetObjectItemCaseSensitive(item, "last_seen");
+            const cJSON *jcompliant =
+                cJSON_GetObjectItemCaseSensitive(item, "compliant");
             if (!cJSON_IsString(jid) || !jid->valuestring ||
                 !*jid->valuestring ||
                 strlen(jid->valuestring) >= ZDB_NODE_ID_MAX) {
@@ -365,6 +371,9 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
             long long seen = cJSON_IsNumber(jseen)
                                  ? (long long)jseen->valuedouble
                                  : 0;
+            long long compliant = cJSON_IsNumber(jcompliant)
+                                      ? (long long)jcompliant->valuedouble
+                                      : 0;
 
             zdb_peer_info *mine = NULL;
             for (size_t i = 0; i < cl->npeers; i++) {
@@ -412,6 +421,10 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
             }
             if (seen > mine->last_seen) {
                 mine->last_seen = seen;
+                changed = true;
+            }
+            if (compliant > mine->compliant_gen) {
+                mine->compliant_gen = compliant;
                 changed = true;
             }
         }
@@ -865,6 +878,26 @@ static int send_hello_state(zdb_cluster *cl, int fd, bool with_state)
     return rc;
 }
 
+/* Immediately push our current STATE to every live connection, so
+ * topology or compliance changes propagate without waiting for the next
+ * heartbeat. */
+static void gossip_state(zdb_cluster *cl)
+{
+    pthread_mutex_lock(&cl->send_lock);
+    for (peer_conn *c = cl->conns; c; c = c->next) {
+        char *state = NULL;
+        cJSON *s = NULL;
+        pthread_mutex_lock(&cl->lock);
+        s = state_to_json(cl);
+        pthread_mutex_unlock(&cl->lock);
+        state = s ? cJSON_PrintUnformatted(s) : NULL;
+        cJSON_Delete(s);
+        zstp_send(c->fd, ZSTP_STATE, state ? state : "{}", NULL);
+        free(state);
+    }
+    pthread_mutex_unlock(&cl->send_lock);
+}
+
 /* Leader reaction after topology changes: recompute ranges and persist.
  * Called without holding the lock. */
 static void leader_react(zdb_cluster *cl, bool changed)
@@ -890,28 +923,21 @@ static void leader_react(zdb_cluster *cl, bool changed)
         zdb_cluster_acquire_rebalance_lock(cl);
     }
 
+    /* stage 6d: once every node reports compliance the leader promotes
+     * automatically (the data migration steps happen via 6c catch-up) */
+    if (am_leader && cl->target_generation > 0) {
+        zdb_cluster_maybe_promote(cl);
+    }
+
     /* a fresh target means the structure changed: gossip immediately so
      * the wave starts everywhere without waiting for the next heartbeat
      * (also unblocks tests that join and wait right away) */
     if (target_published) {
-        pthread_mutex_lock(&cl->send_lock);
-        for (peer_conn *c = cl->conns; c; c = c->next) {
-            char *state = NULL;
-            cJSON *s = NULL;
-            pthread_mutex_lock(&cl->lock);
-            s = state_to_json(cl);
-            pthread_mutex_unlock(&cl->lock);
-            state = s ? cJSON_PrintUnformatted(s) : NULL;
-            cJSON_Delete(s);
-            zstp_send(c->fd, ZSTP_STATE, state ? state : "{}", NULL);
-            free(state);
-        }
-        pthread_mutex_unlock(&cl->send_lock);
+        gossip_state(cl);
     }
 }
 
 /* Per-connection loop. Takes ownership of `c` and frees it.
- *
  * Frame ordering on a fresh connection: whichever side spawned this
  * thread already sent its own HELLO (acceptor/connector/join). The
  * remote side does the same, so the first frame we read here is their
@@ -1331,6 +1357,13 @@ static void maintainer_tick(zdb_cluster *cl)
         pthread_mutex_lock(&cl->lock);
     }
     pthread_mutex_unlock(&cl->lock);
+
+    /* stage 6d: promote a compliant wave on a steady cadence (also
+     * catches compliance that arrived outside a topology change). Shard
+     * GC is deliberately NOT automatic: with full replication every node
+     * still holds replica copies, so the placement layer decides what is
+     * redundant and calls zdb_cluster_gc_redundant explicitly. */
+    zdb_cluster_maybe_promote(cl);
 }
 
 static void *maintainer_main(void *arg)
@@ -1771,11 +1804,18 @@ bool zdb_cluster_target_compliant(zdb_cluster *cl)
     if (!cl || zdb_cluster_target_generation(cl) == 0) {
         return false;
     }
+    long long tgen = zdb_cluster_target_generation(cl);
     zdb_peer_info peers[MAX_PEERS];
     size_t n = zdb_cluster_peers(cl, peers, MAX_PEERS);
     for (size_t i = 0; i < n; i++) {
         if (!peers[i].online && strcmp(peers[i].id, cl->self_id) != 0) {
             continue;   /* only online nodes must comply */
+        }
+        /* stage 6d: compliance is gossiped (compliant_gen); fall back to
+         * the settings store so the stage 6a stub (manually injected
+         * flags) and any persisted flag still count */
+        if (peers[i].compliant_gen >= tgen) {
+            continue;
         }
         char name[96];
         snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
@@ -1799,12 +1839,78 @@ void zdb_cluster_mark_compliant(zdb_cluster *cl)
     if (tgen == 0) {
         return;
     }
+    /* gossip-based compliance: record self as current for this target */
+    pthread_mutex_lock(&cl->lock);
+    for (size_t i = 0; i < cl->npeers; i++) {
+        if (strcmp(cl->peers[i].id, cl->self_id) == 0) {
+            if (cl->peers[i].compliant_gen < tgen) {
+                cl->peers[i].compliant_gen = tgen;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+
+    /* keep the persisted flag for crash recovery / stage 6a compat */
     char name[96];
     char val[32];
     snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
              cl->self_id);
     snprintf(val, sizeof(val), "%lld", tgen);
     zdb_setting_set(cl->cfg, name, val);
+
+    /* propagate compliance immediately so the leader can promote without
+     * waiting for the next heartbeat */
+    gossip_state(cl);
+}
+
+/* --- stage 6d: promotion trigger + shard GC -------------------------- */
+
+/* Leader-only: promote the pending target when every online node has
+ * reported compliance. Safe to call from any thread (takes the lock).
+ * Returns true when a promotion happened. */
+bool zdb_cluster_maybe_promote(zdb_cluster *cl)
+{
+    if (!cl || !zdb_cluster_is_leader(cl)) {
+        return false;
+    }
+    if (zdb_cluster_target_generation(cl) == 0 ||
+        !zdb_cluster_target_compliant(cl)) {
+        return false;
+    }
+    return zdb_cluster_promote_target(cl);
+}
+
+/* Removes one redundant local shard file (a shard whose key is now owned
+ * by a different node under the live table) after confirming the new
+ * owner is assigned. Reserved __system__ config shards are never removed.
+ * Returns the number of shards GC'd this call (0 or 1), so callers can
+ * drain GC one at a time. */
+size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
+{
+    if (!cl) {
+        return 0;
+    }
+    zdb_engine *engine = zdb_config_engine(cl->cfg);
+    if (!engine) {
+        return 0;
+    }
+    char keys[256][33];
+    size_t n = zdb_engine_shard_keys(engine, keys, 256);
+    for (size_t i = 0; i < n; i++) {
+        if (zdb_config_is_system_key(cl->cfg, keys[i])) {
+            continue;
+        }
+        const char *owner = zdb_cluster_owner(cl, keys[i]);
+        if (owner && strcmp(owner, cl->self_id) != 0) {
+            /* the live table reassigned this key to another node; our
+             * copy is now redundant */
+            if (zdb_shard_gc(engine, keys[i])) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 bool zdb_cluster_acquire_rebalance_lock(zdb_cluster *cl)

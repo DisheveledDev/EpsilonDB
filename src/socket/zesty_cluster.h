@@ -41,6 +41,8 @@ typedef struct {
     int port;
     long long last_seen;      /* epoch seconds, from gossip */
     bool online;              /* mesh connection alive */
+    long long compliant_gen;  /* stage 6d: highest target gen this node
+                               * has reported compliance for (0 = none) */
 } zdb_peer_info;
 
 typedef struct {
@@ -132,5 +134,16 @@ bool zdb_cluster_acquire_rebalance_lock(zdb_cluster *cl);
 
 /* Releases the global rebalance lock (leader, after promotion). */
 void zdb_cluster_release_rebalance_lock(zdb_cluster *cl);
+
+/* --- stage 6d: promotion trigger + shard GC --------------------------- */
+
+/* Leader-only: promote the pending target if every online node reports
+ * compliance. Returns true when a promotion happened. */
+bool zdb_cluster_maybe_promote(zdb_cluster *cl);
+
+/* Remove one redundant local shard (no longer owned under the live
+ * table) after confirming the new owner; reserved system shards are
+ * never removed. Returns the number GC'd (0 or 1). */
+size_t zdb_cluster_gc_redundant(zdb_cluster *cl);
 
 #endif

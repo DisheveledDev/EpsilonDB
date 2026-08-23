@@ -757,3 +757,26 @@ char **zdb_setting_list(zdb_config *cfg, size_t *count_out)
     *count_out = i;
     return names;
 }
+
+bool zdb_config_is_system_key(zdb_config *cfg, const char key[33])
+{
+    if (!cfg || !key || strlen(key) != 32) {
+        return false;
+    }
+    static const char *const keyspaces[] = {
+        CFG_KEYSPACE_DATABASES, CFG_KEYSPACE_GROUPS,   CFG_KEYSPACE_USERS,
+        CFG_KEYSPACE_PARTITIONS, CFG_KEYSPACE_KEYSPACES,
+        CFG_KEYSPACE_SETTINGS,
+    };
+    for (size_t i = 0;
+         i < sizeof(keyspaces) / sizeof(keyspaces[0]); i++) {
+        char sys_key[33];
+        char path[1024];
+        if (zdb_shard_path(cfg->engine, ZDB_SYSTEM_DB, keyspaces[i], path,
+                           sizeof(path), sys_key) &&
+            strcmp(sys_key, key) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
