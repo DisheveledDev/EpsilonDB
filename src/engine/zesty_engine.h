@@ -44,6 +44,30 @@ void zdb_engine_close(zdb_engine *mgr);
  * touch shard files directly, e.g. snapshot transfer). */
 const char *zdb_engine_path(zdb_engine *mgr);
 
+/* --- stage 6b: shard snapshot support --------------------------------- */
+
+/* Fills path_out with the shard file path for partition/keyspace
+ * (md5(partition + keyspace) + ".sqlite" under the store root) and key_out
+ * with the 32-char hex shard key. Returns false on allocation/argument
+ * failure. The file may not exist yet. */
+bool zdb_shard_path(zdb_engine *mgr, const char *partition,
+                    const char *keyspace, char *path_out, size_t cap,
+                    char key_out[33]);
+
+/* Drops the cached open handle for partition/keyspace so the next use
+ * reopens the file from disk. Call after a snapshot replaces the shard
+ * file underneath the engine; concurrent users block until the close
+ * finishes and then reopen cleanly. Returns true when a handle existed.
+ * Also runs an integrity check on the new file: returns false when the
+ * reopened database fails "PRAGMA integrity_check". */
+bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
+                          const char *keyspace);
+
+/* True when partition/keyspace currently has an open shard handle.
+ * Test hook for invalidate semantics. */
+bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
+                       const char *keyspace);
+
 /* Store a JSON document under id in partition/keyspace.
  * ttl_seconds: seconds until expiry, or -1 for no expiry.
  * filters: array of "key=value" strings used for later query filtering,

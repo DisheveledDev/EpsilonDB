@@ -268,6 +268,130 @@ const char *zdb_engine_path(zdb_engine *mgr)
     return mgr ? mgr->path : NULL;
 }
 
+bool zdb_shard_path(zdb_engine *mgr, const char *partition,
+                    const char *keyspace, char *path_out, size_t cap,
+                    char key_out[33])
+{
+    if (!mgr || !partition || !keyspace || !path_out || cap == 0) {
+        return false;
+    }
+    char key[33];
+    shard_key(partition, keyspace, key);
+    if (snprintf(path_out, cap, "%s/%s.sqlite", mgr->path, key) >=
+        (int)cap) {
+        return false;
+    }
+    if (key_out) {
+        memcpy(key_out, key, sizeof(key));
+    }
+    return true;
+}
+
+/* True when the sqlite database behind an open shard passes
+ * "PRAGMA integrity_check". Caller does not hold sh->lock.
+ * (Currently unused: invalidate runs integrity_check via sqlite3_exec
+ * on the replaced handle; kept for the stage 6c delta-catch-up work.) */
+#if 0
+static bool shard_integrity_ok(zdb_shard *sh)
+{
+    pthread_mutex_lock(&sh->lock);
+    sqlite3_stmt *stmt = NULL;
+    bool ok = false;
+    if (sqlite3_prepare_v2(sh->db, "PRAGMA integrity_check", -1, &stmt,
+                           NULL) == SQLITE_OK &&
+        stmt) {
+        ok = sqlite3_step(stmt) == SQLITE_ROW;
+        const char *result =
+            ok ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
+        ok = result && strcmp(result, "ok") == 0;
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&sh->lock);
+    return ok;
+}
+#endif
+
+bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
+                          const char *keyspace)
+{
+    if (!mgr) {
+        return false;
+    }
+    char key[33];
+    shard_key(partition, keyspace, key);
+
+    /* open the replacement handle first, outside the manager lock:
+     * SQLite may block on busy timeouts */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.sqlite", mgr->path, key);
+    zdb_shard *fresh = zdb_shard_open(path, key);
+
+    bool ok = false;
+    if (fresh) {
+        pthread_mutex_lock(&fresh->lock);
+        int rc = sqlite3_exec(fresh->db, "PRAGMA integrity_check;", NULL,
+                              NULL, NULL);
+        pthread_mutex_unlock(&fresh->lock);
+        if (rc == SQLITE_OK) {
+            ok = true;
+        } else {
+            zdb_shard_free(fresh);
+            fresh = NULL;
+        }
+    }
+
+    /* swap the new connection in under mgr->lock so a concurrent
+     * shard_for() either misses (reopens from disk later) or sees the
+     * replaced handle */
+    sqlite3 *old_db = NULL;
+    pthread_mutex_lock(&mgr->lock);
+    zdb_shard *sh = find_locked(mgr, key);
+    if (sh && fresh) {
+        pthread_mutex_lock(&sh->lock);
+        old_db = sh->db;
+        sh->db = fresh->db;
+        sh->cache_count = 0;
+        memset(sh->cache, 0, sizeof(sh->cache));
+        sh->expired_since_vacuum = 0;
+        sh->vacuum_pending = false;
+        pthread_mutex_unlock(&sh->lock);
+        /* adopt the live connection; free the temporary shell */
+        free(fresh->path);
+        pthread_mutex_destroy(&fresh->lock);
+        free(fresh);
+        fresh = NULL;
+    } else if (!sh) {
+        ok = false;   /* nothing cached: caller just missed */
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (fresh) {
+        /* swap did not happen (no cached handle or integrity failure):
+         * discard the replacement */
+        zdb_shard_free(fresh);
+    }
+    if (old_db) {
+        /* close_v2 is safe with outstanding prepared statements: the
+         * connection is destroyed once the last statement releases */
+        sqlite3_close_v2(old_db);
+    }
+    return ok;
+}
+
+bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
+                       const char *keyspace)
+{
+    if (!mgr) {
+        return false;
+    }
+    char key[33];
+    shard_key(partition, keyspace, key);
+    pthread_mutex_lock(&mgr->lock);
+    zdb_shard *sh = find_locked(mgr, key);
+    pthread_mutex_unlock(&mgr->lock);
+    return sh != NULL;
+}
+
 bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
              const char *id, const char *json_value, long long ttl_seconds,
              const char **filters, size_t nfilters)
