@@ -1,0 +1,715 @@
+#include "zesty_http.h"
+
+#include <arpa/inet.h>
+#include <sys/un.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <strings.h>
+#include <stdarg.h>
+
+#define ZDB_HTTP_BACKLOG 64
+#define ZDB_HTTP_MAX_HEADER_BYTES (32 * 1024)
+#define ZDB_HTTP_MAX_BODY_BYTES (16 * 1024 * 1024)
+#define ZDB_HTTP_RECV_TIMEOUT_SEC 30
+#define ZDB_HTTP_MAX_ROUTES 32
+
+typedef struct {
+    char method[16];
+    char prefix[256];
+    zdb_http_handler handler;
+} http_route;
+
+struct zdb_http_server {
+    int listen_fd;
+    pthread_t accept_thread;
+    volatile bool running;
+
+    int admin_fd;                 /* -1 when no admin listener */
+    char admin_path[108];         /* unix socket path (sun_path limit) */
+
+    pthread_mutex_t routes_lock;
+    http_route routes[ZDB_HTTP_MAX_ROUTES];
+    int nroutes;
+
+    int static_route;             /* index into routes, -1 if none */
+    char static_root[1024];
+};
+
+typedef struct {
+    zdb_http_server *srv;
+    int fd;
+    bool trusted;
+} conn_ctx;
+
+/* ------------------------------------------------------------------ */
+/* response helpers                                                    */
+
+char *zdb_http_body_printf(size_t *len_out, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap2);
+        if (len_out) *len_out = 0;
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) {
+        va_end(ap2);
+        if (len_out) *len_out = 0;
+        return NULL;
+    }
+    vsnprintf(buf, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    if (len_out) *len_out = (size_t)n;
+    return buf;
+}
+
+void zdb_http_set_json(zdb_http_response *res, int status, char *body)
+{
+    res->status = status;
+    res->content_type = "application/json";
+    res->body = body ? body : zdb_http_body_printf(&res->body_len, "");
+    res->body_len = body && res->body == body
+                        ? strlen(body)
+                        : res->body_len;
+}
+
+const char *zdb_http_header(const zdb_http_request *req, const char *name)
+{
+    for (int i = 0; i < req->nheaders; i++) {
+        if (strcasecmp(req->header_names[i], name) == 0) {
+            return req->header_values[i];
+        }
+    }
+    return NULL;
+}
+
+static void send_all(int fd, const char *data, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR)) {
+                continue;
+            }
+            return;
+        }
+        sent += (size_t)n;
+    }
+}
+
+static const char *status_text(int status)
+{
+    switch (status) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 409: return "Conflict";
+    case 500: return "Internal Server Error";
+    default:  return "Unknown";
+    }
+}
+
+static void write_response(int fd, const zdb_http_response *res,
+                           bool keep_alive)
+{
+    char head[512];
+    size_t body_len = res->body ? res->body_len : 0;
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 %d %s\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: %s\r\n"
+                     "\r\n",
+                     res->status, status_text(res->status),
+                     res->content_type ? res->content_type
+                                       : "application/json",
+                     body_len,
+                     keep_alive ? "keep-alive" : "close");
+    if (n > 0) {
+        send_all(fd, head, (size_t)n);
+        if (body_len) {
+            send_all(fd, res->body, body_len);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* request parsing                                                     */
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} recv_buf;
+
+static bool recv_append(recv_buf *rb, int fd, size_t *total_read)
+{
+    if (rb->cap - rb->len < 4096) {
+        size_t newcap = rb->cap ? rb->cap * 2 : 8192;
+        char *grown = realloc(rb->buf, newcap);
+        if (!grown) {
+            return false;
+        }
+        rb->buf = grown;
+        rb->cap = newcap;
+    }
+    ssize_t n = recv(fd, rb->buf + rb->len, rb->cap - rb->len, 0);
+    if (n <= 0) {
+        return false;
+    }
+    rb->len += (size_t)n;
+    *total_read += (size_t)n;
+    return true;
+}
+
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\r')) {
+        s[--len] = '\0';
+    }
+    return s;
+}
+
+/* Parses one request from rb using fd for additional reads. On success
+ * advances *pos past the consumed bytes. Returns false on parse error or
+ * EOF. */
+static char *buf_find(const char *hay, size_t hay_len, const char *needle,
+                      size_t needle_len)
+{
+    if (needle_len == 0 || hay_len < needle_len) {
+        return NULL;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (hay[i] == needle[0] &&
+            memcmp(hay + i, needle, needle_len) == 0) {
+            return (char *)(hay + i);
+        }
+    }
+    return NULL;
+}
+
+static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
+                               zdb_http_request *req)
+{
+    memset(req, 0, sizeof(*req));
+    size_t header_total = 0;
+
+    char *head_end = NULL;
+    for (;;) {
+        if (rb->len >= *pos + 4) {
+            head_end = buf_find(rb->buf + *pos, rb->len - *pos, "\r\n\r\n", 4);
+        }
+        if (!head_end && rb->len >= *pos + 2) {
+            head_end = buf_find(rb->buf + *pos, rb->len - *pos, "\n\n", 2);
+        }
+        if (head_end) {
+            break;
+        }
+        if (header_total > ZDB_HTTP_MAX_HEADER_BYTES) {
+            return false;
+        }
+        if (!recv_append(rb, fd, &header_total)) {
+            return false;
+        }
+    }
+
+    size_t head_len;
+    if (strncmp(head_end, "\r\n\r\n", 4) == 0) {
+        head_len = (size_t)(head_end - (rb->buf + *pos)) + 4;
+    } else {
+        head_len = (size_t)(head_end - (rb->buf + *pos)) + 2;
+    }
+
+    rb->buf[*pos + head_len - 1] = '\0';   /* terminate headers block */
+
+    /* request line: work on a copy so header parsing below sees the full
+     * block unmodified */
+    char *line = rb->buf + *pos;
+    char *eol = strchr(line, '\n');
+    if (!eol) {
+        return false;
+    }
+    *eol = '\0';
+
+    char target[3072];
+    if (sscanf(line, "%15s %3071s", req->method, target) != 2) {
+        return false;
+    }
+    *eol = '\n';   /* restore */
+
+    /* split path / query */
+    char *q = strchr(target, '?');
+    if (q) {
+        *q = '\0';
+        snprintf(req->query, sizeof(req->query), "%s", q + 1);
+    } else {
+        req->query[0] = '\0';
+    }
+    snprintf(req->path, sizeof(req->path), "%s", target);
+
+    /* headers */
+    char *cursor = eol + 1;
+    while ((eol = strchr(cursor, '\n')) != NULL && cursor[0] != '\r' &&
+           cursor[0] != '\n') {
+        *eol = '\0';
+        char *colon = strchr(cursor, ':');
+        if (colon && req->nheaders < ZDB_HTTP_MAX_HEADERS) {
+            *colon = '\0';
+            req->header_names[req->nheaders] = trim(cursor);
+            req->header_values[req->nheaders] = trim(colon + 1);
+            req->nheaders++;
+        }
+        cursor = eol + 1;
+    }
+
+    /* content length */
+    size_t content_length = 0;
+    const char *cl = zdb_http_header(req, "Content-Length");
+    if (cl) {
+        content_length = strtoul(cl, NULL, 10);
+        if (content_length > ZDB_HTTP_MAX_BODY_BYTES) {
+            return false;
+        }
+    }
+
+    /* body starts after headers; may need more data */
+    while (rb->len < *pos + head_len + content_length) {
+        size_t dummy = 0;
+        if (!recv_append(rb, fd, &dummy)) {
+            return false;
+        }
+    }
+
+    req->body = malloc(content_length + 1);
+    if (!req->body) {
+        return false;
+    }
+    memcpy(req->body, rb->buf + *pos + head_len, content_length);
+    req->body[content_length] = '\0';
+    req->body_len = content_length;
+
+    *pos += head_len + content_length;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* static files                                                        */
+
+static bool path_is_safe(const char *rel)
+{
+    return strstr(rel, "..") == NULL;
+}
+
+static bool guess_content_type(const char *path, char *out, size_t cap)
+{
+    const char *ext = strrchr(path, '.');
+    if (!ext) {
+        snprintf(out, cap, "application/octet-stream");
+        return true;
+    }
+    ext++;
+    if (strcasecmp(ext, "html") == 0 || strcasecmp(ext, "htm") == 0) {
+        snprintf(out, cap, "text/html");
+    } else if (strcasecmp(ext, "js") == 0) {
+        snprintf(out, cap, "text/javascript");
+    } else if (strcasecmp(ext, "css") == 0) {
+        snprintf(out, cap, "text/css");
+    } else if (strcasecmp(ext, "json") == 0) {
+        snprintf(out, cap, "application/json");
+    } else if (strcasecmp(ext, "png") == 0) {
+        snprintf(out, cap, "image/png");
+    } else if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) {
+        snprintf(out, cap, "image/jpeg");
+    } else if (strcasecmp(ext, "svg") == 0) {
+        snprintf(out, cap, "image/svg+xml");
+    } else if (strcasecmp(ext, "ico") == 0) {
+        snprintf(out, cap, "image/x-icon");
+    } else {
+        snprintf(out, cap, "application/octet-stream");
+    }
+    return true;
+}
+
+static void serve_static_file(zdb_http_server *srv,
+                              const zdb_http_request *req,
+                              zdb_http_response *res, bool *handled)
+{
+    *handled = false;
+    const char *prefix = srv->routes[srv->static_route].prefix;
+    size_t plen = strlen(prefix);
+
+    if (strncmp(req->path, prefix, plen) != 0) {
+        return;
+    }
+    const char *rel = req->path + plen;
+    if (*rel == '/') {
+        rel++;
+    }
+    if (!*rel) {
+        rel = "index.html";
+    }
+    if (!path_is_safe(rel)) {
+        res->status = 404;
+        res->content_type = "text/plain";
+        res->body = NULL;
+        *handled = true;
+        return;
+    }
+
+    char full[2048];
+    snprintf(full, sizeof(full), "%s/%s", srv->static_root, rel);
+
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        res->status = 404;
+        res->content_type = "text/plain";
+        res->body = zdb_http_body_printf(&res->body_len, "not found\n");
+        *handled = true;
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fclose(f);
+        res->status = 500;
+        *handled = true;
+        return;
+    }
+    char *data = malloc((size_t)sz + 1);
+    if (!data) {
+        fclose(f);
+        res->status = 500;
+        *handled = true;
+        return;
+    }
+    size_t got = fread(data, 1, (size_t)sz, f);
+    fclose(f);
+    data[got] = '\0';
+
+    res->status = 200;
+    char ctype[128];
+    guess_content_type(full, ctype, sizeof(ctype));
+    static __thread char ctype_tls[128];
+    snprintf(ctype_tls, sizeof(ctype_tls), "%s", ctype);
+    res->content_type = ctype_tls;
+    res->body = data;
+    res->body_len = got;
+}
+
+/* ------------------------------------------------------------------ */
+/* connection worker                                                   */
+
+static void *conn_main(void *arg)
+{
+    conn_ctx ctx = *(conn_ctx *)arg;
+    free(arg);
+
+    int fd = ctx.fd;
+    struct timeval tv = { .tv_sec = ZDB_HTTP_RECV_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    recv_buf rb = {0};
+    size_t pos = 0;
+    bool keep_alive = true;
+
+    while (keep_alive && ctx.srv->running) {
+        zdb_http_request req;
+        if (!parse_request_full(&rb, fd, &pos, &req)) {
+            break;
+        }
+        req.trusted = ctx.trusted;
+
+        zdb_http_response res = { .status = 500 };
+        res.content_type = "application/json";
+
+        /* route match: longest prefix wins; static file handler is last */
+        int best = -1;
+        size_t best_len = 0;
+        pthread_mutex_lock(&ctx.srv->routes_lock);
+        for (int i = 0; i < ctx.srv->nroutes; i++) {
+            http_route *r = &ctx.srv->routes[i];
+            if (i == ctx.srv->static_route) {
+                continue;
+            }
+            size_t plen = strlen(r->prefix);
+            if (strncmp(req.path, r->prefix, plen) == 0 &&
+                strcmp(req.method, r->method) == 0 && plen >= best_len) {
+                best = i;
+                best_len = plen;
+            }
+        }
+        bool handled = false;
+        if (best >= 0) {
+            http_route route_copy = ctx.srv->routes[best];
+            pthread_mutex_unlock(&ctx.srv->routes_lock);
+            keep_alive = route_copy.handler(&req, &res);
+            handled = true;
+        } else if (ctx.srv->static_route >= 0) {
+            pthread_mutex_unlock(&ctx.srv->routes_lock);
+            serve_static_file(ctx.srv, &req, &res, &handled);
+        } else {
+            pthread_mutex_unlock(&ctx.srv->routes_lock);
+        }
+
+        if (!handled) {
+            res.status = 404;
+            res.content_type = "application/json";
+            res.body = zdb_http_body_printf(
+                &res.body_len,
+                "{\"error\":\"not found\",\"path\":\"%s\"}", req.path);
+        }
+
+        /* honor client's Connection header unless handler said close */
+        const char *conn_hdr = zdb_http_header(&req, "Connection");
+        if (conn_hdr && strcasecmp(conn_hdr, "close") == 0) {
+            keep_alive = false;
+        }
+
+        write_response(fd, &res, keep_alive);
+        free(res.body);
+        free(req.body);
+
+        /* compact the buffer when everything was consumed */
+        if (pos == rb.len) {
+            pos = 0;
+            rb.len = 0;
+        }
+    }
+
+    close(fd);
+    free(rb.buf);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    zdb_http_server *srv;
+    int listen_fd;
+    bool trusted;
+} accept_job;
+
+static void *accept_main(void *arg)
+{
+    accept_job job = *(accept_job *)arg;
+    free(arg);
+    zdb_http_server *srv = job.srv;
+
+    while (srv->running) {
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        int fd = accept(job.listen_fd, (struct sockaddr *)&peer, &peer_len);
+        if (fd < 0) {
+            if (!srv->running) {
+                break;
+            }
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
+            }
+            fprintf(stderr, "zdb: accept failed: %s\n", strerror(errno));
+            continue;
+        }
+
+        conn_ctx *ctx = malloc(sizeof(*ctx));
+        if (!ctx) {
+            close(fd);
+            continue;
+        }
+        ctx->srv = srv;
+        ctx->fd = fd;
+        ctx->trusted = job.trusted;
+
+        pthread_t worker;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&worker, &attr, conn_main, ctx) != 0) {
+            close(fd);
+            free(ctx);
+        }
+        pthread_attr_destroy(&attr);
+    }
+    return NULL;
+}
+
+static bool spawn_acceptor(zdb_http_server *srv, int listen_fd, bool trusted)
+{
+    accept_job *job = malloc(sizeof(*job));
+    if (!job) {
+        return false;
+    }
+    job->srv = srv;
+    job->listen_fd = listen_fd;
+    job->trusted = trusted;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    bool ok = pthread_create(&tid, &attr, accept_main, job) == 0;
+    pthread_attr_destroy(&attr);
+    if (!ok) {
+        free(job);
+    }
+    return ok;
+}
+
+bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
+{
+    if (!srv || !sock_path || !*sock_path || srv->admin_fd >= 0) {
+        return false;
+    }
+    if (strlen(sock_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        fprintf(stderr, "zdb: admin socket path too long: %s\n", sock_path);
+        return false;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "zdb: admin socket() failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    unlink(sock_path);   /* remove stale socket from a previous run */
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, ZDB_HTTP_BACKLOG) != 0) {
+        fprintf(stderr, "zdb: admin bind/listen on '%s' failed: %s\n",
+                sock_path, strerror(errno));
+        close(fd);
+        return false;
+    }
+
+    if (!spawn_acceptor(srv, fd, true)) {
+        close(fd);
+        unlink(sock_path);
+        return false;
+    }
+    srv->admin_fd = fd;
+    snprintf(srv->admin_path, sizeof(srv->admin_path), "%s", sock_path);
+    return true;
+}
+
+zdb_http_server *zdb_http_start(const char *bind_addr, int port)
+{
+    signal(SIGPIPE, SIG_IGN);
+
+    zdb_http_server *srv = calloc(1, sizeof(*srv));
+    if (!srv) {
+        return NULL;
+    }
+    srv->running = true;
+    srv->static_route = -1;
+    pthread_mutex_init(&srv->routes_lock, NULL);
+
+    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv->listen_fd < 0) {
+        free(srv);
+        return NULL;
+    }
+    int one = 1;
+    setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (!bind_addr || !*bind_addr ||
+        inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+    if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(srv->listen_fd, ZDB_HTTP_BACKLOG) != 0) {
+        fprintf(stderr, "zdb: http bind/listen on port %d failed: %s\n",
+                port, strerror(errno));
+        close(srv->listen_fd);
+        free(srv);
+        return NULL;
+    }
+
+    srv->admin_fd = -1;
+    if (!spawn_acceptor(srv, srv->listen_fd, false)) {
+        fprintf(stderr, "zdb: failed to start accept thread\n");
+        close(srv->listen_fd);
+        pthread_mutex_destroy(&srv->routes_lock);
+        free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+bool zdb_http_add_handler(zdb_http_server *srv, const char *method,
+                          const char *prefix, zdb_http_handler handler)
+{
+    if (!srv || !method || !prefix || !handler ||
+        srv->nroutes >= ZDB_HTTP_MAX_ROUTES) {
+        return false;
+    }
+    pthread_mutex_lock(&srv->routes_lock);
+    http_route *r = &srv->routes[srv->nroutes++];
+    snprintf(r->method, sizeof(r->method), "%s", method);
+    snprintf(r->prefix, sizeof(r->prefix), "%s", prefix);
+    r->handler = handler;
+    pthread_mutex_unlock(&srv->routes_lock);
+    return true;
+}
+
+bool zdb_http_serve_static(zdb_http_server *srv, const char *prefix,
+                           const char *root_dir)
+{
+    if (!srv || !prefix || !root_dir || srv->static_route >= 0) {
+        return false;
+    }
+    if (!zdb_http_add_handler(srv, "GET", prefix, NULL)) {
+        return false;
+    }
+    srv->static_route = srv->nroutes - 1;
+    snprintf(srv->static_root, sizeof(srv->static_root), "%s", root_dir);
+    return true;
+}
+
+void zdb_http_stop(zdb_http_server *srv)
+{
+    if (!srv) {
+        return;
+    }
+    srv->running = false;
+    shutdown(srv->listen_fd, SHUT_RDWR);
+    close(srv->listen_fd);
+    if (srv->admin_fd >= 0) {
+        shutdown(srv->admin_fd, SHUT_RDWR);
+        close(srv->admin_fd);
+        unlink(srv->admin_path);
+    }
+    pthread_mutex_destroy(&srv->routes_lock);
+    free(srv);
+}

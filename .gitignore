@@ -1,0 +1,7 @@
+*.o
+*.sqlite
+.DS_Store
+libzesty.a
+AGENTS.md
+zestyctl
+zestyd
