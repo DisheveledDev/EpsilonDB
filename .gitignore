@@ -5,3 +5,5 @@ libzesty.a
 AGENTS.md
 zestyctl
 zestyd
+tests/data/join_live/
+tests/data/chaos/

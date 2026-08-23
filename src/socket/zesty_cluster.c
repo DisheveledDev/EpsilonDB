@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -109,6 +110,12 @@ struct zdb_cluster {
     zdb_range_info *target_ranges;
     size_t ntarget_ranges;
     size_t target_ranges_cap;
+
+    /* stage 6e: when true (default), the maintainer marks this node
+     * compliant as soon as it holds everything the target assigns to
+     * it. Disabled around a join's snapshot/catch-up phase so a fresh
+     * node cannot mark itself compliant before its data lands. */
+    bool auto_compliant;
 
     char leader[ZDB_NODE_ID_MAX];
 
@@ -551,6 +558,20 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                     }
                 }
             }
+        }
+    } else if (cl->target_generation > 0) {
+        /* stage 6e: the leader gossips state with no pending target
+         * while we still hold one: the wave was voided (failed join).
+         * Only the current leader may clear our copy so a lagging
+         * node's stale gossip cannot kill a fresh wave. */
+        const cJSON *jsender =
+            cJSON_GetObjectItemCaseSensitive(doc, "sender");
+        if (cJSON_IsString(jsender) && jsender->valuestring &&
+            cl->leader[0] &&
+            strcmp(jsender->valuestring, cl->leader) == 0) {
+            cl->target_generation = 0;
+            cl->ntarget_ranges = 0;
+            changed = true;
         }
     }
 
@@ -1116,6 +1137,17 @@ static void *conn_thread(void *arg)
             zdb_snap_serve(c->fd,
                            payload ? (uint32_t)strlen(payload) : 0,
                            payload, zdb_config_engine(cl->cfg));
+        } else if (t == ZSTP_VOID) {
+            /* stage 6e: rollback request. Only the leader acts; the
+             * reply tells the requester whether a wave was voided. */
+            pthread_mutex_lock(&cl->lock);
+            c->last_recv = epoch_now();
+            pthread_mutex_unlock(&cl->lock);
+            bool ok = zdb_cluster_void_target(cl);
+            char reply[32];
+            snprintf(reply, sizeof(reply), "{\"ok\":%s}",
+                     ok ? "true" : "false");
+            zstp_send(c->fd, ZSTP_ACK, reply, &cl->send_lock);
         } else if ((t == ZSTP_REPL || t == ZSTP_QUERY ||
                     t == ZSTP_FLUSH) &&
                    (g_dispatcher || c->owner->dispatch)) {
@@ -1364,6 +1396,28 @@ static void maintainer_tick(zdb_cluster *cl)
      * still holds replica copies, so the placement layer decides what is
      * redundant and calls zdb_cluster_gc_redundant explicitly. */
     zdb_cluster_maybe_promote(cl);
+
+    /* stage 6e: auto-compliance. A node that already holds everything
+     * the pending target assigns to it reports compliance without
+     * waiting for an explicit API call; the joiner's catch-up flow
+     * disables this until its snapshots have landed. */
+    pthread_mutex_lock(&cl->lock);
+    bool auto_ok = cl->auto_compliant;
+    long long tgen = cl->target_generation;
+    long long self_gen = 0;
+    if (tgen > 0) {
+        for (size_t i = 0; i < cl->npeers; i++) {
+            if (strcmp(cl->peers[i].id, cl->self_id) == 0) {
+                self_gen = cl->peers[i].compliant_gen;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+    if (auto_ok && tgen > 0 && self_gen < tgen &&
+        !zdb_cluster_needs_sync(cl)) {
+        zdb_cluster_mark_compliant(cl);
+    }
 }
 
 static void *maintainer_main(void *arg)
@@ -1436,6 +1490,7 @@ zdb_cluster *zdb_cluster_start(zdb_config *cfg, const char *advertise_addr,
         return NULL;
     }
     cl->cfg = cfg;
+    cl->auto_compliant = true;
     snprintf(cl->self_addr, sizeof(cl->self_addr), "%s", advertise_addr);
     cl->self_port = peer_port;
 
@@ -1954,4 +2009,142 @@ void zdb_cluster_release_rebalance_lock(zdb_cluster *cl)
         return;
     }
     zdb_setting_delete(cl->cfg, SETTING_LOCK);
+}
+
+/* --- stage 6e: end-to-end rebalance wiring ---------------------------- */
+
+bool zdb_cluster_needs_sync(zdb_cluster *cl)
+{
+    if (!cl || zdb_cluster_target_generation(cl) == 0) {
+        return false;
+    }
+    zdb_engine *engine = zdb_config_engine(cl->cfg);
+    if (!engine) {
+        return false;
+    }
+    size_t nks = 0;
+    zdb_keyspace_info *kss = zdb_keyspace_list(cl->cfg, &nks);
+    bool needed = false;
+    for (size_t i = 0; kss && i < nks && !needed; i++) {
+        char key[33];
+        char path[1024];
+        if (!zdb_shard_path(engine, kss[i].partition, kss[i].name,
+                            path, sizeof(path), key)) {
+            continue;
+        }
+        if (zdb_config_is_system_key(cl->cfg, key)) {
+            continue;   /* config shards replicate separately */
+        }
+        const char *towner = zdb_cluster_target_owner(cl, key);
+        if (!towner || strcmp(towner, cl->self_id) != 0) {
+            continue;   /* the wave does not give us this shard */
+        }
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            continue;   /* shard data already present locally */
+        }
+        needed = true;
+    }
+    free(kss);
+    return needed;
+}
+
+void zdb_cluster_set_auto_compliant(zdb_cluster *cl, bool enabled)
+{
+    if (!cl) {
+        return;
+    }
+    pthread_mutex_lock(&cl->lock);
+    cl->auto_compliant = enabled;
+    pthread_mutex_unlock(&cl->lock);
+}
+
+bool zdb_cluster_void_target(zdb_cluster *cl)
+{
+    if (!cl) {
+        return false;
+    }
+    bool voided = false;
+    pthread_mutex_lock(&cl->lock);
+    if (leader_is_self_locked(cl) && cl->target_generation > 0) {
+        cl->target_generation = 0;
+        cl->ntarget_ranges = 0;
+        for (size_t i = 0; i < cl->npeers; i++) {
+            cl->peers[i].compliant_gen = 0;
+        }
+        voided = true;
+    }
+    pthread_mutex_unlock(&cl->lock);
+    if (voided) {
+        /* back to the live structure: release the lock and let every
+         * peer drop its stale pending copy via gossip */
+        zdb_cluster_release_rebalance_lock(cl);
+        pthread_mutex_lock(&cl->lock);
+        persist_state(cl);
+        pthread_mutex_unlock(&cl->lock);
+        gossip_state(cl);
+    }
+    return voided;
+}
+
+bool zdb_cluster_request_void(zdb_cluster *cl)
+{
+    if (!cl) {
+        return false;
+    }
+    char leader[ZDB_NODE_ID_MAX] = "";
+    char addr[ZDB_ADDR_MAX] = "";
+    int port = 0;
+    pthread_mutex_lock(&cl->lock);
+    snprintf(leader, sizeof(leader), "%s", cl->leader);
+    for (size_t i = 0; i < cl->npeers; i++) {
+        if (strcmp(cl->peers[i].id, leader) == 0) {
+            snprintf(addr, sizeof(addr), "%s", cl->peers[i].addr);
+            port = cl->peers[i].port;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+    if (!leader[0] || !addr[0] || port <= 0 ||
+        strcmp(leader, cl->self_id) == 0) {
+        /* no reachable leader (or we are it): void locally so a leader
+         * joiner still rolls back instead of hanging on its own RPC */
+        return zdb_cluster_void_target(cl);
+    }
+    int fd = dial_peer(addr, port);
+    if (fd < 0) {
+        return false;
+    }
+    char hello[192];
+    snprintf(hello, sizeof(hello),
+             "{\"node_id\":\"ephemeral\",\"addr\":\"%s\",\"port\":0}",
+             cl->self_addr);
+    zstp_send(fd, ZSTP_HELLO, hello, NULL);
+
+    /* absorb their HELLO/STATE before asking */
+    for (;;) {
+        char *payload = NULL;
+        int t = zstp_recv(fd, &payload);
+        free(payload);
+        if (t < 0 || t == ZSTP_STATE) {
+            break;
+        }
+    }
+    char req[64];
+    long long tgen = zdb_cluster_target_generation(cl);
+    snprintf(req, sizeof(req), "{\"generation\":%lld}", tgen);
+    zstp_send(fd, ZSTP_VOID, req, NULL);
+    bool ok = false;
+    char *payload = NULL;
+    int t = zstp_recv(fd, &payload);
+    if (t == ZSTP_ACK && payload) {
+        cJSON *doc = cJSON_Parse(payload);
+        const cJSON *jok =
+            doc ? cJSON_GetObjectItemCaseSensitive(doc, "ok") : NULL;
+        ok = cJSON_IsTrue(jok);
+        cJSON_Delete(doc);
+    }
+    free(payload);
+    close(fd);
+    return ok;
 }

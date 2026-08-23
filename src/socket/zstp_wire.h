@@ -38,8 +38,10 @@ typedef enum {
     ZSTP_SNAP_REQ  = 7, /* {key} request a shard snapshot */
     ZSTP_SNAP_DATA = 8, /* raw shard bytes; empty payload = EOF */
     ZSTP_SNAP_ACK  = 9, /* {ok:bool} end of transfer status */
-    ZSTP_FLUSH     = 10 /* {target:node_id} drain cached changes for a
-                         * peer; answered by ACK {ok,pending} */
+    ZSTP_FLUSH     = 10, /* {target:node_id} drain cached changes for a
+                          * peer; answered by ACK {ok,pending} */
+    ZSTP_VOID      = 11  /* {generation} ask the leader to void the
+                          * pending target wave; answered by ACK {ok} */
 } zstp_type;
 
 /* Sends one framed message. send_lock (optional) serialises writes on a

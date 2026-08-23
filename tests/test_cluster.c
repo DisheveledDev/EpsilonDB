@@ -146,6 +146,8 @@ static void test_two_node_mesh(const char *dir)
     sleep(1);   /* let both acceptor/maintainer threads start first */
 
     two_nodes t = { a, b };
+    zdb_cluster_set_auto_compliant(a, false);
+    zdb_cluster_set_auto_compliant(b, false);
     CHECK(zdb_cluster_join(b, "127.0.0.1", port_base) == 0);
     wait_for(15, converged, &t);
     CHECK(converged(&t));

@@ -304,14 +304,17 @@ int main(void)
     node a, b, c, d;
     snprintf(dir, sizeof(dir), "tests/data/rebalance/a");
     node_start(&a, dir, port_base);
+    zdb_cluster_set_auto_compliant(a.cluster, false);
     zdb_database_create(a.cfg, "app", 2);
 
     snprintf(dir, sizeof(dir), "tests/data/rebalance/b");
     node_start(&b, dir, port_base + 1);
+    zdb_cluster_set_auto_compliant(b.cluster, false);
     zdb_database_create(b.cfg, "app", 2);
 
     snprintf(dir, sizeof(dir), "tests/data/rebalance/c");
     node_start(&c, dir, port_base + 2);
+    zdb_cluster_set_auto_compliant(c.cluster, false);
     zdb_database_create(c.cfg, "app", 2);
 
     CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
@@ -350,9 +353,12 @@ int main(void)
         CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
     }
 
-    /* --- join a 4th node; it catches up and everyone reports compliant */
+    /* --- join a 4th node; it catches up and everyone reports compliant
+     * (auto-compliance is disabled on d so the wave stays pending until
+     * the test has driven the catch-up explicitly) */
     snprintf(dir, sizeof(dir), "tests/data/rebalance/d");
     node_start(&d, dir, port_base + 3);
+    zdb_cluster_set_auto_compliant(d.cluster, false);
     zdb_database_create(d.cfg, "app", 2);
     CHECK(zdb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc4 = { { &a, &b, &c, &d }, 4 };
@@ -371,8 +377,12 @@ int main(void)
 
     /* d catches up the moved shard from its live owner */
     CHECK(zdb_repl_catchup(d.repl, "127.0.0.1", port_base, "main", "kv"));
+    zdb_cluster_set_auto_compliant(d.cluster, true);
 
     /* every node reports compliance (d caught up; a/b/c were current) */
+    zdb_cluster_set_auto_compliant(a.cluster, true);
+    zdb_cluster_set_auto_compliant(b.cluster, true);
+    zdb_cluster_set_auto_compliant(c.cluster, true);
     zdb_cluster_mark_compliant(a.cluster);
     zdb_cluster_mark_compliant(b.cluster);
     zdb_cluster_mark_compliant(c.cluster);

@@ -178,6 +178,8 @@ static void test_two_node_wave_lock_and_promotion(void)
     sleep(1);
 
     /* --- join publishes a pending target ---------------------------- */
+    zdb_cluster_set_auto_compliant(a, false);
+    zdb_cluster_set_auto_compliant(b, false);
     CHECK(zdb_cluster_join(b, "127.0.0.1", 19221) == 0);
     target_view tv = { a, b, 2 };
     wait_for(15, targets_converged, &tv);

@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../../vendor/cjson/cJSON.h"
 
@@ -1217,8 +1219,31 @@ static bool handle_admin_cluster(const zdb_http_request *req,
         cJSON_AddStringToObject(o, "leader", leader ? leader : "none");
         cJSON_AddBoolToObject(o, "is_leader",
                               zdb_cluster_is_leader(g_cluster));
+        /* stage 6e: live/target structure versions, rebalance lock state
+         * and per-node compliance for observability */
+        long long tgen = zdb_cluster_target_generation(g_cluster);
         cJSON_AddNumberToObject(o, "generation",
                                 (double)zdb_cluster_generation(g_cluster));
+        cJSON_AddNumberToObject(o, "live_version",
+                                (double)zdb_cluster_generation(g_cluster));
+        cJSON_AddNumberToObject(o, "target_version", (double)tgen);
+        cJSON_AddBoolToObject(o, "rebalance_in_progress", tgen > 0);
+        char *lockjson =
+            zdb_setting_get(g_ctx.config, "cluster.rebalance_lock");
+        if (lockjson) {
+            cJSON *jl = cJSON_Parse(lockjson);
+            free(lockjson);
+            const cJSON *jln = jl ? cJSON_GetObjectItemCaseSensitive(
+                                        jl, "node")
+                                  : NULL;
+            cJSON_AddStringToObject(o, "rebalance_lock",
+                                    cJSON_IsString(jln) && jln->valuestring
+                                        ? jln->valuestring
+                                        : "held");
+            cJSON_Delete(jl);
+        } else {
+            cJSON_AddNullToObject(o, "rebalance_lock");
+        }
 
         zdb_peer_info peers[64];
         size_t n = zdb_cluster_peers(g_cluster, peers, 64);
@@ -1229,7 +1254,25 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             cJSON_AddStringToObject(p, "addr", peers[i].addr);
             cJSON_AddNumberToObject(p, "port", peers[i].port);
             cJSON_AddBoolToObject(p, "online", peers[i].online);
+            if (peers[i].compliant_gen > 0) {
+                cJSON_AddNumberToObject(p, "compliant",
+                                        (double)peers[i].compliant_gen);
+            }
             cJSON_AddItemToArray(arr, p);
+        }
+
+        zdb_range_info tranges[64];
+        size_t nt =
+            zdb_cluster_target_ranges(g_cluster, tranges, 64);
+        cJSON *tarr = cJSON_AddArrayToObject(o, "target_ranges");
+        for (size_t i = 0; tarr && i < nt; i++) {
+            cJSON *r = cJSON_CreateObject();
+            cJSON_AddStringToObject(r, "owner", tranges[i].node_id);
+            char span[80];
+            snprintf(span, sizeof(span), "%.8s..%.8s", tranges[i].start,
+                     tranges[i].end);
+            cJSON_AddStringToObject(r, "hash_span", span);
+            cJSON_AddItemToArray(tarr, r);
         }
 
         zdb_range_info ranges[64];
@@ -1285,6 +1328,9 @@ static bool handle_admin_join(const zdb_http_request *req,
     }
     int rc = zdb_cluster_join(g_cluster, addr->valuestring,
                               port->valueint);
+    char seed_addr[ZDB_ADDR_MAX];
+    int seed_port = port->valueint;
+    snprintf(seed_addr, sizeof(seed_addr), "%s", addr->valuestring);
     cJSON_Delete(body);
     if (rc == -2) {
         respond_error(res, 409, "rebalance in progress: one node may"
@@ -1296,8 +1342,87 @@ static bool handle_admin_join(const zdb_http_request *req,
         return true;
     }
     respond_json(res, 200, NULL);
+
+    /* --- stage 6e: run the full rebalance flow for this node -------- */
+    /* Snapshot the reserved config shards first so lists/auth/settings
+     * work here, then wait for the leader to publish the target and
+     * snapshot every data shard the wave assigns to us. While that runs,
+     * maintainer auto-compliance is disabled so we cannot report
+     * compliant before our data has landed; once synced we mark
+     * ourselves compliant and the leader promotes automatically. */
+    bool synced = true;
+    char fail_detail[128] = "";
+    zdb_cluster_set_auto_compliant(g_cluster, false);
+
+    const char *sys_ks[8];
+    size_t nsys = zdb_config_system_keyspaces(sys_ks, 8);
+    for (size_t i = 0; i < nsys && synced; i++) {
+        if (!zdb_repl_catchup(g_repl, seed_addr, seed_port,
+                              ZDB_SYSTEM_DB, sys_ks[i])) {
+            synced = false;
+            snprintf(fail_detail, sizeof(fail_detail),
+                     "config sync failed for %s", sys_ks[i]);
+        }
+    }
+
+    bool pending = false;
+    for (int i = 0; i < 100 && !pending; i++) {
+        pending = zdb_cluster_target_generation(g_cluster) > 0;
+        if (!pending) {
+            usleep(100 * 1000);
+        }
+    }
+    if (synced && pending && zdb_cluster_needs_sync(g_cluster)) {
+        size_t nks = 0;
+        zdb_keyspace_info *kss =
+            zdb_keyspace_list(g_ctx.config, &nks);
+        for (size_t i = 0; kss && i < nks && synced; i++) {
+            char key[33];
+            char path[1024];
+            if (!zdb_shard_path(g_ctx.engine, kss[i].partition,
+                                kss[i].name, path, sizeof(path), key) ||
+                zdb_config_is_system_key(g_ctx.config, key)) {
+                continue;
+            }
+            const char *towner =
+                zdb_cluster_target_owner(g_cluster, key);
+            if (!towner ||
+                strcmp(towner, zdb_cluster_self_id(g_cluster)) != 0) {
+                continue;
+            }
+            struct stat st;
+            if (stat(path, &st) == 0) {
+                continue;   /* shard already present locally */
+            }
+            /* fetch from the seed peer (an existing member that always
+             * holds a current copy of the data) */
+            if (!zdb_repl_catchup(g_repl, seed_addr, seed_port,
+                                  kss[i].partition, kss[i].name)) {
+                synced = false;
+                snprintf(fail_detail, sizeof(fail_detail),
+                         "sync failed for %s/%s", kss[i].partition,
+                         kss[i].name);
+            }
+        }
+        free(kss);
+    }
+    if (synced) {
+        zdb_cluster_mark_compliant(g_cluster);
+    } else {
+        /* roll the cluster back to the live structure */
+        zdb_cluster_request_void(g_cluster);
+    }
+    zdb_cluster_set_auto_compliant(g_cluster, true);
+
+    if (!synced) {
+        respond_error(res, 500, fail_detail[0] ? fail_detail
+                                               : "join sync failed;"
+                                                 " rolled back");
+        return true;
+    }
+    free(res->body);
     res->body = zdb_http_body_printf(&res->body_len,
-                                     "{\"joined\":true}");
+                                     "\"joined\":true,\"synced\":true}");
     return true;
 }
 

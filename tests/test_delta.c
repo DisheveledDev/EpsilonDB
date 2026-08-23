@@ -312,6 +312,7 @@ int main(void)
     /* --- d joins: leader publishes a 3-slice target ------------------ */
     snprintf(dir, sizeof(dir), "tests/data/delta/d");
     node_start(&d, dir, port_base + 2);
+    zdb_cluster_set_auto_compliant(d.cluster, false);
     zdb_database_create(d.cfg, "app", 2);
     CHECK(zdb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc3 = { { &a, &b, &d }, 3 };

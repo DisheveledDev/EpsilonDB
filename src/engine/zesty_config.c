@@ -542,7 +542,8 @@ bool zdb_partition_ensure(zdb_config *cfg, const char *database,
         return false;
     }
 
-    bool exists = zdb_partition_get(cfg, database, partition, NULL);
+    zdb_partition_info existing;
+    bool exists = zdb_partition_get(cfg, database, partition, &existing);
     if (!exists) {
         /* registry of used partitions per database */
         if (!zdb_partition_create(cfg, database, partition,
@@ -779,4 +780,18 @@ bool zdb_config_is_system_key(zdb_config *cfg, const char key[33])
         }
     }
     return false;
+}
+
+size_t zdb_config_system_keyspaces(const char **out, size_t cap)
+{
+    static const char *const keyspaces[] = {
+        CFG_KEYSPACE_DATABASES, CFG_KEYSPACE_GROUPS,   CFG_KEYSPACE_USERS,
+        CFG_KEYSPACE_PARTITIONS, CFG_KEYSPACE_KEYSPACES,
+        CFG_KEYSPACE_SETTINGS,
+    };
+    size_t n = sizeof(keyspaces) / sizeof(keyspaces[0]);
+    for (size_t i = 0; out && i < n && i < cap; i++) {
+        out[i] = keyspaces[i];
+    }
+    return n;
 }

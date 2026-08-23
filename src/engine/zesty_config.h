@@ -162,4 +162,9 @@ char **zdb_setting_list(zdb_config *cfg, size_t *count_out);
  * remove these: every node needs its own config view. */
 bool zdb_config_is_system_key(zdb_config *cfg, const char key[33]);
 
+/* Fills `out` (up to `cap` entries) with the reserved __system__ config
+ * keyspace names (in stable order) and returns the count. Used by the
+ * stage 6e join flow to snapshot config shards onto a joining node. */
+size_t zdb_config_system_keyspaces(const char **out, size_t cap);
+
 #endif

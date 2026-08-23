@@ -146,4 +146,28 @@ bool zdb_cluster_maybe_promote(zdb_cluster *cl);
  * never removed. Returns the number GC'd (0 or 1). */
 size_t zdb_cluster_gc_redundant(zdb_cluster *cl);
 
+/* --- stage 6e: end-to-end rebalance wiring ---------------------------- */
+
+/* True when this node still lacks data for a non-system shard the
+ * pending target assigns to it (target owner is self, live owner is
+ * not, and no local shard file exists yet). Always false when no wave
+ * is pending. */
+bool zdb_cluster_needs_sync(zdb_cluster *cl);
+
+/* Enables/disables maintainer auto-compliance (default enabled).
+ * Disabled while a join's snapshot/catch-up runs so a fresh node does
+ * not report compliance before its data has landed. */
+void zdb_cluster_set_auto_compliant(zdb_cluster *cl, bool enabled);
+
+/* Leader-only: discard the pending target wave and release the
+ * rebalance lock, returning the cluster to the live structure.
+ * Returns true when a pending wave was actually voided. */
+bool zdb_cluster_void_target(zdb_cluster *cl);
+
+/* Ask the leader to void the pending target wave (ZSTP_VOID over an
+ * ephemeral connection). Returns true when the leader acknowledged a
+ * void. Used by a joiner whose local catch-up failed so the cluster
+ * rolls back to the live structure instead of waiting for promotion. */
+bool zdb_cluster_request_void(zdb_cluster *cl);
+
 #endif
