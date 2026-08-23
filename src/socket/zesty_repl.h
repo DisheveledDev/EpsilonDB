@@ -101,4 +101,38 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const char **filters,
                          size_t nfilters, size_t *count_out);
 
+/* --- stage 6c: delta catch-up ---------------------------------------- */
+
+/* Puts this node into (or out of) the "syncing" state. While syncing,
+ * inbound REPL frames are answered ok:false (rather than applied) so
+ * writers cache those changes in their local change log for us instead;
+ * the deltas are replayed after the shard snapshot lands, guaranteeing
+ * the snapshot overwrite never clobbers an already-applied change. */
+void zdb_repl_set_syncing(zdb_repl *rp, bool syncing);
+
+/* Number of cached changes this node still owes `node_id`. */
+size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id);
+
+/* Force-drain this node's cached changes destined for `node_id` right
+ * now (blocking, single-flight). Returns the number of changes still
+ * queued afterwards (0 = fully caught up). Safe to call from any thread;
+ * used by the FLUSH handler and by zdb_repl_catchup. */
+size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id);
+
+/* Flush every online peer's cached-change queue for this node, looping
+ * until all report empty (or ~20s deadline). Returns true when fully
+ * caught up. Fine-grained counterpart to zdb_repl_catchup for callers
+ * (tests, 6e) that need to interleave writes with the snapshot. */
+bool zdb_repl_flush(zdb_repl *rp);
+
+/* Catch up one shard on this node: take a snapshot of partition/keyspace
+ * from owner_addr:owner_port, invalidate the local handle, then flush
+ * every online peer's change cache for us until all queues are empty.
+ * Returns true when the snapshot landed and all cached deltas for this
+ * shard's peers have been drained (data is now at least as current as a
+ * quorum). Sets syncing around the snapshot transfer so concurrent
+ * writes are cached and replayed, never lost. */
+bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
+                      const char *partition, const char *keyspace);
+
 #endif

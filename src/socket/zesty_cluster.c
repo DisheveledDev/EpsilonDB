@@ -24,6 +24,7 @@
  */
 
 #include "zesty_cluster.h"
+#include "zesty_snap.h"
 #include "zstp_wire.h"
 
 #include <arpa/inet.h>
@@ -166,7 +167,7 @@ static int read_full(int fd, void *buf, size_t len)
 
 bool zstp_type_valid(int type)
 {
-    return type >= ZSTP_HELLO && type <= ZSTP_SNAP_ACK;
+    return type >= ZSTP_HELLO && type <= ZSTP_FLUSH;
 }
 
 static zstp_dispatch_fn g_dispatcher;
@@ -1078,7 +1079,19 @@ static void *conn_thread(void *arg)
             }
             recompute_leader(cl);
             pthread_mutex_unlock(&cl->lock);
-        } else if ((t == ZSTP_REPL || t == ZSTP_QUERY) &&
+        } else if (t == ZSTP_SNAP_REQ) {
+            /* stage 6b/6c: shard snapshot request. Served directly
+             * (not via the dispatcher) so the engine behind the config
+             * store streams a consistent copy; runs without cl->lock
+             * held because it blocks on SQLite + socket I/O. */
+            pthread_mutex_lock(&cl->lock);
+            c->last_recv = epoch_now();
+            pthread_mutex_unlock(&cl->lock);
+            zdb_snap_serve(c->fd,
+                           payload ? (uint32_t)strlen(payload) : 0,
+                           payload, zdb_config_engine(cl->cfg));
+        } else if ((t == ZSTP_REPL || t == ZSTP_QUERY ||
+                    t == ZSTP_FLUSH) &&
                    (g_dispatcher || c->owner->dispatch)) {
             /* stage 5: data-plane frames. The dispatcher runs without
              * cl->lock held: applying writes can block on SQLite */

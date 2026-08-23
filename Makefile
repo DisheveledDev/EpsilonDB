@@ -15,10 +15,10 @@ CLI_BIN = bin/zestyctl
 
 TEST_SRC = tests/test_engine.c tests/test_config.c tests/test_http.c \
            tests/test_replication.c tests/test_structure.c \
-           tests/test_snapshot.c
+           tests/test_snapshot.c tests/test_delta.c
 TEST_BINS = tests/test_engine tests/test_config tests/test_http \
             tests/test_cluster tests/test_replication tests/test_structure \
-            tests/test_snapshot
+            tests/test_snapshot tests/test_delta
 .PHONY: all test clean
 
 all: $(SERVER_BIN) $(CLI_BIN)
@@ -54,7 +54,8 @@ test: all $(TEST_BINS)
 	mkdir -p tests/data
 	./tests/test_engine && ./tests/test_config && ./tests/test_http_run.sh \
 		&& ./tests/test_cluster && ./tests/test_replication \
-		&& ./tests/test_structure && ./tests/test_snapshot
+		&& ./tests/test_structure && ./tests/test_snapshot \
+		&& ./tests/test_delta
 
 tests/test_engine: tests/test_engine.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
@@ -67,19 +68,25 @@ tests/test_http: tests/test_http.c
 
 tests/test_cluster: tests/test_cluster.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
 
 tests/test_replication: tests/test_replication.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+		src/socket/zesty_repl.c src/socket/zesty_snap.c \
+		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
 
 tests/test_structure: tests/test_structure.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
 
 tests/test_snapshot: tests/test_snapshot.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
 		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+
+tests/test_delta: tests/test_delta.c $(ENGINE_LIB)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
+		src/socket/zesty_repl.c src/socket/zesty_snap.c \
+		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf bin

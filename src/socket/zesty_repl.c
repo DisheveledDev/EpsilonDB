@@ -29,8 +29,10 @@
 #include <unistd.h>
 
 #include "../../vendor/cjson/cJSON.h"
+#include "../engine/zesty_engine.h"
 #include "../sqlite/sqlite3.h"
 #include "zstp_wire.h"
+#include "zesty_snap.h"
 
 #define MAX_PEERS_SNAPSHOT 64
 #define REPL_CONNECT_TIMEOUT_MS 1500
@@ -267,10 +269,15 @@ struct zdb_repl {
     void *ud;
 
     char self_id[ZDB_NODE_ID_MAX];
+    char data_dir[512];
     long long change_seq;
 
     bool running;
     pthread_t maint_thread;
+
+    /* stage 6c: syncing gate (see zdb_repl_set_syncing) */
+    pthread_mutex_t sync_lock;
+    bool syncing;
 
     /* per-peer replay bookkeeping, guarded by replay_lock */
     pthread_mutex_t replay_lock;
@@ -278,7 +285,24 @@ struct zdb_repl {
 };
 
 /* ------------------------------------------------------------------ */
-/* dispatcher: answer inbound REPL / QUERY frames                      */
+/* dispatcher: answer inbound REPL / QUERY / FLUSH frames              */
+
+/* True when an ACK payload means "delivered" (ok present and true, or
+ * the field is absent for older peers that never sent it). */
+static bool ack_ok(const char *reply)
+{
+    if (!reply) {
+        return false;
+    }
+    cJSON *doc = cJSON_Parse(reply);
+    if (!doc) {
+        return false;
+    }
+    const cJSON *jok = cJSON_GetObjectItemCaseSensitive(doc, "ok");
+    bool ok = jok ? cJSON_IsTrue(jok) : true;
+    cJSON_Delete(doc);
+    return ok;
+}
 
 static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
                           int *reply_type, char **reply_json)
@@ -291,13 +315,49 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
     }
 
     if (msg_type == ZSTP_REPL && rp && rp->apply) {
-        bool ok = rp->apply(rp->ud, req);
+        /* stage 6c: while this node is syncing shard snapshots, refuse
+         * incoming writes so the sender caches them for later replay */
+        pthread_mutex_lock(&rp->sync_lock);
+        bool syncing = rp->syncing;
+        pthread_mutex_unlock(&rp->sync_lock);
+
+        bool ok = false;
+        if (!syncing) {
+            ok = rp->apply(rp->ud, req);
+        }
         cJSON_Delete(req);
         cJSON *ack = cJSON_CreateObject();
         if (!ack) {
             return false;
         }
         cJSON_AddBoolToObject(ack, "ok", ok);
+        *reply_type = ZSTP_ACK;
+        *reply_json = json_print(ack);
+        cJSON_Delete(ack);
+        return *reply_json != NULL;
+    }
+
+    if (msg_type == ZSTP_FLUSH && rp) {
+        /* stage 6c: a peer asks us to flush our cached changes for it.
+         * Drain synchronously and report how many remain. */
+        const cJSON *jt =
+            cJSON_GetObjectItemCaseSensitive(req, "target");
+        char target[ZDB_NODE_ID_MAX] = "";
+        if (cJSON_IsString(jt) && jt->valuestring) {
+            snprintf(target, sizeof(target), "%.63s", jt->valuestring);
+        }
+        cJSON_Delete(req);
+
+        size_t remaining = 0;
+        if (target[0]) {
+            remaining = zdb_repl_drain_peer(rp, target);
+        }
+        cJSON *ack = cJSON_CreateObject();
+        if (!ack) {
+            return false;
+        }
+        cJSON_AddBoolToObject(ack, "ok", remaining == 0);
+        cJSON_AddNumberToObject(ack, "pending", (double)remaining);
         *reply_type = ZSTP_ACK;
         *reply_json = json_print(ack);
         cJSON_Delete(ack);
@@ -450,12 +510,14 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
         char *reply = NULL;
         int t = rpc_once(peers[i].addr, peers[i].port, ZSTP_REPL,
                          payload, ZSTP_ACK, &reply);
-        if (t == ZSTP_ACK) {
+        if (t == ZSTP_ACK && ack_ok(reply)) {
             holders++;
             free(reply);
             continue;
         }
-        /* 3. unacknowledged: persist for later replay */
+        free(reply);
+        /* 3. unacknowledged (or refused: syncing peer): persist for
+         * later replay */
         cache_append(&rp->cache, peers[i].id, cid, strdup(payload));
     }
     free(payload);
@@ -487,8 +549,9 @@ static bool deliver_cached(zdb_repl *rp, const zdb_peer_info *peer,
     char *reply = NULL;
     int t = rpc_once(peer->addr, peer->port, ZSTP_REPL, payload, ZSTP_ACK,
                      &reply);
+    bool ok = (t == ZSTP_ACK) && ack_ok(reply);
     free(reply);
-    if (t == ZSTP_ACK) {
+    if (ok) {
         cache_remove(&rp->cache, peer->id, cid);
         return true;
     }
@@ -551,6 +614,102 @@ static void free_rows(pending_row *rows, size_t count)
         free(rows[i].payload);
     }
     free(rows);
+}
+
+/* Resolves a node id to its current dialable peer info. Returns false
+ * when unknown or not dialable. */
+static bool find_peer(zdb_repl *rp, const char *node_id, zdb_peer_info *out)
+{
+    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    size_t n = zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(peers[i].id, node_id) == 0 &&
+            peers[i].addr[0] != '\0' && peers[i].port > 0) {
+            *out = peers[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id)
+{
+    if (!rp || !node_id) {
+        return 0;
+    }
+    /* cache_load gives us at most 256; count directly for accuracy */
+    if (!rp->cache.db) {
+        return 0;
+    }
+    pthread_mutex_lock(&rp->cache.lock);
+    sqlite3_stmt *stmt = NULL;
+    size_t count = 0;
+    if (sqlite3_prepare_v2(rp->cache.db,
+                           "SELECT COUNT(*) FROM PendingChanges"
+                           " WHERE target = ?",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, node_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = (size_t)sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    pthread_mutex_unlock(&rp->cache.lock);
+    return count;
+}
+
+size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id)
+{
+    if (!rp || !node_id) {
+        return 0;
+    }
+    /* single-flight: the maintenance thread may already be draining this
+     * peer; if so, report what is left rather than racing it */
+    pthread_mutex_lock(&rp->replay_lock);
+    if (rp->replaying[0] != '\0' &&
+        strcmp(rp->replaying, node_id) == 0) {
+        pthread_mutex_unlock(&rp->replay_lock);
+        return zdb_repl_pending_for(rp, node_id);
+    }
+    snprintf(rp->replaying, sizeof(rp->replaying), "%s", node_id);
+    pthread_mutex_unlock(&rp->replay_lock);
+
+    zdb_peer_info peer;
+    if (!find_peer(rp, node_id, &peer)) {
+        pthread_mutex_lock(&rp->replay_lock);
+        rp->replaying[0] = '\0';
+        pthread_mutex_unlock(&rp->replay_lock);
+        return zdb_repl_pending_for(rp, node_id);
+    }
+
+    /* drain in batches until the queue is empty or delivery stalls */
+    for (int round = 0; round < 64; round++) {
+        size_t count = 0;
+        pending_row *rows =
+            cache_load(&rp->cache, node_id, 256, &count);
+        if (!rows || count == 0) {
+            free_rows(rows, 0);
+            break;
+        }
+        bool progress = false;
+        for (size_t i = 0; i < count; i++) {
+            if (deliver_cached(rp, &peer, rows[i].cid,
+                               rows[i].payload)) {
+                progress = true;
+            } else {
+                break;   /* stall: retry on a later flush/tick */
+            }
+        }
+        free_rows(rows, count);
+        if (!progress) {
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&rp->replay_lock);
+    rp->replaying[0] = '\0';
+    pthread_mutex_unlock(&rp->replay_lock);
+    return zdb_repl_pending_for(rp, node_id);
 }
 
 /* Drains the queue for one peer. Single-flight per peer via
@@ -1172,6 +1331,106 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
 }
 
 /* ------------------------------------------------------------------ */
+/* stage 6c: delta catch-up                                            */
+
+void zdb_repl_set_syncing(zdb_repl *rp, bool syncing)
+{
+    if (!rp) {
+        return;
+    }
+    pthread_mutex_lock(&rp->sync_lock);
+    rp->syncing = syncing;
+    pthread_mutex_unlock(&rp->sync_lock);
+}
+
+/* Sends a FLUSH request to every online, dialable peer asking it to
+ * drain its cached changes for us; loops until all report an empty
+ * queue or the deadline passes. Returns true when every peer reported
+ * pending == 0. */
+bool zdb_repl_flush(zdb_repl *rp)
+{
+    long long deadline = mono_ms() + 20000;
+    bool all_empty = false;
+    for (;;) {
+        zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
+        size_t n = zdb_cluster_peers(rp->cluster, peers,
+                                     MAX_PEERS_SNAPSHOT);
+        all_empty = true;
+        bool any = false;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(peers[i].id, rp->self_id) == 0) {
+                continue;
+            }
+            if (!peers[i].online || peers[i].addr[0] == '\0' ||
+                peers[i].port <= 0) {
+                continue;
+            }
+            any = true;
+            char req[96];
+            snprintf(req, sizeof(req), "{\"target\":\"%.63s\"}",
+                     rp->self_id);
+            char *reply = NULL;
+            int t = rpc_once(peers[i].addr, peers[i].port, ZSTP_FLUSH,
+                             req, ZSTP_ACK, &reply);
+            long long pending = 0;
+            if (t == ZSTP_ACK && reply) {
+                cJSON *doc = cJSON_Parse(reply);
+                const cJSON *jp =
+                    doc ? cJSON_GetObjectItemCaseSensitive(doc, "pending")
+                        : NULL;
+                if (cJSON_IsNumber(jp)) {
+                    pending = (long long)jp->valuedouble;
+                }
+                cJSON_Delete(doc);
+            }
+            free(reply);
+            if (pending > 0) {
+                all_empty = false;
+            }
+        }
+        if (!any || all_empty) {
+            break;
+        }
+        if (mono_ms() >= deadline) {
+            break;
+        }
+        sleep_ms(100);
+    }
+    return all_empty;
+}
+
+bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
+                      const char *partition, const char *keyspace)
+{
+    if (!rp || !owner_addr || !partition || !keyspace) {
+        return false;
+    }
+
+    /* refuse writes while we replace the shard file so writers cache
+     * deltas instead of applying them to a file the snapshot will
+     * overwrite (LWW replays them idempotently afterwards) */
+    zdb_repl_set_syncing(rp, true);
+
+    char key[33];
+    char path[1024];
+    if (!zdb_shard_path(rp->cfg_engine, partition, keyspace, path,
+                        sizeof(path), key)) {
+        zdb_repl_set_syncing(rp, false);
+        return false;
+    }
+    if (zdb_snap_fetch(owner_addr, owner_port, key, rp->data_dir) != 0) {
+        zdb_repl_set_syncing(rp, false);
+        return false;
+    }
+    zdb_shard_invalidate(rp->cfg_engine, partition, keyspace);
+
+    /* reopen writes; cached deltas now land safely after the snapshot */
+    zdb_repl_set_syncing(rp, false);
+
+    return zdb_repl_flush(rp);
+}
+
+/* ------------------------------------------------------------------ */
 /* lifecycle                                                           */
 
 void zdb_repl_set_handlers(zdb_repl *rp, zdb_repl_apply_fn apply,
@@ -1200,6 +1459,10 @@ zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
     rp->cfg_engine = zdb_config_engine(cfg);
     snprintf(rp->self_id, sizeof(rp->self_id), "%s",
              zdb_cluster_self_id(cluster));
+    snprintf(rp->data_dir, sizeof(rp->data_dir), "%s", data_dir);
+    pthread_mutex_init(&rp->sync_lock, NULL);
+    pthread_mutex_init(&rp->replay_lock, NULL);
+    rp->syncing = false;
 
     if (!cache_open(&rp->cache, data_dir)) {
         fprintf(stderr, "zdb: change cache unavailable; writes will not"
@@ -1230,5 +1493,7 @@ void zdb_repl_stop(zdb_repl *rp)
     pthread_join(rp->maint_thread, NULL);
     zdb_cluster_set_dispatcher(rp->cluster, NULL, NULL);
     cache_close(&rp->cache);
+    pthread_mutex_destroy(&rp->sync_lock);
+    pthread_mutex_destroy(&rp->replay_lock);
     free(rp);
 }
