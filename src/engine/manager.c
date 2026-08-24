@@ -42,6 +42,19 @@ static size_t bucket_for(const char *key)
 static void shard_key(const char *partition, const char *keyspace,
                       char out[33])
 {
+    char partition_hash[33];
+    char keyspace_hash[33];
+    char framed[66];
+    zdb_md5_hex(partition, strlen(partition), partition_hash);
+    zdb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
+    snprintf(framed, sizeof(framed), "%s:%s", partition_hash,
+             keyspace_hash);
+    zdb_md5_hex(framed, strlen(framed), out);
+}
+
+static void legacy_shard_key(const char *partition, const char *keyspace,
+                             char out[33])
+{
     char combined[1024];
     snprintf(combined, sizeof(combined), "%s%s", partition, keyspace);
     zdb_md5_hex(combined, strlen(combined), out);
@@ -61,11 +74,15 @@ static zdb_shard *find_locked(zdb_engine *mgr, const char *key)
 /* Insert an opened shard. Takes ownership on success. Caller must not hold
  * mgr->lock. Returns the shard, or NULL after freeing it if the key was
  * inserted concurrently. */
-static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh)
+static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh,
+                               bool acquire)
 {
     pthread_mutex_lock(&mgr->lock);
     zdb_shard *existing = find_locked(mgr, sh->key);
     if (existing) {
+        if (acquire) {
+            existing->refs++;
+        }
         pthread_mutex_unlock(&mgr->lock);
         zdb_shard_free(sh);
         return existing;
@@ -76,6 +93,7 @@ static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh)
         zdb_shard_free(sh);
         return NULL;
     }
+    sh->refs = acquire ? 1 : 0;
     link->shard = sh;
     link->next = mgr->buckets[bucket_for(sh->key)];
     mgr->buckets[bucket_for(sh->key)] = link;
@@ -83,16 +101,66 @@ static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh)
     return sh;
 }
 
-/* Returns the shard for partition/keyspace, opening (and inserting) it on
- * first use. */
+static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
+                                 const char *keyspace, const char *new_key)
+{
+    char legacy_key[33];
+    legacy_shard_key(partition, keyspace, legacy_key);
+    if (strcmp(legacy_key, new_key) == 0) {
+        return true;
+    }
+    char new_path[1024];
+    char legacy_path[1024];
+    if (snprintf(new_path, sizeof(new_path), "%s/%s.sqlite", mgr->path,
+                 new_key) >= (int)sizeof(new_path) ||
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s.sqlite", mgr->path,
+                 legacy_key) >= (int)sizeof(legacy_path)) {
+        return false;
+    }
+    struct stat file_stat;
+    if (stat(new_path, &file_stat) == 0 ||
+        (stat(legacy_path, &file_stat) != 0 && errno == ENOENT)) {
+        return true;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    struct shard_link **link = &mgr->buckets[bucket_for(legacy_key)];
+    while (*link && strcmp((*link)->shard->key, legacy_key) != 0) {
+        link = &(*link)->next;
+    }
+    zdb_shard *legacy = NULL;
+    if (*link) {
+        if ((*link)->shard->refs > 0) {
+            pthread_mutex_unlock(&mgr->lock);
+            return false;
+        }
+        struct shard_link *removed = *link;
+        legacy = removed->shard;
+        *link = removed->next;
+        free(removed);
+    }
+    if (legacy) {
+        zdb_shard_free(legacy);
+    }
+    bool migrated = rename(legacy_path, new_path) == 0 || errno == ENOENT;
+    pthread_mutex_unlock(&mgr->lock);
+    return migrated;
+}
+
 static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
                             const char *keyspace)
 {
     char key[33];
     shard_key(partition, keyspace, key);
+    if (!migrate_legacy_shard(mgr, partition, keyspace, key)) {
+        return NULL;
+    }
 
     pthread_mutex_lock(&mgr->lock);
     zdb_shard *sh = find_locked(mgr, key);
+    if (sh) {
+        sh->refs++;
+    }
     pthread_mutex_unlock(&mgr->lock);
     if (sh) {
         return sh;
@@ -109,7 +177,21 @@ static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
     if (!opened) {
         return NULL;
     }
-    return insert_shard(mgr, opened);
+    return insert_shard(mgr, opened, true);
+}
+
+static void shard_release(zdb_engine *mgr, zdb_shard *sh)
+{
+    bool destroy = false;
+    pthread_mutex_lock(&mgr->lock);
+    if (sh->refs > 0) {
+        sh->refs--;
+    }
+    destroy = sh->retired && sh->refs == 0;
+    pthread_mutex_unlock(&mgr->lock);
+    if (destroy) {
+        zdb_shard_free(sh);
+    }
 }
 
 static void close_all(zdb_engine *mgr)
@@ -224,7 +306,7 @@ zdb_engine *zdb_engine_open(const char *path)
                     entry->d_name);
             continue;
         }
-        if (!insert_shard(mgr, sh)) {
+        if (!insert_shard(mgr, sh, false)) {
             closedir(dir);
             zdb_engine_close(mgr);
             return NULL;
@@ -313,10 +395,12 @@ bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
         sh = victim->shard;
         *pp = victim->next;
         free(victim);
+        sh->retired = true;
+        sh->refs++;
     }
     pthread_mutex_unlock(&mgr->lock);
     if (sh) {
-        zdb_shard_free(sh);
+        pthread_mutex_lock(&sh->lock);
     }
 
     /* remove the file and any SQLite sidecars */
@@ -330,6 +414,10 @@ bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
     unlink(side);
     if (rc != 0 && errno == ENOENT) {
         rc = 0;   /* already gone */
+    }
+    if (sh) {
+        pthread_mutex_unlock(&sh->lock);
+        shard_release(mgr, sh);
     }
     return rc == 0;
 }
@@ -414,6 +502,9 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
     zdb_shard *sh = find_locked(mgr, key);
     if (sh && fresh) {
         pthread_mutex_lock(&sh->lock);
+        for (int i = 0; i < sh->cache_count; i++) {
+            sqlite3_finalize(sh->cache[i].stmt);
+        }
         old_db = sh->db;
         sh->db = fresh->db;
         sh->cache_count = 0;
@@ -426,8 +517,6 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
         pthread_mutex_destroy(&fresh->lock);
         free(fresh);
         fresh = NULL;
-    } else if (!sh) {
-        ok = false;   /* nothing cached: caller just missed */
     }
     pthread_mutex_unlock(&mgr->lock);
 
@@ -458,6 +547,43 @@ bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
     return sh != NULL;
 }
 
+bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
+                        const char *keyspace)
+{
+    if (!mgr || !partition || !keyspace) {
+        return false;
+    }
+    char path[1024];
+    char key[33];
+    if (!zdb_shard_path(mgr, partition, keyspace, path, sizeof(path), key)) {
+        return false;
+    }
+    struct stat file_stat;
+    if (stat(path, &file_stat) != 0 || file_stat.st_size <= 0) {
+        return false;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                        NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    bool valid = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt,
+                                    NULL) == SQLITE_OK &&
+                 stmt && sqlite3_step(stmt) == SQLITE_ROW;
+    const char *result = valid ? (const char *)sqlite3_column_text(stmt, 0)
+                               : NULL;
+    valid = result && strcmp(result, "ok") == 0;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return valid;
+}
+
+
 bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
              const char *id, const char *json_value, long long ttl_seconds,
              const char **filters, size_t nfilters)
@@ -466,7 +592,10 @@ bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return false;
     }
-    return zdb_shard_put(sh, id, json_value, ttl_seconds, filters, nfilters);
+    bool ok = zdb_shard_put(sh, id, json_value, ttl_seconds, filters,
+                            nfilters);
+    shard_release(mgr, sh);
+    return ok;
 }
 
 cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -476,7 +605,9 @@ cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_get(sh, id);
+    cJSON *result = zdb_shard_get(sh, id);
+    shard_release(mgr, sh);
+    return result;
 }
 
 bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -486,7 +617,9 @@ bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return false;
     }
-    return zdb_shard_delete(sh, id);
+    bool ok = zdb_shard_delete(sh, id);
+    shard_release(mgr, sh);
+    return ok;
 }
 
 char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -497,7 +630,9 @@ char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_ids(sh, filters, nfilters, count_out);
+    char **result = zdb_shard_ids(sh, filters, nfilters, count_out);
+    shard_release(mgr, sh);
+    return result;
 }
 
 cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -507,7 +642,9 @@ cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_all(sh, filters, nfilters);
+    cJSON *result = zdb_shard_all(sh, filters, nfilters);
+    shard_release(mgr, sh);
+    return result;
 }
 
 cJSON *zdb_query(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -518,7 +655,9 @@ cJSON *zdb_query(zdb_engine *mgr, const char *partition, const char *keyspace,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_query(sh, filters, nfilters, fields, nfields);
+    cJSON *result = zdb_shard_query(sh, filters, nfilters, fields, nfields);
+    shard_release(mgr, sh);
+    return result;
 }
 
 bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
@@ -528,7 +667,9 @@ bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
     if (!sh) {
         return false;
     }
-    return zdb_shard_cleanup(sh);
+    bool ok = zdb_shard_cleanup(sh);
+    shard_release(mgr, sh);
+    return ok;
 }
 
 bool zdb_replica_put(zdb_engine *mgr, const char *partition,
@@ -537,24 +678,49 @@ bool zdb_replica_put(zdb_engine *mgr, const char *partition,
                      long long timestamp, const char **filters,
                      size_t nfilters)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
-    if (!sh) {
-        return false;
-    }
-    return zdb_shard_replica_put(sh, id, json_value, ttl_absolute,
-                                 timestamp, filters, nfilters);
+    return zdb_replica_put_origin(mgr, partition, keyspace, id, json_value,
+                                  ttl_absolute, timestamp, "", filters,
+                                  nfilters);
 }
 
-bool zdb_replica_delete(zdb_engine *mgr, const char *partition,
-                        const char *keyspace, const char *id,
-                        long long timestamp)
+bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
+                            const char *keyspace, const char *id,
+                            const char *json_value, long long ttl_absolute,
+                            long long timestamp, const char *origin,
+                            const char **filters, size_t nfilters)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    return zdb_shard_replica_delete(sh, id, timestamp);
+    bool ok = zdb_shard_replica_put(sh, id, json_value, ttl_absolute,
+                                    timestamp, origin, filters, nfilters);
+    shard_release(mgr, sh);
+    return ok;
 }
+
+
+bool zdb_replica_delete(zdb_engine *mgr, const char *partition,
+                        const char *keyspace, const char *id,
+                        long long timestamp)
+{
+    return zdb_replica_delete_origin(mgr, partition, keyspace, id, timestamp,
+                                     "");
+}
+
+bool zdb_replica_delete_origin(zdb_engine *mgr, const char *partition,
+                               const char *keyspace, const char *id,
+                               long long timestamp, const char *origin)
+{
+    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    if (!sh) {
+        return false;
+    }
+    bool ok = zdb_shard_replica_delete(sh, id, timestamp, origin);
+    shard_release(mgr, sh);
+    return ok;
+}
+
 
 cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
                   const char *keyspace, const char *id,
@@ -564,7 +730,9 @@ cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_get_ts(sh, id, timestamp_out);
+    cJSON *result = zdb_shard_get_ts(sh, id, timestamp_out);
+    shard_release(mgr, sh);
+    return result;
 }
 
 cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
@@ -575,7 +743,9 @@ cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_all_ts(sh, filters, nfilters);
+    cJSON *result = zdb_shard_all_ts(sh, filters, nfilters);
+    shard_release(mgr, sh);
+    return result;
 }
 
 cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
@@ -586,7 +756,10 @@ cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
     if (!sh) {
         return NULL;
     }
-    return zdb_shard_query_ts(sh, filters, nfilters, fields, nfields);
+    cJSON *result = zdb_shard_query_ts(sh, filters, nfilters, fields,
+                                       nfields);
+    shard_release(mgr, sh);
+    return result;
 }
 
 void zdb_free_strings(char **strings)

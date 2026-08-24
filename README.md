@@ -10,8 +10,9 @@ across nodes.
 
 - **REST data API**: put/get/delete/all/ids/query with optional indexed
   filters (`?filter=k=v`, repeatable) and TTLs (`?ttl=seconds`).
-- **Sharded storage**: shard file = SQLite db named
-  `md5(partition + keyspace) + ".sqlite"`; soft deletes; 60s cleanup pass
+- **Sharded storage**: shard file = SQLite db named from a framed digest of
+  partition and keyspace; legacy concatenated-name shards migrate lazily;
+  soft deletes; 60s cleanup pass
   with a 2h grace window (lets offline nodes replay missed changes);
   automatic VACUUM after 10k expirations.
 - **Clustering**: permanent TCP mesh between peers (ZSTP protocol),

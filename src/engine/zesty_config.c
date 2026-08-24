@@ -1,5 +1,7 @@
 #include "zesty_config.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,10 @@
 struct zdb_config {
     zdb_engine *engine;
     bool owns_engine;
+    pthread_mutex_t replicate_lock;
+    pthread_mutex_t group_lock;
+    zdb_config_replicate_fn replicate;
+    void *replicate_ctx;
 };
 
 #define NAME_OK(name, type) \
@@ -62,6 +68,13 @@ static const char *filter_for_keyspace(const char *keyspace)
     return FILTER_TYPE_PARTITION;
 }
 
+static bool internal_cluster_setting(const char *keyspace, const char *id)
+{
+    return strcmp(keyspace, CFG_KEYSPACE_SETTINGS) == 0 &&
+           (strncmp(id, "cluster.", 8) == 0 ||
+            strncmp(id, "rebalance.", 10) == 0);
+}
+
 static bool store(zdb_config *cfg, const char *keyspace, const char *id,
                   cJSON *obj)
 {
@@ -70,10 +83,32 @@ static bool store(zdb_config *cfg, const char *keyspace, const char *id,
         return false;
     }
     const char *type_filter = filter_for_keyspace(keyspace);
-    bool ok = zdb_put(cfg->engine, ZDB_SYSTEM_DB, keyspace, id, json, -1,
-                      &type_filter, 1);
+    pthread_mutex_lock(&cfg->replicate_lock);
+    bool ok;
+    if (cfg->replicate && !internal_cluster_setting(keyspace, id)) {
+        ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, json,
+                            type_filter);
+        pthread_mutex_unlock(&cfg->replicate_lock);
+    } else {
+        pthread_mutex_unlock(&cfg->replicate_lock);
+        ok = zdb_put(cfg->engine, ZDB_SYSTEM_DB, keyspace, id, json, -1,
+                     &type_filter, 1);
+    }
     free(json);
     return ok;
+}
+
+static bool remove_record(zdb_config *cfg, const char *keyspace,
+                          const char *id)
+{
+    pthread_mutex_lock(&cfg->replicate_lock);
+    if (cfg->replicate && !internal_cluster_setting(keyspace, id)) {
+        bool ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, NULL, NULL);
+        pthread_mutex_unlock(&cfg->replicate_lock);
+        return ok;
+    }
+    pthread_mutex_unlock(&cfg->replicate_lock);
+    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, keyspace, id);
 }
 
 static cJSON *collect(zdb_config *cfg, const char *keyspace,
@@ -96,9 +131,15 @@ static void copy_name(char *dst, size_t cap, const cJSON *obj,
 static uint64_t json_u64(const cJSON *obj, const char *field)
 {
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, field);
-    if (cJSON_IsNumber(item)) {
-        /* 64-bit masks exceed double precision only above 2^53, and group
-         * bits are <= 63, so exact representation is guaranteed. */
+    if (cJSON_IsString(item) && item->valuestring) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(item->valuestring, &end, 10);
+        if (errno == 0 && end && *end == '\0') {
+            return (uint64_t)value;
+        }
+    }
+    if (cJSON_IsNumber(item) && item->valuedouble >= 0) {
         return (uint64_t)item->valuedouble;
     }
     return 0;
@@ -108,7 +149,7 @@ static void set_json_u64(cJSON *obj, const char *field, uint64_t v)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
-    cJSON_AddNumberToObject(obj, field, strtod(buf, NULL));
+    cJSON_AddStringToObject(obj, field, buf);
 }
 
 zdb_config *zdb_config_open(zdb_engine *engine)
@@ -122,6 +163,8 @@ zdb_config *zdb_config_open(zdb_engine *engine)
     }
     cfg->engine = engine;
     cfg->owns_engine = false;
+    pthread_mutex_init(&cfg->replicate_lock, NULL);
+    pthread_mutex_init(&cfg->group_lock, NULL);
     return cfg;
 }
 
@@ -130,11 +173,25 @@ zdb_engine *zdb_config_engine(zdb_config *cfg)
     return cfg ? cfg->engine : NULL;
 }
 
+void zdb_config_set_replicator(zdb_config *cfg,
+                               zdb_config_replicate_fn replicate, void *ctx)
+{
+    if (!cfg) {
+        return;
+    }
+    pthread_mutex_lock(&cfg->replicate_lock);
+    cfg->replicate = replicate;
+    cfg->replicate_ctx = ctx;
+    pthread_mutex_unlock(&cfg->replicate_lock);
+}
+
 void zdb_config_close(zdb_config *cfg)
 {
     if (!cfg) {
         return;
     }
+    pthread_mutex_destroy(&cfg->group_lock);
+    pthread_mutex_destroy(&cfg->replicate_lock);
     free(cfg);
 }
 
@@ -175,8 +232,7 @@ bool zdb_database_delete(zdb_config *cfg, const char *name)
         zdb_partition_delete(cfg, name, parts[i].name);
     }
     free(parts);
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, CFG_KEYSPACE_DATABASES,
-                      name);
+    return remove_record(cfg, CFG_KEYSPACE_DATABASES, name);
 }
 
 bool zdb_database_get(zdb_config *cfg, const char *name,
@@ -251,16 +307,20 @@ bool zdb_group_create(zdb_config *cfg, const char *name)
     if (!cfg || !name || !*name || !NAME_OK(name, zdb_group_info)) {
         return false;
     }
+    pthread_mutex_lock(&cfg->group_lock);
     zdb_group_info existing;
     if (zdb_group_get(cfg, name, &existing)) {
+        pthread_mutex_unlock(&cfg->group_lock);
         return false;
     }
     uint64_t bit = next_free_bit(cfg);
     if (bit == 0) {
+        pthread_mutex_unlock(&cfg->group_lock);
         return false;
     }
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
+        pthread_mutex_unlock(&cfg->group_lock);
         return false;
     }
     cJSON_AddStringToObject(obj, "type", "group");
@@ -268,6 +328,7 @@ bool zdb_group_create(zdb_config *cfg, const char *name)
     set_json_u64(obj, "bit_position", bit);
     bool ok = store(cfg, CFG_KEYSPACE_GROUPS, name, obj);
     cJSON_Delete(obj);
+    pthread_mutex_unlock(&cfg->group_lock);
     return ok;
 }
 
@@ -276,7 +337,10 @@ bool zdb_group_delete(zdb_config *cfg, const char *name)
     if (!cfg || !name) {
         return false;
     }
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, CFG_KEYSPACE_GROUPS, name);
+    pthread_mutex_lock(&cfg->group_lock);
+    bool ok = remove_record(cfg, CFG_KEYSPACE_GROUPS, name);
+    pthread_mutex_unlock(&cfg->group_lock);
+    return ok;
 }
 
 bool zdb_group_get(zdb_config *cfg, const char *name, zdb_group_info *out)
@@ -351,7 +415,7 @@ bool zdb_user_delete(zdb_config *cfg, const char *name)
     if (!cfg || !name) {
         return false;
     }
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, CFG_KEYSPACE_USERS, name);
+    return remove_record(cfg, CFG_KEYSPACE_USERS, name);
 }
 
 static bool user_update(zdb_config *cfg, const char *name, uint64_t groups)
@@ -465,8 +529,7 @@ bool zdb_partition_delete(zdb_config *cfg, const char *database,
     }
     char id[384];
     snprintf(id, sizeof(id), "%s/%s", database, name);
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, CFG_KEYSPACE_PARTITIONS,
-                      id);
+    return remove_record(cfg, CFG_KEYSPACE_PARTITIONS, id);
 }
 
 bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
@@ -725,8 +788,7 @@ bool zdb_setting_delete(zdb_config *cfg, const char *name)
     if (!cfg || !name) {
         return false;
     }
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, CFG_KEYSPACE_SETTINGS,
-                      name);
+    return remove_record(cfg, CFG_KEYSPACE_SETTINGS, name);
 }
 
 char **zdb_setting_list(zdb_config *cfg, size_t *count_out)

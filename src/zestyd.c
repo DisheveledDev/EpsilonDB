@@ -88,19 +88,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    zdb_http_server *srv = zdb_http_start(bind_addr, port);
-    if (!srv) {
+    /* validate ports before anything binds */
+    if (port < 1 || port > 65535) {
+        fprintf(stderr, "zestyd: invalid port %d\n", port);
         zdb_config_close(config);
         zdb_engine_close(engine);
         return 1;
     }
-
-    /* static UI is optional; absence is not fatal */
-    zdb_http_serve_static(srv, "/admin", admin_dir);
-
-    if (!zdb_api_register(srv, engine, config)) {
-        fprintf(stderr, "zestyd: failed to register API routes\n");
-        zdb_http_stop(srv);
+    if (peer_port < 0 || peer_port > 65535) {
+        fprintf(stderr, "zestyd: invalid peer port %d\n", peer_port);
         zdb_config_close(config);
         zdb_engine_close(engine);
         return 1;
@@ -115,7 +111,6 @@ int main(int argc, char **argv)
         if (!cluster) {
             fprintf(stderr, "zestyd: failed to start cluster service on"
                             " peer port %d\n", peer_port);
-            zdb_http_stop(srv);
             zdb_config_close(config);
             zdb_engine_close(engine);
             return 1;
@@ -129,7 +124,6 @@ int main(int argc, char **argv)
         if (!repl) {
             fprintf(stderr, "zestyd: failed to start replication service\n");
             zdb_cluster_stop(cluster);
-            zdb_http_stop(srv);
             zdb_config_close(config);
             zdb_engine_close(engine);
             return 1;
@@ -137,6 +131,29 @@ int main(int argc, char **argv)
     }
     zdb_api_set_cluster(cluster);
     zdb_api_set_repl(repl);
+
+    zdb_http_server *srv = zdb_http_start(bind_addr, port);
+    if (!srv) {
+        zdb_repl_stop(repl);
+        zdb_cluster_stop(cluster);
+        zdb_config_close(config);
+        zdb_engine_close(engine);
+        return 1;
+    }
+
+    if (!zdb_http_serve_static(srv, "/admin", admin_dir)) {
+        fprintf(stderr, "zestyd: failed to register admin static route\n");
+    }
+
+    if (!zdb_api_register(srv, engine, config)) {
+        fprintf(stderr, "zestyd: failed to register API routes\n");
+        zdb_http_stop(srv);
+        zdb_repl_stop(repl);
+        zdb_cluster_stop(cluster);
+        zdb_config_close(config);
+        zdb_engine_close(engine);
+        return 1;
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -158,11 +175,11 @@ int main(int argc, char **argv)
     }
 
     printf("zestyd shutting down\n");
+    zdb_http_stop(srv);
     zdb_api_set_cluster(NULL);
     zdb_api_set_repl(NULL);
     zdb_repl_stop(repl);
     zdb_cluster_stop(cluster);
-    zdb_http_stop(srv);
     zdb_config_close(config);
     zdb_engine_close(engine);
     return 0;

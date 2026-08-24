@@ -451,15 +451,25 @@ int main(void)
         const char *owner = zdb_cluster_owner(a.cluster, key);
         CHECK(owner != NULL);
 
-        /* pick a node that does not own the shard, and confirm it holds
-         * a (replica) copy to GC */
+        node *nodes[] = { &a, &b, &c, &d };
+        char holders[4][ZDB_NODE_ID_MAX];
+        size_t holder_count = zdb_cluster_holders(a.cluster, key, holders, 4);
         node *victim = NULL;
-        if (strcmp(owner, zdb_cluster_self_id(a.cluster)) != 0) {
-            victim = &a;
-        } else {
-            victim = &b;
+        for (size_t i = 0; i < 4 && !victim; i++) {
+            bool holder_node = false;
+            for (size_t h = 0; h < holder_count && h < 2; h++) {
+                if (strcmp(zdb_cluster_self_id(nodes[i]->cluster),
+                           holders[h]) == 0) {
+                    holder_node = true;
+                }
+            }
+            cJSON *copy = zdb_get(nodes[i]->engine, "main", "kv", "id-0000");
+            if (!holder_node && copy) {
+                victim = nodes[i];
+            }
+            cJSON_Delete(copy);
         }
-        CHECK(zdb_get(victim->engine, "main", "kv", "id-0000") != NULL);
+        CHECK(victim != NULL);
         CHECK(zdb_cluster_gc_redundant(victim->cluster) >= 1);
 
         /* the file is gone from the victim */

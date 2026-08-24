@@ -152,33 +152,56 @@ static int http_request(const char *method, const char *path,
         }
     }
 
-    char head[4096];
-    int n = snprintf(head, sizeof(head),
+    int n = snprintf(NULL, 0,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
                      "Authorization: Bearer %s\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
-                     method, path,
-                     g_host ? g_host : "local", g_port, g_user,
+                     method, path, g_host ? g_host : "local", g_port, g_user,
                      body ? strlen(body) : 0);
+    if (n < 0) {
+        close(fd);
+        return -1;
+    }
+    char *head = malloc((size_t)n + 1);
+    if (!head) {
+        close(fd);
+        return -1;
+    }
+    snprintf(head, (size_t)n + 1,
+             "%s %s HTTP/1.1\r\n"
+             "Host: %s:%d\r\n"
+             "Authorization: Bearer %s\r\n"
+             "Content-Length: %zu\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             method, path, g_host ? g_host : "local", g_port, g_user,
+             body ? strlen(body) : 0);
 
-    /* send headers then body separately: exercises server buffering */
     size_t sent = 0;
     while (sent < (size_t)n) {
         ssize_t w = send(fd, head + sent, (size_t)n - sent, 0);
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
         if (w <= 0) {
+            free(head);
             close(fd);
             return -1;
         }
         sent += (size_t)w;
     }
+    free(head);
     if (body && *body) {
         size_t blen = strlen(body);
         size_t bsent = 0;
         while (bsent < blen) {
             ssize_t w = send(fd, body + bsent, blen - bsent, 0);
+            if (w < 0 && errno == EINTR) {
+                continue;
+            }
             if (w <= 0) {
                 close(fd);
                 return -1;
@@ -337,8 +360,18 @@ static void s_append(char *line, size_t cap, const char *text)
 /* Renders the plain display text of a JSON scalar and picks a colour
  * for its type: numbers cyan, strings yellow, true green, false red,
  * null dim, containers magenta. */
+static void scalar_text_depth(const cJSON *v, char *buf, size_t cap,
+                              const char **colour, int depth);
+static void scalar_text(const cJSON *v, char *buf, size_t cap,
+                        const char **colour);
 static void scalar_text(const cJSON *v, char *buf, size_t cap,
                         const char **colour)
+{
+    scalar_text_depth(v, buf, cap, colour, 0);
+}
+
+static void scalar_text_depth(const cJSON *v, char *buf, size_t cap,
+                              const char **colour, int depth)
 {
     *colour = "";
     if (!v || cJSON_IsNull(v)) {
@@ -357,7 +390,7 @@ static void scalar_text(const cJSON *v, char *buf, size_t cap,
     } else if (cJSON_IsString(v)) {
         *colour = "\033[33m";
         snprintf(buf, cap, "%s", v->valuestring ? v->valuestring : "");
-    } else if (cJSON_IsArray(v)) {
+    } else if (cJSON_IsArray(v) && depth < 4) {
         /* compact inline list: a, b, c */
         *colour = "\033[35m";
         buf[0] = '\0';
@@ -366,7 +399,7 @@ static void scalar_text(const cJSON *v, char *buf, size_t cap,
         cJSON_ArrayForEach(el, v) {
             char cell[160];
             const char *c2;
-            scalar_text(el, cell, sizeof(cell), &c2);
+            scalar_text_depth(el, cell, sizeof(cell), &c2, depth + 1);
             if (!first) {
                 s_append(buf, cap, ", ");
             }
@@ -617,16 +650,16 @@ static void print_usage(void)
         "  create user <name> <group_mask>",
         "  set user <name> <group_mask>",
         "  delete user <name>",
-        "  create partition <db> <name> <create_mask> <update_mask>"
-        " <read_mask> <delete_mask>",
+        "  create partition <db> <name> <create_mask> <update_mask>",
+        "                   <read_mask> <delete_mask>",
         "  delete partition <db> <name>",
         "  get setting <name> | set setting <name> <json|->",
         "  delete setting <name>",
         "",
         "data (partitions/keyspaces are created automatically on put):",
         "  get <db>/<partition>/<keyspace>/<id>",
-        "  put <db>/<partition>/<keyspace>/<id> <json|->"
-        " [--filter k=v]... [ttl]",
+        "  put <db>/<partition>/<keyspace>/<id> <json|->",
+        "      [--filter k=v]... [ttl]",
         "  rm <db>/<partition>/<keyspace>/<id>",
         "  all <db>/<partition>/<keyspace> [--filter k=v]...",
         "  ids <db>/<partition>/<keyspace> [--filter k=v]...",
@@ -644,6 +677,18 @@ static void print_usage(void)
 }
 
 /* Builds "/data/{...}" path prefix from a slash-joined spec. */
+static bool uint64_argument(const char *text)
+{
+    if (!text || !*text) {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    strtoull(text, &end, 10);
+    return errno == 0 && end && *end == '\0';
+}
+
+
 static bool parse_data_spec(const char *spec, char *path, size_t cap)
 {
     snprintf(path, cap, "/data/%s", spec);
@@ -654,14 +699,24 @@ static void append_filters(char *path, size_t cap, const char **filters,
                            size_t nfilters, const char **fields,
                            size_t nfields)
 {
+    /* snprintf returns the length the string *would* have had: clamp
+     * after every call or the next offset walks past the buffer */
     size_t len = strlen(path);
     for (size_t i = 0; i < nfilters; i++) {
-        len += snprintf(path + len, cap - len, "%sfilter=%s",
-                        strchr(path, '?') ? "&" : "?", filters[i]);
+        size_t w = snprintf(path + len, cap - len, "%sfilter=%s",
+                            strchr(path, '?') ? "&" : "?", filters[i]);
+        if (w >= cap - len) {
+            return;
+        }
+        len += w;
     }
     for (size_t i = 0; i < nfields; i++) {
-        len += snprintf(path + len, cap - len, "%sfield=%s",
-                        strchr(path, '?') ? "&" : "?", fields[i]);
+        size_t w = snprintf(path + len, cap - len, "%sfield=%s",
+                            strchr(path, '?') ? "&" : "?", fields[i]);
+        if (w >= cap - len) {
+            return;
+        }
+        len += w;
     }
 }
 
@@ -796,7 +851,7 @@ static int execute_command(int argc, char **argv)
     /* ---- create/delete entities ---- */
     if (sub && strcmp(cmd, "create") == 0) {
         char body[1024];
-        if (strcmp(sub, "database") == 0 && argi + 1 <= argc) {
+        if (strcmp(sub, "database") == 0 && argi < argc) {
             const char *name = argv[argi];
             long rf = argi + 1 < argc ? strtol(argv[argi + 1], NULL, 10) : 1;
             snprintf(body, sizeof(body),
@@ -809,16 +864,24 @@ static int execute_command(int argc, char **argv)
             return run("POST", "/admin/groups", body);
         }
         if (strcmp(sub, "user") == 0 && argi + 1 < argc) {
+            if (!uint64_argument(argv[argi + 1])) {
+                return 1;
+            }
             snprintf(body, sizeof(body),
-                     "{\"name\":\"%s\",\"groups\":%s}", argv[argi],
+                     "{\"name\":\"%s\",\"groups\":\"%s\"}", argv[argi],
                      argv[argi + 1]);
             return run("POST", "/admin/users", body);
         }
         if (strcmp(sub, "partition") == 0 && argi + 5 < argc) {
+            for (int i = 2; i <= 5; i++) {
+                if (!uint64_argument(argv[argi + i])) {
+                    return 1;
+                }
+            }
             snprintf(body, sizeof(body),
                      "{\"database\":\"%s\",\"name\":\"%s\","
-                     "\"create_mask\":%s,\"update_mask\":%s,"
-                     "\"read_mask\":%s,\"delete_mask\":%s}",
+                     "\"create_mask\":\"%s\",\"update_mask\":\"%s\","
+                     "\"read_mask\":\"%s\",\"delete_mask\":\"%s\"}",
                      argv[argi], argv[argi + 1], argv[argi + 2],
                      argv[argi + 3], argv[argi + 4], argv[argi + 5]);
             return run("POST", "/admin/partitions", body);
@@ -852,9 +915,13 @@ static int execute_command(int argc, char **argv)
     /* ---- user management ---- */
     if (sub && strcmp(cmd, "set") == 0 && strcmp(sub, "user") == 0 &&
         argi + 1 < argc) {
+        if (!uint64_argument(argv[argi + 1])) {
+            return 1;
+        }
         char body[512];
-        snprintf(body, sizeof(body), "{\"name\":\"%s\",\"groups\":%s}",
-                 argv[argi], argv[argi + 1]);
+        snprintf(body, sizeof(body),
+                 "{\"name\":\"%s\",\"groups\":\"%s\"}", argv[argi],
+                 argv[argi + 1]);
         return run("POST", "/admin/users", body);
     }
 
@@ -866,10 +933,10 @@ static int execute_command(int argc, char **argv)
         return run("GET", path, NULL);
     }
     if (sub && strcmp(cmd, "set") == 0 && strcmp(sub, "setting") == 0 &&
-        argi + 1 <= argc) {
+        argi < argc) {
         char path[512];
         snprintf(path, sizeof(path), "/admin/settings/%s", argv[argi]);
-        char *body = body_from_arg(argi + 1 <= argc ? argv[argi + 1] : "-");
+        char *body = body_from_arg(argi + 1 < argc ? argv[argi + 1] : "-");
         int rc = run("POST", path, body);
         free(body);
         return rc;
@@ -908,8 +975,15 @@ static int execute_command(int argc, char **argv)
             }
             size_t len = strlen(path);
             if (argi + 1 < argc) {
-                len += snprintf(path + len, sizeof(path) - len, "?ttl=%s",
-                                argv[argi + 1]);
+                size_t w = snprintf(path + len, sizeof(path) - len,
+                                    "?ttl=%s", argv[argi + 1]);
+                if (w >= sizeof(path) - len) {
+                    out_line("zestyctl: path too long");
+                    free(doc);
+                    free(filters);
+                    return 1;
+                }
+                len += w;
             }
             for (size_t i = 0; i < nfilters; i++) {
                 snprintf(path + len, sizeof(path) - len, "%sfilter=%s",
@@ -943,41 +1017,45 @@ static int execute_command(int argc, char **argv)
         } else if (strcmp(cmd, "ids") == 0) {
             rc = run("GET", path, NULL);
         } else {
-            /* query passes fields in the body too; URL form also works */
-            char body[4096] = "";
+            char *body = NULL;
             if (nfields > 0) {
-                strcpy(body, "{\"fields\":{");
-                for (size_t i = 0; i < nfields; i++) {
-                    char eqcopy[512];
-                    snprintf(eqcopy, sizeof(eqcopy), "%s", fields[i]);
-                    char *eq = strchr(eqcopy, '=');
-                    if (eq) {
-                        *eq = '\0';
-                        strcat(body, i ? "," : "");
-                        strcat(body, "\"");
-                        strcat(body, eqcopy);
-                        strcat(body, "\":\"");
-                        strcat(body, eq + 1);
-                        strcat(body, "\"");
+                cJSON *root = cJSON_CreateObject();
+                cJSON *field_object = root
+                                          ? cJSON_AddObjectToObject(root,
+                                                                   "fields")
+                                          : NULL;
+                for (size_t i = 0; field_object && i < nfields; i++) {
+                    const char *equals = strchr(fields[i], '=');
+                    if (!equals || equals == fields[i]) {
+                        continue;
                     }
+                    size_t name_length = (size_t)(equals - fields[i]);
+                    char *name = malloc(name_length + 1);
+                    if (!name) {
+                        continue;
+                    }
+                    memcpy(name, fields[i], name_length);
+                    name[name_length] = '\0';
+                    cJSON_AddStringToObject(field_object, name, equals + 1);
+                    free(name);
                 }
-                strcat(body, "}}");
+                body = root ? cJSON_PrintUnformatted(root) : NULL;
+                cJSON_Delete(root);
+                if (!body) {
+                    free(filters);
+                    free(fields);
+                    return 1;
+                }
             }
-            rc = run("POST", path, nfields > 0 ? body : NULL);
+            rc = run("POST", path, body);
+            free(body);
         }
         free(filters);
         free(fields);
         return rc;
     }
 
-    /* ---- cluster (stage 4) ---- */
-    if (sub && strcmp(cmd, "join") == 0 && strcmp(sub, "node") == 0 &&
-        argi + 1 < argc) {
-        char body[256];
-        snprintf(body, sizeof(body), "{\"addr\":\"%s\",\"port\":%s}",
-                 argv[argi], argv[argi + 1]);
-        return run("POST", "/admin/join", body);
-    }
+    /* ---- cluster (stage 4): handled above with the other joins ---- */
 
     print_usage();
     return 1;
@@ -1341,6 +1419,7 @@ static int split_command(char *line, char *argv_out[MAX_ARGS])
         argv_out[argc++] = tok;
         tok = strtok_r(NULL, " \t", &save);
     }
+    argv_out[argc] = NULL;   /* execute_command may read argv[argc] */
     return argc;
 }
 
@@ -1490,7 +1569,7 @@ static void shell_loop(void)
 
             char work[sizeof(input.input)];
             snprintf(work, sizeof(work), "%s", input.input);
-            char *args[MAX_ARGS];
+            char *args[MAX_ARGS + 1];   /* split NULL-terminates */
             execute_command(split_command(work, args), args);
 
             refresh_server_info();   /* keep the panel live */

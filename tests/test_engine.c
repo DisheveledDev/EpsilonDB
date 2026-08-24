@@ -169,6 +169,21 @@ static void test_filters_and_query(void)
     CHECK(ids != NULL && n == 1);
     zdb_free_strings(ids);
 
+    char filter_storage[20][32];
+    const char *many_filters[20];
+    for (size_t i = 0; i < 20; i++) {
+        snprintf(filter_storage[i], sizeof(filter_storage[i]), "f%zu=v%zu", i,
+                 i);
+        many_filters[i] = filter_storage[i];
+    }
+    CHECK(zdb_put(mgr, "kv", "main", "many", "{\"many\":true}", -1,
+                  many_filters, 20));
+    CHECK(zdb_put(mgr, "kv", "main", "sixteen", "{\"many\":false}", -1,
+                  many_filters, 16));
+    ids = zdb_ids(mgr, "kv", "main", many_filters, 20, &n);
+    CHECK(ids != NULL && n == 1 && strcmp(ids[0], "many") == 0);
+    zdb_free_strings(ids);
+
     zdb_engine_close(mgr);
 }
 
@@ -181,9 +196,16 @@ static void test_shard_layout_and_reopen(void)
     CHECK(zdb_put(mgr, "p1", "k1", "x", "{\"v\":1}", -1, NULL, 0));
     CHECK(zdb_put(mgr, "p1", "k2", "x", "{\"v\":2}", -1, NULL, 0));
     CHECK(zdb_put(mgr, "p2", "k1", "x", "{\"v\":3}", -1, NULL, 0));
+    CHECK(zdb_put(mgr, "ab", "c", "same", "{\"v\":4}", -1, NULL, 0));
+    CHECK(zdb_put(mgr, "a", "bc", "same", "{\"v\":5}", -1, NULL, 0));
 
-    /* one shard file per (partition, keyspace) pair */
-    CHECK(count_shards("tests/data/layout") == 3);
+    CHECK(count_shards("tests/data/layout") == 5);
+    cJSON *left = zdb_get(mgr, "ab", "c", "same");
+    cJSON *right = zdb_get(mgr, "a", "bc", "same");
+    CHECK(left && cJSON_GetObjectItemCaseSensitive(left, "v")->valueint == 4);
+    CHECK(right && cJSON_GetObjectItemCaseSensitive(right, "v")->valueint == 5);
+    cJSON_Delete(left);
+    cJSON_Delete(right);
 
     zdb_engine_close(mgr);
 

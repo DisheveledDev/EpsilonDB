@@ -18,9 +18,11 @@ typedef struct {
 
 typedef struct zdb_shard {
     char *path;
-    char key[33];              /* md5(partition + keyspace) */
+    char key[33];              /* framed partition/keyspace digest */
     sqlite3 *db;
     pthread_mutex_t lock;
+    size_t refs;
+    bool retired;
 
     zdb_cached_stmt cache[ZDB_STMT_CACHE_SIZE];
     int cache_count;
@@ -47,10 +49,10 @@ bool zdb_shard_cleanup(zdb_shard *sh);
 /* stage 5: replication-aware variants (see zesty_engine.h) */
 bool zdb_shard_replica_put(zdb_shard *sh, const char *id,
                            const char *json_value, long long ttl_absolute,
-                           long long timestamp, const char **filters,
-                           size_t nfilters);
+                           long long timestamp, const char *origin,
+                           const char **filters, size_t nfilters);
 bool zdb_shard_replica_delete(zdb_shard *sh, const char *id,
-                              long long timestamp);
+                              long long timestamp, const char *origin);
 cJSON *zdb_shard_get_ts(zdb_shard *sh, const char *id,
                         long long *timestamp_out);
 cJSON *zdb_shard_all_ts(zdb_shard *sh, const char **filters,

@@ -1,7 +1,7 @@
 /* zesty_engine.h - ZestyDB core shard storage engine.
  *
  * One SQLite database file per (partition, keyspace) pair, filename is
- * md5(partition + keyspace) + ".sqlite". Documents are JSON values.
+ * md5(md5(partition) + ":" + md5(keyspace)) + ".sqlite". Documents are JSON values.
  *
  * Semantics inherited from the Switchblade SQLiteShardProvider:
  *   - delete() is a soft delete: ttl is set to now-5 so replicas can
@@ -47,7 +47,7 @@ const char *zdb_engine_path(zdb_engine *mgr);
 /* --- stage 6b: shard snapshot support --------------------------------- */
 
 /* Fills path_out with the shard file path for partition/keyspace
- * (md5(partition + keyspace) + ".sqlite" under the store root) and key_out
+ * (the framed partition/keyspace digest under the store root) and key_out
  * with the 32-char hex shard key. Returns false on allocation/argument
  * failure. The file may not exist yet. */
 bool zdb_shard_path(zdb_engine *mgr, const char *partition,
@@ -67,6 +67,8 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
  * Test hook for invalidate semantics. */
 bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
                        const char *keyspace);
+bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
+                        const char *keyspace);
 
 /* --- stage 6d: shard GC ------------------------------------------------ */
 
@@ -129,12 +131,20 @@ bool zdb_replica_put(zdb_engine *mgr, const char *partition,
                      const char *json_value, long long ttl_absolute,
                      long long timestamp, const char **filters,
                      size_t nfilters);
+bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
+                            const char *keyspace, const char *id,
+                            const char *json_value, long long ttl_absolute,
+                            long long timestamp, const char *origin,
+                            const char **filters, size_t nfilters);
 
 /* Apply a replicated soft-delete carrying an explicit origin timestamp.
  * LWW semantics as above; ttl becomes timestamp - 5 (tombstone). */
 bool zdb_replica_delete(zdb_engine *mgr, const char *partition,
                         const char *keyspace, const char *id,
                         long long timestamp);
+bool zdb_replica_delete_origin(zdb_engine *mgr, const char *partition,
+                               const char *keyspace, const char *id,
+                               long long timestamp, const char *origin);
 
 /* Like zdb_get but also reports the row's last-modified timestamp
  * (needed for quorum comparison). NULL value => ts untouched. */

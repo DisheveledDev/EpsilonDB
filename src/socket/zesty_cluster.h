@@ -86,12 +86,14 @@ size_t zdb_cluster_target_ranges(zdb_cluster *cl, zdb_range_info *out,
                                  size_t cap);
 long long zdb_cluster_target_generation(zdb_cluster *cl);
 
-/* Node owning a shard key given its md5(partition+keyspace) hex, or NULL
+/* Node owning a shard key given its framed shard digest, or NULL
  * if no assignment covers it. */
 const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex);
 
 /* Owner of the key under the TARGET table (NULL when no target pending). */
 const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex);
+size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
+                           char (*node_ids)[ZDB_NODE_ID_MAX], size_t cap);
 
 /* Contacts seed_addr:seed_port, exchanges membership so both sides join
  * the same mesh, then returns. The persistent mesh connection is

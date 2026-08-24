@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -39,6 +40,7 @@
 
 #define SNAP_CONNECT_TIMEOUT_MS 1500
 #define SNAP_IO_DEADLINE_MS    60000
+#define SNAP_MAX_BYTES         (4ULL * 1024 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -61,6 +63,20 @@ static void set_socket_timeouts(int fd, int ms)
 static char *json_print(const cJSON *doc)
 {
     return doc ? cJSON_PrintUnformatted(doc) : NULL;
+}
+
+static bool valid_key(const char *key)
+{
+    if (!key || strlen(key) != 32) {
+        return false;
+    }
+    for (size_t i = 0; i < 32; i++) {
+        if (!((key[i] >= '0' && key[i] <= '9') ||
+              (key[i] >= 'a' && key[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static int write_full(int fd, const void *buf, size_t len)
@@ -184,13 +200,15 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
                          : NULL;
     const cJSON *jkey =
         req ? cJSON_GetObjectItemCaseSensitive(req, "key") : NULL;
-    const char *key =
-        cJSON_IsString(jkey) && strlen(jkey->valuestring) == 32
-            ? jkey->valuestring
-            : NULL;
+    const cJSON *jallow_missing =
+        req ? cJSON_GetObjectItemCaseSensitive(req, "allow_missing") : NULL;
+    const char *key = cJSON_IsString(jkey) && valid_key(jkey->valuestring)
+                          ? jkey->valuestring
+                          : NULL;
+    bool allow_missing = cJSON_IsTrue(jallow_missing);
     bool ok = false;
     bool sent_eof = false;
-    char tmp[1100];
+    char tmp[1100] = "";
 
     do {
         const char *dir = zdb_engine_path(engine);
@@ -202,21 +220,50 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
          * a missing shard is an empty but valid snapshot */
         char src_path[1100];
         snprintf(src_path, sizeof(src_path), "%s/%s.sqlite", dir, key);
-        snprintf(tmp, sizeof(tmp), "%s/%s.snapshot.tmp", dir, key);
-        unlink(tmp);
+        if (snprintf(tmp, sizeof(tmp), "%s/.%s.snapshot.XXXXXX", dir,
+                     key) >= (int)sizeof(tmp)) {
+            break;
+        }
+        int tmp_fd = mkstemp(tmp);
+        if (tmp_fd < 0) {
+            break;
+        }
+        close(tmp_fd);
         int brc = backup_shard_file(src_path, tmp);
         if (brc != SQLITE_OK) {
-            if (shard_missing(dir, key)) {
-                /* no shard file at all: an empty snapshot is valid */
+            if (allow_missing && shard_missing(dir, key)) {
                 ok = true;
             }
             break;
         }
 
+        struct stat snapshot_stat;
+        if (stat(tmp, &snapshot_stat) != 0 || snapshot_stat.st_size < 0 ||
+            (uint64_t)snapshot_stat.st_size > SNAP_MAX_BYTES) {
+            break;
+        }
         FILE *f = fopen(tmp, "rb");
         if (!f) {
             break;
         }
+        cJSON *meta = cJSON_CreateObject();
+        if (!meta) {
+            fclose(f);
+            break;
+        }
+        cJSON_AddBoolToObject(meta, "ok", true);
+        cJSON_AddNumberToObject(meta, "size", (double)snapshot_stat.st_size);
+        char *meta_str = json_print(meta);
+        cJSON_Delete(meta);
+        if (!meta_str ||
+            write_full(fd, make_header(ZSTP_SNAP_ACK, strlen(meta_str)),
+                       ZSTP_HEADER_SIZE) != 0 ||
+            write_full(fd, meta_str, strlen(meta_str)) != 0) {
+            free(meta_str);
+            fclose(f);
+            break;
+        }
+        free(meta_str);
         ok = true;
 
         static _Thread_local unsigned char chunk[ZSTP_MAX_PAYLOAD];
@@ -242,12 +289,20 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
                               ZSTP_HEADER_SIZE) == 0;
         ok = ok && sent_eof;
         unlink(tmp);
+        tmp[0] = '\0';
     } while (0);
+    if (tmp[0]) {
+        unlink(tmp);
+    }
 
-    /* paths that skipped the data loop still owe the receiver an EOF
-     * marker before the ack */
+    /* paths that skipped the data loop still owe the receiver metadata
+     * and an EOF marker before the final acknowledgement */
     if (ok && !sent_eof) {
-        ok = write_full(fd, make_header(ZSTP_SNAP_DATA, 0),
+        const char *meta = "{\"ok\":true,\"size\":0}";
+        ok = write_full(fd, make_header(ZSTP_SNAP_ACK, strlen(meta)),
+                        ZSTP_HEADER_SIZE) == 0 &&
+             write_full(fd, meta, strlen(meta)) == 0 &&
+             write_full(fd, make_header(ZSTP_SNAP_DATA, 0),
                         ZSTP_HEADER_SIZE) == 0;
     }
 
@@ -269,10 +324,10 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
 /* ------------------------------------------------------------------ */
 /* receiver: pull a snapshot                                           */
 
-int zdb_snap_fetch(const char *addr, int port, const char key[33],
-                   const char *dest_dir)
+static int snap_fetch(const char *addr, int port, const char key[33],
+                      const char *dest_dir, bool allow_missing)
 {
-    if (!addr || !key || !dest_dir || port <= 0) {
+    if (!addr || !valid_key(key) || !dest_dir || port <= 0) {
         return -1;
     }
 
@@ -280,25 +335,23 @@ int zdb_snap_fetch(const char *addr, int port, const char key[33],
     if (fd < 0) {
         return -1;
     }
-    /* generous I/O window; the overall transfer is also bounded by the
-     * monotonic deadline below */
     set_socket_timeouts(fd, SNAP_IO_DEADLINE_MS);
 
     int rc = -1;
-    char incoming[1100];
+    char incoming[1100] = "";
     char final_path[1100];
-    snprintf(incoming, sizeof(incoming), "%s/%s.sqlite.incoming", dest_dir,
-             key);
-    snprintf(final_path, sizeof(final_path), "%s/%s.sqlite", dest_dir,
-             key);
     FILE *out = NULL;
+    if (snprintf(incoming, sizeof(incoming), "%s/.%s.incoming.XXXXXX",
+                 dest_dir, key) >= (int)sizeof(incoming) ||
+        snprintf(final_path, sizeof(final_path), "%s/%s.sqlite", dest_dir,
+                 key) >= (int)sizeof(final_path)) {
+        goto done;
+    }
 
     cJSON *hello = cJSON_CreateObject();
     if (!hello) {
         goto done;
     }
-    /* identity is not needed for one-shot transfers but the mesh
-     * requires HELLO as the first frame on every connection */
     cJSON_AddStringToObject(hello, "node_id", "ephemeral");
     char *hello_str = json_print(hello);
     cJSON_Delete(hello);
@@ -314,6 +367,7 @@ int zdb_snap_fetch(const char *addr, int port, const char key[33],
         goto done;
     }
     cJSON_AddStringToObject(req, "key", key);
+    cJSON_AddBoolToObject(req, "allow_missing", allow_missing);
     char *req_str = json_print(req);
     cJSON_Delete(req);
     if (!req_str || zstp_send_frame(fd, ZSTP_SNAP_REQ, req_str, NULL) != 0) {
@@ -322,73 +376,113 @@ int zdb_snap_fetch(const char *addr, int port, const char key[33],
     }
     free(req_str);
 
-    out = fopen(incoming, "wb");
+    int out_fd = mkstemp(incoming);
+    if (out_fd < 0) {
+        goto done;
+    }
+    out = fdopen(out_fd, "wb");
     if (!out) {
+        close(out_fd);
         goto done;
     }
     setvbuf(out, NULL, _IONBF, 0);
 
     long long deadline = mono_ms() + SNAP_IO_DEADLINE_MS;
+    bool metadata_seen = false;
     bool eof_seen = false;
     bool ack_ok = false;
+    uint64_t expected_size = 0;
+    uint64_t received_size = 0;
     for (;;) {
-        long long left = deadline - mono_ms();
-        if (left <= 0) {
+        if (mono_ms() >= deadline) {
             goto done;
         }
-        char *payload = NULL;
-        uint32_t plen = 0;
-        int t = zstp_recv_frame_raw(fd, &payload, &plen);
-        if (t < 0) {
-            free(payload);
+        char *frame = NULL;
+        uint32_t frame_len = 0;
+        int type = zstp_recv_frame_raw(fd, &frame, &frame_len);
+        if (type < 0) {
+            free(frame);
             goto done;
         }
-        if (t == ZSTP_SNAP_DATA) {
-#ifdef SNAP_DEBUG
-            fprintf(stderr, "[fetch] DATA len=%u\n", plen);
-#endif
-            if (eof_seen || (plen > 0 && !payload) ||
-                plen > 0x7ffffff0 ||
-                (size_t)plen != fwrite(payload, 1, plen, out)) {
-                free(payload);
-                goto done;
-            }
-            free(payload);
-            if (plen == 0) {
-                eof_seen = true;
-            }
+        if (!metadata_seen && (type == ZSTP_HELLO || type == ZSTP_STATE)) {
+            free(frame);
             continue;
         }
-#ifdef SNAP_DEBUG
-        else if (t != ZSTP_SNAP_ACK) {
-            fprintf(stderr, "[fetch] frame type=%d len=%u\n", t, plen);
-        }
-#endif
-        if (t == ZSTP_SNAP_ACK) {
-            cJSON *ack = payload ? cJSON_Parse(payload) : NULL;
-            free(payload);
-            const cJSON *jok =
-                ack ? cJSON_GetObjectItemCaseSensitive(ack, "ok") : NULL;
-            ack_ok = eof_seen && cJSON_IsTrue(jok);
+        if (type == ZSTP_SNAP_ACK) {
+            cJSON *ack = frame ? cJSON_Parse(frame) : NULL;
+            free(frame);
+            const cJSON *ok = ack
+                                  ? cJSON_GetObjectItemCaseSensitive(ack, "ok")
+                                  : NULL;
+            const cJSON *size = ack
+                                    ? cJSON_GetObjectItemCaseSensitive(ack,
+                                                                       "size")
+                                    : NULL;
+            if (!metadata_seen && cJSON_IsTrue(ok) && cJSON_IsNumber(size) &&
+                size->valuedouble >= 0 &&
+                size->valuedouble <= (double)SNAP_MAX_BYTES) {
+                expected_size = (uint64_t)size->valuedouble;
+                metadata_seen = true;
+                struct statvfs space;
+                if (statvfs(dest_dir, &space) != 0 ||
+                    expected_size >
+                        (uint64_t)space.f_bavail * (uint64_t)space.f_frsize) {
+                    cJSON_Delete(ack);
+                    goto done;
+                }
+                cJSON_Delete(ack);
+                continue;
+            }
+            ack_ok = metadata_seen && eof_seen && cJSON_IsTrue(ok) &&
+                     received_size == expected_size;
             cJSON_Delete(ack);
             break;
         }
-        free(payload);   /* their HELLO etc */
+        if (type != ZSTP_SNAP_DATA || !metadata_seen || eof_seen ||
+            (frame_len > 0 && !frame) ||
+            received_size > expected_size ||
+            (uint64_t)frame_len > expected_size - received_size) {
+            free(frame);
+            goto done;
+        }
+        if (frame_len > 0 &&
+            (size_t)frame_len != fwrite(frame, 1, frame_len, out)) {
+            free(frame);
+            goto done;
+        }
+        free(frame);
+        received_size += frame_len;
+        if (frame_len == 0) {
+            eof_seen = true;
+        }
     }
 
     fclose(out);
     out = NULL;
-
     if (ack_ok && rename(incoming, final_path) == 0) {
+        incoming[0] = '\0';
         rc = 0;
-    } else {
-        unlink(incoming);
     }
 
 done:
     if (out) {
         fclose(out);
     }
+    if (incoming[0]) {
+        unlink(incoming);
+    }
     close(fd);
     return rc;
+}
+
+int zdb_snap_fetch(const char *addr, int port, const char key[33],
+                   const char *dest_dir)
+{
+    return snap_fetch(addr, port, key, dest_dir, true);
+}
+
+int zdb_snap_fetch_required(const char *addr, int port, const char key[33],
+                            const char *dest_dir)
+{
+    return snap_fetch(addr, port, key, dest_dir, false);
 }

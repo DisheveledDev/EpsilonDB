@@ -29,6 +29,8 @@
  * writing it to dest_dir/<key>.sqlite. Returns 0 on success. */
 int zdb_snap_fetch(const char *addr, int port, const char key[33],
                    const char *dest_dir);
+int zdb_snap_fetch_required(const char *addr, int port, const char key[33],
+                            const char *dest_dir);
 
 /* Serves one inbound SNAP_REQ exchange on fd. payload/plen describe the
  * SNAP_REQ frame already read from the socket; this function reads the

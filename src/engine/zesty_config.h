@@ -35,12 +35,17 @@
 #define ZDB_MASK_ALLOW_ALL  0ULL
 
 typedef struct zdb_config zdb_config;
+typedef bool (*zdb_config_replicate_fn)(void *ctx, const char *keyspace,
+                                        const char *id, const char *json,
+                                        const char *type_filter);
 
 zdb_config *zdb_config_open(zdb_engine *engine);
 void zdb_config_close(zdb_config *cfg);
 
 /* The shard engine backing this config store. */
 zdb_engine *zdb_config_engine(zdb_config *cfg);
+void zdb_config_set_replicator(zdb_config *cfg,
+                               zdb_config_replicate_fn replicate, void *ctx);
 
 /* --- databases ------------------------------------------------------- */
 

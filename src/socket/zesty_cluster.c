@@ -29,14 +29,17 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -47,6 +50,9 @@
 #define OFFLINE_AFTER_SECONDS 12
 #define MAINTAINER_TICK_MS    500
 #define MAX_PEERS             64
+#define MAX_CONN_THREADS      128
+#define PEER_IO_TIMEOUT_MS    15000
+#define PEER_CONNECT_TIMEOUT_MS 1500
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -71,6 +77,14 @@ static void set_tcp_nodelay(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
+static void set_socket_timeouts(int fd, int ms)
+{
+    struct timeval timeout = { .tv_sec = ms / 1000,
+                               .tv_usec = (ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
 /* ------------------------------------------------------------------ */
 /* cluster state                                                       */
 
@@ -81,6 +95,12 @@ typedef struct peer_conn {
     long long last_recv;
     struct zdb_cluster *owner;
     struct peer_conn *next;
+    /* lifecycle: the reader thread holds one reference. A thread that
+     * wants to write on this socket takes another reference under
+     * cl->lock first, so teardown can never free/close a connection
+     * while a sender is inside a blocking write on it. */
+    int refs;
+    bool dead;
 } peer_conn;
 
 struct zdb_cluster {
@@ -94,6 +114,8 @@ struct zdb_cluster {
 
     pthread_mutex_t lock;           /* guards everything below */
     pthread_mutex_t send_lock;      /* serialises frame writes */
+    pthread_cond_t conn_cv;         /* signalled when refs hit zero */
+    size_t nconn_threads;           /* live reader threads (for stop) */
     peer_conn *conns;
 
     zdb_peer_info *peers;           /* includes self */
@@ -101,6 +123,7 @@ struct zdb_cluster {
     size_t peers_cap;
 
     long long generation;
+    long long gc_after;
     zdb_range_info *ranges;
     size_t nranges;
     size_t ranges_cap;
@@ -121,6 +144,7 @@ struct zdb_cluster {
 
     zstp_dispatch_fn dispatch;      /* per-cluster REPL/QUERY handler */
     void *dispatch_ctx;
+    size_t dispatch_inflight;
 
     bool running;
     pthread_t acceptor_thread;
@@ -137,6 +161,9 @@ static bool leader_is_self_locked(const zdb_cluster *cl)
 
 static zstp_dispatch_fn g_dispatcher;
 static void *g_dispatcher_ctx;
+static pthread_mutex_t g_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_dispatch_done = PTHREAD_COND_INITIALIZER;
+static size_t g_dispatch_inflight;
 
 static int write_full(int fd, const void *buf, size_t len)
 {
@@ -174,16 +201,20 @@ static int read_full(int fd, void *buf, size_t len)
 
 bool zstp_type_valid(int type)
 {
-    return type >= ZSTP_HELLO && type <= ZSTP_FLUSH;
+    return type >= ZSTP_HELLO && type <= ZSTP_VOID;
 }
-
-static zstp_dispatch_fn g_dispatcher;
-static void *g_dispatcher_ctx;
 
 void zstp_set_dispatcher(zstp_dispatch_fn fn, void *ctx)
 {
+    pthread_mutex_lock(&g_dispatch_lock);
+    g_dispatcher = NULL;
+    g_dispatcher_ctx = NULL;
+    while (g_dispatch_inflight > 0) {
+        pthread_cond_wait(&g_dispatch_done, &g_dispatch_lock);
+    }
     g_dispatcher = fn;
     g_dispatcher_ctx = ctx;
+    pthread_mutex_unlock(&g_dispatch_lock);
 }
 
 int zstp_send_frame(int fd, zstp_type type, const char *json,
@@ -271,12 +302,40 @@ int zstp_dial(const char *addr, int port)
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, addr, &sa.sin_addr) != 1 ||
-        connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    if (inet_pton(AF_INET, addr, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc != 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    if (rc != 0) {
+        struct pollfd pollfd = { .fd = fd, .events = POLLOUT };
+        do {
+            rc = poll(&pollfd, 1, PEER_CONNECT_TIMEOUT_MS);
+        } while (rc < 0 && errno == EINTR);
+        int error = 0;
+        socklen_t error_len = sizeof(error);
+        if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
+                                  &error_len) != 0 || error != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (fcntl(fd, F_SETFL, flags) != 0) {
         close(fd);
         return -1;
     }
     set_tcp_nodelay(fd);
+    set_socket_timeouts(fd, PEER_IO_TIMEOUT_MS);
     return fd;
 }
 
@@ -486,6 +545,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                     }
                     cl->nranges = i;
                     cl->generation = gen;
+                    cl->gc_after = epoch_now() + OFFLINE_AFTER_SECONDS;
                     changed = true;
                 }
             }
@@ -845,6 +905,7 @@ static void promote_target_locked(zdb_cluster *cl)
            cl->ntarget_ranges * sizeof(*cl->ranges));
     cl->nranges = cl->ntarget_ranges;
     cl->generation = cl->target_generation;
+    cl->gc_after = epoch_now() + OFFLINE_AFTER_SECONDS;
     cl->target_generation = 0;
     cl->ntarget_ranges = 0;
 }
@@ -866,6 +927,19 @@ bool zdb_cluster_publish_target(zdb_cluster *cl)
 
 /* ------------------------------------------------------------------ */
 /* gossip                                                              */
+
+/* Drops one reference taken by a sender. Caller holds cl->lock. When the
+ * connection was torn down in the meantime and this is the last
+ * reference, close the fd and free it here. */
+static void conn_unref_locked(zdb_cluster *cl, peer_conn *c)
+{
+    if (--c->refs == 0 && c->dead) {
+        shutdown(c->fd, SHUT_RDWR);
+        close(c->fd);
+        free(c);
+        pthread_cond_broadcast(&cl->conn_cv);
+    }
+}
 
 /* Builds and sends HELLO (+STATE when requested) on a connection.
  * Returns 0 on success. */
@@ -901,22 +975,50 @@ static int send_hello_state(zdb_cluster *cl, int fd, bool with_state)
 
 /* Immediately push our current STATE to every live connection, so
  * topology or compliance changes propagate without waiting for the next
- * heartbeat. */
+ * heartbeat.
+ *
+ * Lock ordering: cl->lock is taken alone to snapshot/build the payload,
+ * then released before acquiring send_lock for each write. Never hold
+ * both at once here - the reverse order would deadlock against the
+ * connection-teardown path. */
 static void gossip_state(zdb_cluster *cl)
 {
-    pthread_mutex_lock(&cl->send_lock);
-    for (peer_conn *c = cl->conns; c; c = c->next) {
-        char *state = NULL;
-        cJSON *s = NULL;
-        pthread_mutex_lock(&cl->lock);
-        s = state_to_json(cl);
-        pthread_mutex_unlock(&cl->lock);
-        state = s ? cJSON_PrintUnformatted(s) : NULL;
-        cJSON_Delete(s);
-        zstp_send(c->fd, ZSTP_STATE, state ? state : "{}", NULL);
-        free(state);
+    pthread_mutex_lock(&cl->lock);
+    cJSON *doc = state_to_json(cl);
+    char *state = doc ? cJSON_PrintUnformatted(doc) : NULL;
+    cJSON_Delete(doc);
+
+    size_t count = 0;
+    for (peer_conn *conn = cl->conns; conn; conn = conn->next) {
+        if (!conn->dead) {
+            count++;
+        }
     }
-    pthread_mutex_unlock(&cl->send_lock);
+    peer_conn **connections = count ? calloc(count, sizeof(*connections)) : NULL;
+    size_t used = 0;
+    if (count == 0 || connections) {
+        for (peer_conn *conn = cl->conns; conn && used < count;
+             conn = conn->next) {
+            if (!conn->dead) {
+                conn->refs++;
+                connections[used++] = conn;
+            }
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+
+    for (size_t i = 0; i < used; i++) {
+        zstp_send(connections[i]->fd, ZSTP_STATE, state ? state : "{}",
+                  &cl->send_lock);
+    }
+
+    free(state);
+    pthread_mutex_lock(&cl->lock);
+    for (size_t i = 0; i < used; i++) {
+        conn_unref_locked(cl, connections[i]);
+    }
+    pthread_mutex_unlock(&cl->lock);
+    free(connections);
 }
 
 /* Leader reaction after topology changes: recompute ranges and persist.
@@ -966,6 +1068,13 @@ static void leader_react(zdb_cluster *cl, bool changed)
  * learn the mesh immediately, then keep reading STATE heartbeats.
  * The connection is registered only after the HELLO exchange so peers
  * never flap online with unknown identities. */
+/* Decrements the live reader-thread counter. Caller holds cl->lock. */
+static void reader_exiting_locked(zdb_cluster *cl)
+{
+    cl->nconn_threads--;
+    pthread_cond_broadcast(&cl->conn_cv);
+}
+
 static void *conn_thread(void *arg)
 {
     peer_conn *c = arg;
@@ -1018,6 +1127,9 @@ static void *conn_thread(void *arg)
                     free(rs);
                     close(c->fd);
                     free(c);
+                    pthread_mutex_lock(&cl->lock);
+                    reader_exiting_locked(cl);
+                    pthread_mutex_unlock(&cl->lock);
                     return NULL;
                 }
             }
@@ -1068,6 +1180,9 @@ static void *conn_thread(void *arg)
     if (!c->node_id[0]) {
         close(c->fd);
         free(c);
+        pthread_mutex_lock(&cl->lock);
+        reader_exiting_locked(cl);
+        pthread_mutex_unlock(&cl->lock);
         return NULL;
     }
 
@@ -1075,6 +1190,7 @@ static void *conn_thread(void *arg)
 
     pthread_mutex_lock(&cl->lock);
     c->last_recv = epoch_now();
+    c->refs = 1;   /* the reader's own reference */
     c->next = cl->conns;
     cl->conns = c;
     recompute_leader(cl);
@@ -1095,6 +1211,7 @@ static void *conn_thread(void *arg)
      * target structure right away instead of waiting for the next
      * heartbeat round */
     leader_react(cl, became_online);
+    gossip_state(cl);
 
     bool changed = false;
     for (;;) {
@@ -1148,30 +1265,51 @@ static void *conn_thread(void *arg)
             snprintf(reply, sizeof(reply), "{\"ok\":%s}",
                      ok ? "true" : "false");
             zstp_send(c->fd, ZSTP_ACK, reply, &cl->send_lock);
-        } else if ((t == ZSTP_REPL || t == ZSTP_QUERY ||
-                    t == ZSTP_FLUSH) &&
-                   (g_dispatcher || c->owner->dispatch)) {
-            /* stage 5: data-plane frames. The dispatcher runs without
-             * cl->lock held: applying writes can block on SQLite */
+        } else if (t == ZSTP_REPL || t == ZSTP_QUERY ||
+                   t == ZSTP_FLUSH) {
+            zstp_dispatch_fn fn = NULL;
+            void *fn_ctx = NULL;
+            bool global = false;
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
+            if (cl->dispatch) {
+                fn = cl->dispatch;
+                fn_ctx = cl->dispatch_ctx;
+                cl->dispatch_inflight++;
+            }
             pthread_mutex_unlock(&cl->lock);
+            if (!fn) {
+                pthread_mutex_lock(&g_dispatch_lock);
+                if (g_dispatcher) {
+                    fn = g_dispatcher;
+                    fn_ctx = g_dispatcher_ctx;
+                    g_dispatch_inflight++;
+                    global = true;
+                }
+                pthread_mutex_unlock(&g_dispatch_lock);
+            }
 
             int reply_type = 0;
             char *reply = NULL;
-            zstp_dispatch_fn fn = c->owner->dispatch
-                                      ? c->owner->dispatch
-                                      : g_dispatcher;
-            void *fn_ctx = c->owner->dispatch
-                               ? c->owner->dispatch_ctx
-                               : g_dispatcher_ctx;
-            if (fn(fn_ctx, t, payload ? payload : "{}", &reply_type,
-                   &reply) &&
-                reply) {
+            if (fn && fn(fn_ctx, t, payload ? payload : "{}", &reply_type,
+                         &reply) && reply) {
                 zstp_send(c->fd, (zstp_type)reply_type, reply,
                           &cl->send_lock);
             }
             free(reply);
+            if (fn) {
+                if (global) {
+                    pthread_mutex_lock(&g_dispatch_lock);
+                    g_dispatch_inflight--;
+                    pthread_cond_broadcast(&g_dispatch_done);
+                    pthread_mutex_unlock(&g_dispatch_lock);
+                } else {
+                    pthread_mutex_lock(&cl->lock);
+                    cl->dispatch_inflight--;
+                    pthread_cond_broadcast(&cl->conn_cv);
+                    pthread_mutex_unlock(&cl->lock);
+                }
+            }
         } else if (t >= 0) {
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
@@ -1186,7 +1324,9 @@ static void *conn_thread(void *arg)
 
     /* unregister before freeing: stop() frees the whole connection list
      * under cl->lock, so a conn_thread must not touch its `c` after
-     * unlinking it here (stop may have already freed it) */
+     * unlinking it here (stop may have already freed it). Any sender
+     * holding a reference finishes its write first; the last unref does
+     * the actual close+free. */
     pthread_mutex_lock(&cl->lock);
     peer_conn **pp = &cl->conns;
     while (*pp && *pp != c) {
@@ -1198,6 +1338,7 @@ static void *conn_thread(void *arg)
     }
     if (!linked) {
         /* stop() already reaped this connection and its fd */
+        reader_exiting_locked(cl);
         pthread_mutex_unlock(&cl->lock);
         return NULL;
     }
@@ -1210,15 +1351,19 @@ static void *conn_thread(void *arg)
     recompute_leader(cl);
     bool was_leader = leader_is_self_locked(cl);
     int fd = c->fd;
-    free(c);
-    /* drop the send lock first: a concurrent sender may hold it and
-     * would otherwise write to the freed connection struct */
-    pthread_mutex_lock(&cl->send_lock);
-    pthread_mutex_unlock(&cl->send_lock);
+    c->dead = true;
+    c->refs--;   /* drop the reader's own reference */
+    if (c->refs > 0) {
+        fd = -1;   /* last sender will close+free via conn_unref_locked */
+    } else {
+        free(c);
+    }
     pthread_mutex_unlock(&cl->lock);
 
-    shutdown(fd, SHUT_RDWR);
-    close(fd);
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
 
     if (was_leader) {
         pthread_mutex_lock(&cl->lock);
@@ -1259,6 +1404,9 @@ static void *conn_thread(void *arg)
         persist_state(cl);
         pthread_mutex_unlock(&cl->lock);
     }
+    pthread_mutex_lock(&cl->lock);
+    reader_exiting_locked(cl);
+    pthread_mutex_unlock(&cl->lock);
     return NULL;
 }
 
@@ -1268,9 +1416,17 @@ static void spawn_conn_thread(peer_conn *c)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    zdb_cluster *cl = c->owner;
+    pthread_mutex_lock(&cl->lock);
+    cl->nconn_threads++;
+    pthread_mutex_unlock(&cl->lock);
     if (pthread_create(&tid, &attr, conn_thread, c) != 0) {
         close(c->fd);
         free(c);
+        pthread_mutex_lock(&cl->lock);
+        cl->nconn_threads--;
+        pthread_cond_broadcast(&cl->conn_cv);
+        pthread_mutex_unlock(&cl->lock);
     }
     pthread_attr_destroy(&attr);
 }
@@ -1295,6 +1451,14 @@ static void *acceptor_main(void *arg)
             break;
         }
         set_tcp_nodelay(fd);
+        set_socket_timeouts(fd, PEER_IO_TIMEOUT_MS);
+        pthread_mutex_lock(&cl->lock);
+        bool at_limit = cl->nconn_threads >= MAX_CONN_THREADS;
+        pthread_mutex_unlock(&cl->lock);
+        if (at_limit) {
+            close(fd);
+            continue;
+        }
 
         /* announce ourselves before entering the read loop */
         send_hello_state(cl, fd, false);
@@ -1337,22 +1501,38 @@ static bool have_conn_locked(const zdb_cluster *cl, const char *id)
 
 static void maintainer_tick(zdb_cluster *cl)
 {
+    /* heartbeat established connections. Build the payload once under
+     * cl->lock, reference every connection, then release cl->lock so a
+     * slow/stalled peer cannot stall the whole cluster state while we
+     * block in send(). */
+    peer_conn *hb[256];
+    size_t nhb = 0;
+    pthread_mutex_lock(&cl->lock);
+    char *state = NULL;
+    cJSON *s = state_to_json(cl);
+    state = s ? cJSON_PrintUnformatted(s) : NULL;
+    cJSON_Delete(s);
+    for (peer_conn *c = cl->conns; c && nhb < 256; c = c->next) {
+        if (!c->dead) {
+            c->refs++;
+            hb[nhb++] = c;
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+
+    for (size_t i = 0; i < nhb; i++) {
+        if (zstp_send(hb[i]->fd, ZSTP_STATE, state ? state : "{}",
+                      &cl->send_lock) != 0) {
+            shutdown(hb[i]->fd, SHUT_RDWR);   /* reader thread tears it down */
+        }
+    }
+    free(state);
 
     pthread_mutex_lock(&cl->lock);
-
-    /* heartbeat established connections */
-    for (peer_conn *c = cl->conns; c; c = c->next) {
-        pthread_mutex_lock(&cl->send_lock);
-        char *state = NULL;
-        cJSON *s = state_to_json(cl);
-        state = s ? cJSON_PrintUnformatted(s) : NULL;
-        cJSON_Delete(s);
-        pthread_mutex_unlock(&cl->send_lock);
-        if (zstp_send(c->fd, ZSTP_STATE, state ? state : "{}", NULL) != 0) {
-            shutdown(c->fd, SHUT_RDWR);   /* reader thread tears it down */
-        }
-        free(state);
+    for (size_t i = 0; i < nhb; i++) {
+        conn_unref_locked(cl, hb[i]);
     }
+    pthread_mutex_unlock(&cl->lock);
 
     /* connections whose reader threads already exited are unlinked from
      * cl->conns there; nothing else to reap here */
@@ -1361,6 +1541,7 @@ static void maintainer_tick(zdb_cluster *cl)
      * The online flag is only cleared on connection loss, so a peer that
      * went offline while we were disconnected still gets dialled here
      * and comes back once the link is re-established. */
+    pthread_mutex_lock(&cl->lock);
     for (size_t i = 0; i < cl->npeers; i++) {
         zdb_peer_info p = cl->peers[i];   /* copy; lock released below */
         if (strcmp(p.id, cl->self_id) == 0 ||
@@ -1390,11 +1571,6 @@ static void maintainer_tick(zdb_cluster *cl)
     }
     pthread_mutex_unlock(&cl->lock);
 
-    /* stage 6d: promote a compliant wave on a steady cadence (also
-     * catches compliance that arrived outside a topology change). Shard
-     * GC is deliberately NOT automatic: with full replication every node
-     * still holds replica copies, so the placement layer decides what is
-     * redundant and calls zdb_cluster_gc_redundant explicitly. */
     zdb_cluster_maybe_promote(cl);
 
     /* stage 6e: auto-compliance. A node that already holds everything
@@ -1417,6 +1593,13 @@ static void maintainer_tick(zdb_cluster *cl)
     if (auto_ok && tgen > 0 && self_gen < tgen &&
         !zdb_cluster_needs_sync(cl)) {
         zdb_cluster_mark_compliant(cl);
+    }
+    pthread_mutex_lock(&cl->lock);
+    bool gc_ready = cl->target_generation == 0 && cl->gc_after > 0 &&
+                    epoch_now() >= cl->gc_after;
+    pthread_mutex_unlock(&cl->lock);
+    if (gc_ready) {
+        zdb_cluster_gc_redundant(cl);
     }
 }
 
@@ -1504,6 +1687,7 @@ zdb_cluster *zdb_cluster_start(zdb_config *cfg, const char *advertise_addr,
 
     pthread_mutex_init(&cl->lock, NULL);
     pthread_mutex_init(&cl->send_lock, NULL);
+    pthread_cond_init(&cl->conn_cv, NULL);
     cl->listen_fd = -1;
 
     restore_state(cl);
@@ -1594,15 +1778,16 @@ void zdb_cluster_stop(zdb_cluster *cl)
     pthread_join(cl->acceptor_thread, NULL);
     pthread_join(cl->maintainer_thread, NULL);
 
-    /* tear down live peer connections: their reader threads exit as
-     * soon as recv fails on the closed sockets */
+    /* tear down live peer connections: shutdown() wakes their reader
+     * threads, which unlink themselves and drop their reference; the
+     * last unref closes the fd and frees the connection */
     pthread_mutex_lock(&cl->lock);
-    for (peer_conn *c = cl->conns; c;) {
-        peer_conn *next = c->next;
+    for (peer_conn *c = cl->conns; c; c = c->next) {
+        c->dead = true;
         shutdown(c->fd, SHUT_RDWR);
-        close(c->fd);
-        free(c);
-        c = next;
+    }
+    while (cl->nconn_threads > 0) {
+        pthread_cond_wait(&cl->conn_cv, &cl->lock);
     }
     cl->conns = NULL;
     persist_state(cl);
@@ -1611,7 +1796,9 @@ void zdb_cluster_stop(zdb_cluster *cl)
     close(cl->listen_fd);
     free(cl->peers);
     free(cl->ranges);
+    free(cl->target_ranges);
     pthread_mutex_destroy(&cl->send_lock);
+    pthread_cond_destroy(&cl->conn_cv);
     pthread_mutex_destroy(&cl->lock);
     free(cl);
 }
@@ -1689,11 +1876,37 @@ size_t zdb_cluster_ranges(zdb_cluster *cl, zdb_range_info *out, size_t cap)
 
 const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex)
 {
+    static _Thread_local char owner_buf[ZDB_NODE_ID_MAX];
     if (!cl || !md5hex || strlen(md5hex) != 32) {
         return NULL;
     }
-    const char *owner = NULL;
+    bool found = false;
     pthread_mutex_lock(&cl->lock);
+    for (size_t i = 0; i < cl->nranges; i++) {
+        if (strncmp(md5hex, cl->ranges[i].start, 32) >= 0 &&
+            (strncmp(md5hex, cl->ranges[i].end, 32) < 0 ||
+             memcmp(cl->ranges[i].end,
+                    "ffffffffffffffffffffffffffffffff", 32) == 0)) {
+            /* copy out: the ranges array can be reallocated or promoted
+             * concurrently, so a bare pointer would dangle */
+            snprintf(owner_buf, sizeof(owner_buf), "%s",
+                     cl->ranges[i].node_id);
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+    return found ? owner_buf : NULL;
+}
+
+size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
+                           char (*node_ids)[ZDB_NODE_ID_MAX], size_t cap)
+{
+    if (!cl || !md5hex || strlen(md5hex) != 32 || !node_ids || cap == 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&cl->lock);
+    const char *owner = NULL;
     for (size_t i = 0; i < cl->nranges; i++) {
         if (strncmp(md5hex, cl->ranges[i].start, 32) >= 0 &&
             (strncmp(md5hex, cl->ranges[i].end, 32) < 0 ||
@@ -1703,9 +1916,41 @@ const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex)
             break;
         }
     }
+
+    const char *candidates[MAX_PEERS];
+    size_t ncandidates = 0;
+    for (size_t i = 0; i < cl->npeers && ncandidates < MAX_PEERS; i++) {
+        candidates[ncandidates++] = cl->peers[i].id;
+    }
+    for (size_t i = 1; i < ncandidates; i++) {
+        const char *candidate = candidates[i];
+        size_t j = i;
+        while (j > 0 && strcmp(candidates[j - 1], candidate) > 0) {
+            candidates[j] = candidates[j - 1];
+            j--;
+        }
+        candidates[j] = candidate;
+    }
+
+    size_t start = 0;
+    if (owner) {
+        for (size_t i = 0; i < ncandidates; i++) {
+            if (strcmp(candidates[i], owner) == 0) {
+                start = i;
+                break;
+            }
+        }
+    }
+    size_t count = 0;
+    for (size_t offset = 0; offset < ncandidates && count < cap; offset++) {
+        size_t index = (start + offset) % ncandidates;
+        snprintf(node_ids[count], ZDB_NODE_ID_MAX, "%s", candidates[index]);
+        count++;
+    }
     pthread_mutex_unlock(&cl->lock);
-    return owner;
+    return count;
 }
+
 
 /* One-shot join: dial the seed, exchange HELLO+STATE both ways so both
  * membership views merge, then hang up (the maintainer re-dials).
@@ -1759,6 +2004,7 @@ int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
     if (fd < 0) {
         return -1;
     }
+    set_socket_timeouts(fd, 2000);
     int rc = join_exchange(cl, fd);
     close(fd);
     return rc;
@@ -1771,6 +2017,11 @@ void zdb_cluster_set_dispatcher(zdb_cluster *cl,
         return;
     }
     pthread_mutex_lock(&cl->lock);
+    cl->dispatch = NULL;
+    cl->dispatch_ctx = NULL;
+    while (cl->dispatch_inflight > 0) {
+        pthread_cond_wait(&cl->conn_cv, &cl->lock);
+    }
     cl->dispatch = fn;
     cl->dispatch_ctx = ctx;
     pthread_mutex_unlock(&cl->lock);
@@ -1804,30 +2055,32 @@ long long zdb_cluster_target_generation(zdb_cluster *cl)
 
 const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex)
 {
+    static _Thread_local char owner_buf[ZDB_NODE_ID_MAX];
     if (!cl || !md5hex || strlen(md5hex) != 32) {
         return NULL;
     }
-    const char *owner = NULL;
+    bool found = false;
     pthread_mutex_lock(&cl->lock);
     for (size_t i = 0; i < cl->ntarget_ranges; i++) {
         if (strncmp(md5hex, cl->target_ranges[i].start, 32) >= 0 &&
             (strncmp(md5hex, cl->target_ranges[i].end, 32) < 0 ||
              memcmp(cl->target_ranges[i].end,
                     "ffffffffffffffffffffffffffffffff", 32) == 0)) {
-            owner = cl->target_ranges[i].node_id;
+            /* copy out: see zdb_cluster_owner for why a bare pointer
+             * into the (mutable) range table would dangle */
+            snprintf(owner_buf, sizeof(owner_buf), "%s",
+                     cl->target_ranges[i].node_id);
+            found = true;
             break;
         }
     }
     pthread_mutex_unlock(&cl->lock);
-    return owner;
+    return found ? owner_buf : NULL;
 }
 
 bool zdb_cluster_promote_target(zdb_cluster *cl)
 {
-    if (!cl) {
-        return false;
-    }
-    if (zdb_cluster_target_generation(cl) == 0 ||
+    if (!cl || zdb_cluster_target_generation(cl) == 0 ||
         !zdb_cluster_target_compliant(cl)) {
         return false;
     }
@@ -1835,50 +2088,79 @@ bool zdb_cluster_promote_target(zdb_cluster *cl)
     pthread_mutex_lock(&cl->lock);
     if (leader_is_self_locked(cl) && cl->target_generation > 0) {
         promote_target_locked(cl);
+        for (size_t i = 0; i < cl->npeers; i++) {
+            char name[96];
+            snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
+                     cl->peers[i].id);
+            zdb_setting_delete(cl->cfg, name);
+        }
+        zdb_setting_delete(cl->cfg, SETTING_LOCK);
+        persist_state(cl);
         promoted = true;
     }
     pthread_mutex_unlock(&cl->lock);
     if (promoted) {
-        /* clear compliance flags and release the lock */
-        zdb_peer_info peers[MAX_PEERS];
-        size_t n = zdb_cluster_peers(cl, peers, MAX_PEERS);
-        for (size_t i = 0; i < n; i++) {
-            char name[96];
-            snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
-                     peers[i].id);
-            zdb_setting_delete(cl->cfg, name);
-        }
-        zdb_cluster_release_rebalance_lock(cl);
-        persist_state(cl);
+        gossip_state(cl);
     }
     return promoted;
 }
 
 bool zdb_cluster_target_compliant(zdb_cluster *cl)
 {
-    if (!cl || zdb_cluster_target_generation(cl) == 0) {
+    if (!cl) {
         return false;
     }
-    long long tgen = zdb_cluster_target_generation(cl);
-    zdb_peer_info peers[MAX_PEERS];
-    size_t n = zdb_cluster_peers(cl, peers, MAX_PEERS);
-    for (size_t i = 0; i < n; i++) {
-        if (!peers[i].online && strcmp(peers[i].id, cl->self_id) != 0) {
-            continue;   /* only online nodes must comply */
+    pthread_mutex_lock(&cl->lock);
+    long long target_generation = cl->target_generation;
+    char required[MAX_PEERS][ZDB_NODE_ID_MAX];
+    size_t nrequired = 0;
+    for (size_t i = 0; target_generation > 0 && i < cl->ntarget_ranges &&
+                       nrequired < MAX_PEERS;
+         i++) {
+        bool duplicate = false;
+        for (size_t j = 0; j < nrequired; j++) {
+            if (strcmp(required[j], cl->target_ranges[i].node_id) == 0) {
+                duplicate = true;
+                break;
+            }
         }
-        /* stage 6d: compliance is gossiped (compliant_gen); fall back to
-         * the settings store so the stage 6a stub (manually injected
-         * flags) and any persisted flag still count */
-        if (peers[i].compliant_gen >= tgen) {
+        if (!duplicate) {
+            snprintf(required[nrequired], ZDB_NODE_ID_MAX, "%s",
+                     cl->target_ranges[i].node_id);
+            nrequired++;
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+    if (target_generation == 0 || nrequired == 0) {
+        return false;
+    }
+
+    zdb_peer_info peers[MAX_PEERS];
+    size_t npeers = zdb_cluster_peers(cl, peers, MAX_PEERS);
+    for (size_t i = 0; i < nrequired; i++) {
+        bool compliant = false;
+        for (size_t p = 0; p < npeers; p++) {
+            if (strcmp(peers[p].id, required[i]) == 0 &&
+                peers[p].compliant_gen >= target_generation) {
+                compliant = true;
+                break;
+            }
+        }
+        if (compliant) {
             continue;
         }
         char name[96];
         snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
-                 peers[i].id);
-        char *v = zdb_setting_get(cl->cfg, name);
-        bool done = v != NULL;
-        free(v);
-        if (!done) {
+                 required[i]);
+        char *value = zdb_setting_get(cl->cfg, name);
+        if (value) {
+            char *end = NULL;
+            long long stored_generation = strtoll(value, &end, 10);
+            compliant = end && *end == '\0' &&
+                        stored_generation >= target_generation;
+        }
+        free(value);
+        if (!compliant) {
             return false;
         }
     }
@@ -1891,6 +2173,9 @@ void zdb_cluster_mark_compliant(zdb_cluster *cl)
         return;
     }
     long long tgen = zdb_cluster_target_generation(cl);
+    if (tgen == 0) {
+        tgen = zdb_cluster_generation(cl);
+    }
     if (tgen == 0) {
         return;
     }
@@ -1943,7 +2228,7 @@ bool zdb_cluster_maybe_promote(zdb_cluster *cl)
  * drain GC one at a time. */
 size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
 {
-    if (!cl) {
+    if (!cl || zdb_cluster_target_generation(cl) != 0) {
         return 0;
     }
     zdb_engine *engine = zdb_config_engine(cl->cfg);
@@ -1951,20 +2236,70 @@ size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
         return 0;
     }
     char keys[256][33];
-    size_t n = zdb_engine_shard_keys(engine, keys, 256);
-    for (size_t i = 0; i < n; i++) {
+    size_t key_count = zdb_engine_shard_keys(engine, keys, 256);
+    size_t keyspace_count = 0;
+    zdb_keyspace_info *keyspaces = zdb_keyspace_list(cl->cfg,
+                                                     &keyspace_count);
+    zdb_peer_info peers[MAX_PEERS];
+    size_t peer_count = zdb_cluster_peers(cl, peers, MAX_PEERS);
+
+    for (size_t i = 0; i < key_count; i++) {
         if (zdb_config_is_system_key(cl->cfg, keys[i])) {
             continue;
         }
-        const char *owner = zdb_cluster_owner(cl, keys[i]);
-        if (owner && strcmp(owner, cl->self_id) != 0) {
-            /* the live table reassigned this key to another node; our
-             * copy is now redundant */
-            if (zdb_shard_gc(engine, keys[i])) {
-                return 1;
+        int rf = 1;
+        bool registered = false;
+        for (size_t k = 0; k < keyspace_count; k++) {
+            char path[1024];
+            char candidate[33];
+            if (zdb_shard_path(engine, keyspaces[k].partition,
+                               keyspaces[k].name, path, sizeof(path),
+                               candidate) && strcmp(candidate, keys[i]) == 0) {
+                zdb_database_info database;
+                if (zdb_database_get(cl->cfg, keyspaces[k].database,
+                                     &database) &&
+                    database.replication_factor > 0) {
+                    rf = database.replication_factor;
+                }
+                registered = true;
+                break;
             }
         }
+        if (!registered) {
+            rf = 1;
+        }
+
+        char holders[MAX_PEERS][ZDB_NODE_ID_MAX];
+        size_t holder_count = zdb_cluster_holders(cl, keys[i], holders,
+                                                  MAX_PEERS);
+        if ((size_t)rf > holder_count) {
+            rf = (int)holder_count;
+        }
+        bool keep_local = false;
+        bool replicas_ready = rf > 0;
+        for (int h = 0; h < rf; h++) {
+            if (strcmp(holders[h], cl->self_id) == 0) {
+                keep_local = true;
+                break;
+            }
+            bool ready = false;
+            for (size_t p = 0; p < peer_count; p++) {
+                if (strcmp(peers[p].id, holders[h]) == 0 && peers[p].online) {
+                    ready = true;
+                    break;
+                }
+            }
+            if (!ready) {
+                replicas_ready = false;
+                break;
+            }
+        }
+        if (!keep_local && replicas_ready && zdb_shard_gc(engine, keys[i])) {
+            free(keyspaces);
+            return 1;
+        }
     }
+    free(keyspaces);
     return 0;
 }
 
@@ -2039,9 +2374,8 @@ bool zdb_cluster_needs_sync(zdb_cluster *cl)
         if (!towner || strcmp(towner, cl->self_id) != 0) {
             continue;   /* the wave does not give us this shard */
         }
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            continue;   /* shard data already present locally */
+        if (zdb_shard_validate(engine, kss[i].partition, kss[i].name)) {
+            continue;
         }
         needed = true;
     }

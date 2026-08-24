@@ -7,11 +7,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <strings.h>
@@ -22,6 +24,8 @@
 #define ZDB_HTTP_MAX_BODY_BYTES (16 * 1024 * 1024)
 #define ZDB_HTTP_RECV_TIMEOUT_SEC 30
 #define ZDB_HTTP_MAX_ROUTES 32
+#define ZDB_HTTP_MAX_WORKERS 128
+#define ZDB_HTTP_REQUEST_TIMEOUT_MS 30000
 
 typedef struct {
     char method[16];
@@ -31,13 +35,18 @@ typedef struct {
 
 struct zdb_http_server {
     int listen_fd;
-    pthread_t accept_thread;
-    volatile bool running;
+    bool running;
 
     int admin_fd;                 /* -1 when no admin listener */
     char admin_path[108];         /* unix socket path (sun_path limit) */
 
     pthread_mutex_t routes_lock;
+    pthread_mutex_t state_lock;
+    pthread_cond_t workers_done;
+    pthread_t accept_threads[2];
+    size_t naccept_threads;
+    size_t nworkers;
+    struct conn_ctx *workers;
     http_route routes[ZDB_HTTP_MAX_ROUTES];
     int nroutes;
 
@@ -45,10 +54,11 @@ struct zdb_http_server {
     char static_root[1024];
 };
 
-typedef struct {
+typedef struct conn_ctx {
     zdb_http_server *srv;
     int fd;
     bool trusted;
+    struct conn_ctx *next;
 } conn_ctx;
 
 /* ------------------------------------------------------------------ */
@@ -164,18 +174,57 @@ typedef struct {
     size_t cap;
 } recv_buf;
 
-static bool recv_append(recv_buf *rb, int fd, size_t *total_read)
+static bool recv_reserve(recv_buf *rb, size_t need)
 {
-    if (rb->cap - rb->len < 4096) {
-        size_t newcap = rb->cap ? rb->cap * 2 : 8192;
-        char *grown = realloc(rb->buf, newcap);
-        if (!grown) {
+    if (need <= rb->cap) {
+        return true;
+    }
+    size_t newcap = rb->cap ? rb->cap : 8192;
+    while (newcap < need) {
+        if (newcap > SIZE_MAX / 2) {
             return false;
         }
-        rb->buf = grown;
-        rb->cap = newcap;
+        newcap *= 2;
     }
-    ssize_t n = recv(fd, rb->buf + rb->len, rb->cap - rb->len, 0);
+    char *grown = realloc(rb->buf, newcap);
+    if (!grown) {
+        return false;
+    }
+    rb->buf = grown;
+    rb->cap = newcap;
+    return true;
+}
+
+static long long mono_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static bool recv_append(recv_buf *rb, int fd, size_t *total_read,
+                        long long deadline)
+{
+    if (rb->cap - rb->len < 4096 &&
+        !recv_reserve(rb, rb->len + 4096)) {
+        return false;
+    }
+    long long remaining = deadline - mono_ms();
+    if (remaining <= 0) {
+        return false;
+    }
+    struct pollfd socket_poll = { .fd = fd, .events = POLLIN };
+    int ready;
+    do {
+        ready = poll(&socket_poll, 1, (int)remaining);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0) {
+        return false;
+    }
+    ssize_t n;
+    do {
+        n = recv(fd, rb->buf + rb->len, rb->cap - rb->len, 0);
+    } while (n < 0 && errno == EINTR);
     if (n <= 0) {
         return false;
     }
@@ -218,6 +267,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
 {
     memset(req, 0, sizeof(*req));
     size_t header_total = 0;
+    long long deadline = mono_ms() + ZDB_HTTP_REQUEST_TIMEOUT_MS;
 
     char *head_end = NULL;
     for (;;) {
@@ -233,7 +283,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
         if (header_total > ZDB_HTTP_MAX_HEADER_BYTES) {
             return false;
         }
-        if (!recv_append(rb, fd, &header_total)) {
+        if (!recv_append(rb, fd, &header_total, deadline)) {
             return false;
         }
     }
@@ -243,6 +293,9 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
         head_len = (size_t)(head_end - (rb->buf + *pos)) + 4;
     } else {
         head_len = (size_t)(head_end - (rb->buf + *pos)) + 2;
+    }
+    if (head_len > ZDB_HTTP_MAX_HEADER_BYTES) {
+        return false;
     }
 
     rb->buf[*pos + head_len - 1] = '\0';   /* terminate headers block */
@@ -277,8 +330,12 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
     while ((eol = strchr(cursor, '\n')) != NULL && cursor[0] != '\r' &&
            cursor[0] != '\n') {
         *eol = '\0';
+        if (req->nheaders >= ZDB_HTTP_MAX_HEADERS) {
+            return false;   /* overfull header table would desync the
+                             * framing (Content-Length could be dropped) */
+        }
         char *colon = strchr(cursor, ':');
-        if (colon && req->nheaders < ZDB_HTTP_MAX_HEADERS) {
+        if (colon) {
             *colon = '\0';
             req->header_names[req->nheaders] = trim(cursor);
             req->header_values[req->nheaders] = trim(colon + 1);
@@ -289,18 +346,59 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
 
     /* content length */
     size_t content_length = 0;
+    int cl_count = 0;
+    for (int i = 0; i < req->nheaders; i++) {
+        if (strcasecmp(req->header_names[i], "Content-Length") == 0) {
+            cl_count++;
+        }
+    }
     const char *cl = zdb_http_header(req, "Content-Length");
     if (cl) {
-        content_length = strtoul(cl, NULL, 10);
-        if (content_length > ZDB_HTTP_MAX_BODY_BYTES) {
+        if (cl_count > 1) {
+            return false;   /* conflicting framing: reject */
+        }
+        if (!*cl) {
             return false;
         }
+        for (const unsigned char *digit = (const unsigned char *)cl;
+             *digit; digit++) {
+            if (!isdigit(*digit)) {
+                return false;
+            }
+        }
+        errno = 0;
+        char *end = NULL;
+        unsigned long long parsed = strtoull(cl, &end, 10);
+        if (errno == ERANGE || !end || *end != '\0' ||
+            parsed > ZDB_HTTP_MAX_BODY_BYTES) {
+            return false;
+        }
+        content_length = (size_t)parsed;
+    }
+    /* chunked bodies are not supported: rejecting up front keeps the
+     * connection framing unambiguous (no smuggling via TE vs CL) */
+    if (zdb_http_header(req, "Transfer-Encoding")) {
+        return false;
     }
 
     /* body starts after headers; may need more data */
+    size_t name_offsets[ZDB_HTTP_MAX_HEADERS];
+    size_t value_offsets[ZDB_HTTP_MAX_HEADERS];
+    for (int i = 0; i < req->nheaders; i++) {
+        name_offsets[i] = (size_t)(req->header_names[i] - rb->buf);
+        value_offsets[i] = (size_t)(req->header_values[i] - rb->buf);
+    }
+    if (content_length > SIZE_MAX - *pos - head_len ||
+        !recv_reserve(rb, *pos + head_len + content_length + 1)) {
+        return false;
+    }
+    for (int i = 0; i < req->nheaders; i++) {
+        req->header_names[i] = rb->buf + name_offsets[i];
+        req->header_values[i] = rb->buf + value_offsets[i];
+    }
     while (rb->len < *pos + head_len + content_length) {
         size_t dummy = 0;
-        if (!recv_append(rb, fd, &dummy)) {
+        if (!recv_append(rb, fd, &dummy, deadline)) {
             return false;
         }
     }
@@ -395,9 +493,9 @@ static void serve_static_file(zdb_http_server *srv,
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz < 0) {
+    if (sz < 0 || sz > (long)ZDB_HTTP_MAX_BODY_BYTES) {
         fclose(f);
-        res->status = 500;
+        res->status = sz < 0 ? 500 : 404;
         *handled = true;
         return;
     }
@@ -420,6 +518,7 @@ static void serve_static_file(zdb_http_server *srv,
     res->content_type = ctype_tls;
     res->body = data;
     res->body_len = got;
+    *handled = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -427,12 +526,12 @@ static void serve_static_file(zdb_http_server *srv,
 
 static void *conn_main(void *arg)
 {
-    conn_ctx ctx = *(conn_ctx *)arg;
-    free(arg);
-
-    int fd = ctx.fd;
+    conn_ctx *ctx = arg;
+    zdb_http_server *srv = ctx->srv;
+    int fd = ctx->fd;
     struct timeval tv = { .tv_sec = ZDB_HTTP_RECV_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
@@ -440,23 +539,29 @@ static void *conn_main(void *arg)
     size_t pos = 0;
     bool keep_alive = true;
 
-    while (keep_alive && ctx.srv->running) {
+    for (;;) {
+        pthread_mutex_lock(&srv->state_lock);
+        bool running = srv->running;
+        pthread_mutex_unlock(&srv->state_lock);
+        if (!keep_alive || !running) {
+            break;
+        }
+
         zdb_http_request req;
         if (!parse_request_full(&rb, fd, &pos, &req)) {
             break;
         }
-        req.trusted = ctx.trusted;
+        req.trusted = ctx->trusted;
 
         zdb_http_response res = { .status = 500 };
         res.content_type = "application/json";
 
-        /* route match: longest prefix wins; static file handler is last */
         int best = -1;
         size_t best_len = 0;
-        pthread_mutex_lock(&ctx.srv->routes_lock);
-        for (int i = 0; i < ctx.srv->nroutes; i++) {
-            http_route *r = &ctx.srv->routes[i];
-            if (i == ctx.srv->static_route) {
+        pthread_mutex_lock(&srv->routes_lock);
+        for (int i = 0; i < srv->nroutes; i++) {
+            http_route *r = &srv->routes[i];
+            if (i == srv->static_route) {
                 continue;
             }
             size_t plen = strlen(r->prefix);
@@ -468,15 +573,15 @@ static void *conn_main(void *arg)
         }
         bool handled = false;
         if (best >= 0) {
-            http_route route_copy = ctx.srv->routes[best];
-            pthread_mutex_unlock(&ctx.srv->routes_lock);
+            http_route route_copy = srv->routes[best];
+            pthread_mutex_unlock(&srv->routes_lock);
             keep_alive = route_copy.handler(&req, &res);
             handled = true;
-        } else if (ctx.srv->static_route >= 0) {
-            pthread_mutex_unlock(&ctx.srv->routes_lock);
-            serve_static_file(ctx.srv, &req, &res, &handled);
+        } else if (srv->static_route >= 0) {
+            pthread_mutex_unlock(&srv->routes_lock);
+            serve_static_file(srv, &req, &res, &handled);
         } else {
-            pthread_mutex_unlock(&ctx.srv->routes_lock);
+            pthread_mutex_unlock(&srv->routes_lock);
         }
 
         if (!handled) {
@@ -487,7 +592,6 @@ static void *conn_main(void *arg)
                 "{\"error\":\"not found\",\"path\":\"%s\"}", req.path);
         }
 
-        /* honor client's Connection header unless handler said close */
         const char *conn_hdr = zdb_http_header(&req, "Connection");
         if (conn_hdr && strcasecmp(conn_hdr, "close") == 0) {
             keep_alive = false;
@@ -497,15 +601,31 @@ static void *conn_main(void *arg)
         free(res.body);
         free(req.body);
 
-        /* compact the buffer when everything was consumed */
-        if (pos == rb.len) {
+        if (pos > 0) {
+            rb.len -= pos;
+            if (rb.len > 0) {
+                memmove(rb.buf, rb.buf + pos, rb.len);
+            }
             pos = 0;
-            rb.len = 0;
         }
     }
 
     close(fd);
     free(rb.buf);
+    pthread_mutex_lock(&srv->state_lock);
+    conn_ctx **link = &srv->workers;
+    while (*link && *link != ctx) {
+        link = &(*link)->next;
+    }
+    if (*link == ctx) {
+        *link = ctx->next;
+    }
+    if (srv->nworkers > 0) {
+        srv->nworkers--;
+    }
+    pthread_cond_broadcast(&srv->workers_done);
+    pthread_mutex_unlock(&srv->state_lock);
+    free(ctx);
     return NULL;
 }
 
@@ -523,12 +643,22 @@ static void *accept_main(void *arg)
     free(arg);
     zdb_http_server *srv = job.srv;
 
-    while (srv->running) {
+    for (;;) {
+        pthread_mutex_lock(&srv->state_lock);
+        bool running = srv->running;
+        pthread_mutex_unlock(&srv->state_lock);
+        if (!running) {
+            break;
+        }
+
         struct sockaddr_storage peer;
         socklen_t peer_len = sizeof(peer);
         int fd = accept(job.listen_fd, (struct sockaddr *)&peer, &peer_len);
         if (fd < 0) {
-            if (!srv->running) {
+            pthread_mutex_lock(&srv->state_lock);
+            running = srv->running;
+            pthread_mutex_unlock(&srv->state_lock);
+            if (!running) {
                 break;
             }
             if (errno == EINTR || errno == ECONNABORTED) {
@@ -538,7 +668,7 @@ static void *accept_main(void *arg)
             continue;
         }
 
-        conn_ctx *ctx = malloc(sizeof(*ctx));
+        conn_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             close(fd);
             continue;
@@ -547,11 +677,38 @@ static void *accept_main(void *arg)
         ctx->fd = fd;
         ctx->trusted = job.trusted;
 
+        pthread_mutex_lock(&srv->state_lock);
+        if (!srv->running || srv->nworkers >= ZDB_HTTP_MAX_WORKERS) {
+            bool stopping = !srv->running;
+            pthread_mutex_unlock(&srv->state_lock);
+            close(fd);
+            free(ctx);
+            if (stopping) {
+                break;
+            }
+            continue;
+        }
+        ctx->next = srv->workers;
+        srv->workers = ctx;
+        srv->nworkers++;
+        pthread_mutex_unlock(&srv->state_lock);
+
         pthread_t worker;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&worker, &attr, conn_main, ctx) != 0) {
+            pthread_mutex_lock(&srv->state_lock);
+            conn_ctx **link = &srv->workers;
+            while (*link && *link != ctx) {
+                link = &(*link)->next;
+            }
+            if (*link == ctx) {
+                *link = ctx->next;
+            }
+            srv->nworkers--;
+            pthread_cond_broadcast(&srv->workers_done);
+            pthread_mutex_unlock(&srv->state_lock);
             close(fd);
             free(ctx);
         }
@@ -562,6 +719,10 @@ static void *accept_main(void *arg)
 
 static bool spawn_acceptor(zdb_http_server *srv, int listen_fd, bool trusted)
 {
+    if (srv->naccept_threads >=
+        sizeof(srv->accept_threads) / sizeof(srv->accept_threads[0])) {
+        return false;
+    }
     accept_job *job = malloc(sizeof(*job));
     if (!job) {
         return false;
@@ -571,15 +732,12 @@ static bool spawn_acceptor(zdb_http_server *srv, int listen_fd, bool trusted)
     job->trusted = trusted;
 
     pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    bool ok = pthread_create(&tid, &attr, accept_main, job) == 0;
-    pthread_attr_destroy(&attr);
-    if (!ok) {
+    if (pthread_create(&tid, NULL, accept_main, job) != 0) {
         free(job);
+        return false;
     }
-    return ok;
+    srv->accept_threads[srv->naccept_threads++] = tid;
+    return true;
 }
 
 bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
@@ -630,10 +788,16 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
     }
     srv->running = true;
     srv->static_route = -1;
+    srv->admin_fd = -1;
     pthread_mutex_init(&srv->routes_lock, NULL);
+    pthread_mutex_init(&srv->state_lock, NULL);
+    pthread_cond_init(&srv->workers_done, NULL);
 
     srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv->listen_fd < 0) {
+        pthread_cond_destroy(&srv->workers_done);
+        pthread_mutex_destroy(&srv->state_lock);
+        pthread_mutex_destroy(&srv->routes_lock);
         free(srv);
         return NULL;
     }
@@ -652,14 +816,18 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
         fprintf(stderr, "zdb: http bind/listen on port %d failed: %s\n",
                 port, strerror(errno));
         close(srv->listen_fd);
+        pthread_cond_destroy(&srv->workers_done);
+        pthread_mutex_destroy(&srv->state_lock);
+        pthread_mutex_destroy(&srv->routes_lock);
         free(srv);
         return NULL;
     }
 
-    srv->admin_fd = -1;
     if (!spawn_acceptor(srv, srv->listen_fd, false)) {
         fprintf(stderr, "zdb: failed to start accept thread\n");
         close(srv->listen_fd);
+        pthread_cond_destroy(&srv->workers_done);
+        pthread_mutex_destroy(&srv->state_lock);
         pthread_mutex_destroy(&srv->routes_lock);
         free(srv);
         return NULL;
@@ -686,14 +854,24 @@ bool zdb_http_add_handler(zdb_http_server *srv, const char *method,
 bool zdb_http_serve_static(zdb_http_server *srv, const char *prefix,
                            const char *root_dir)
 {
-    if (!srv || !prefix || !root_dir || srv->static_route >= 0) {
+    if (!srv || !prefix || !root_dir || srv->static_route >= 0 ||
+        strlen(prefix) >= sizeof(srv->routes[0].prefix) ||
+        strlen(root_dir) >= sizeof(srv->static_root)) {
         return false;
     }
-    if (!zdb_http_add_handler(srv, "GET", prefix, NULL)) {
+    pthread_mutex_lock(&srv->routes_lock);
+    if (srv->nroutes >= ZDB_HTTP_MAX_ROUTES) {
+        pthread_mutex_unlock(&srv->routes_lock);
         return false;
     }
-    srv->static_route = srv->nroutes - 1;
+    http_route *route = &srv->routes[srv->nroutes];
+    snprintf(route->method, sizeof(route->method), "GET");
+    snprintf(route->prefix, sizeof(route->prefix), "%s", prefix);
+    route->handler = NULL;
+    srv->static_route = srv->nroutes;
+    srv->nroutes++;
     snprintf(srv->static_root, sizeof(srv->static_root), "%s", root_dir);
+    pthread_mutex_unlock(&srv->routes_lock);
     return true;
 }
 
@@ -702,14 +880,35 @@ void zdb_http_stop(zdb_http_server *srv)
     if (!srv) {
         return;
     }
+
+    pthread_mutex_lock(&srv->state_lock);
     srv->running = false;
     shutdown(srv->listen_fd, SHUT_RDWR);
-    close(srv->listen_fd);
     if (srv->admin_fd >= 0) {
         shutdown(srv->admin_fd, SHUT_RDWR);
+    }
+    for (conn_ctx *ctx = srv->workers; ctx; ctx = ctx->next) {
+        shutdown(ctx->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&srv->state_lock);
+
+    close(srv->listen_fd);
+    if (srv->admin_fd >= 0) {
         close(srv->admin_fd);
         unlink(srv->admin_path);
     }
+    for (size_t i = 0; i < srv->naccept_threads; i++) {
+        pthread_join(srv->accept_threads[i], NULL);
+    }
+
+    pthread_mutex_lock(&srv->state_lock);
+    while (srv->nworkers > 0) {
+        pthread_cond_wait(&srv->workers_done, &srv->state_lock);
+    }
+    pthread_mutex_unlock(&srv->state_lock);
+
+    pthread_cond_destroy(&srv->workers_done);
+    pthread_mutex_destroy(&srv->state_lock);
     pthread_mutex_destroy(&srv->routes_lock);
     free(srv);
 }

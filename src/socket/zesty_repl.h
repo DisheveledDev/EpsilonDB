@@ -134,5 +134,8 @@ bool zdb_repl_flush(zdb_repl *rp);
  * writes are cached and replayed, never lost. */
 bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
                       const char *partition, const char *keyspace);
+bool zdb_repl_catchup_required(zdb_repl *rp, const char *owner_addr,
+                               int owner_port, const char *partition,
+                               const char *keyspace);
 
 #endif

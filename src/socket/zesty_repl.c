@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "../../vendor/cjson/cJSON.h"
+#include "../engine/md5.h"
 #include "../engine/zesty_engine.h"
 #include "../sqlite/sqlite3.h"
 #include "zstp_wire.h"
@@ -173,10 +174,26 @@ static bool cache_open(change_cache *cc, const char *data_dir)
                      "CREATE TABLE IF NOT EXISTS PendingChanges ("
                      " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
                      " target TEXT NOT NULL,"
-                     " cid TEXT NOT NULL UNIQUE,"
+                     " cid TEXT NOT NULL,"
                      " payload TEXT NOT NULL,"
-                     " created INT NOT NULL"
-                     ");",
+                     " created INT NOT NULL,"
+                     " UNIQUE(target, cid)"
+                     ");"
+                     "DROP TABLE IF EXISTS PendingChangesV2;"
+                     "CREATE TABLE PendingChangesV2 ("
+                     " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     " target TEXT NOT NULL,"
+                     " cid TEXT NOT NULL,"
+                     " payload TEXT NOT NULL,"
+                     " created INT NOT NULL,"
+                     " UNIQUE(target, cid)"
+                     ");"
+                     "INSERT OR IGNORE INTO PendingChangesV2"
+                     " (seq,target,cid,payload,created)"
+                     " SELECT seq,target,cid,payload,created"
+                     " FROM PendingChanges;"
+                     "DROP TABLE PendingChanges;"
+                     "ALTER TABLE PendingChangesV2 RENAME TO PendingChanges;",
                      NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "zdb: change cache init failed: %s\n",
                 err ? err : "?");
@@ -400,6 +417,11 @@ static bool apply_change_local(zdb_repl *rp, const cJSON *change)
         cJSON_GetObjectItemCaseSensitive(change, "keyspace");
     const cJSON *jid = cJSON_GetObjectItemCaseSensitive(change, "id");
     const cJSON *jts = cJSON_GetObjectItemCaseSensitive(change, "ts");
+    const cJSON *jorigin =
+        cJSON_GetObjectItemCaseSensitive(change, "origin");
+    const char *origin = cJSON_IsString(jorigin) && jorigin->valuestring
+                             ? jorigin->valuestring
+                             : "";
 
     if (!cJSON_IsString(jop) || !cJSON_IsString(jdb) ||
         !cJSON_IsString(jpart) || !cJSON_IsString(jks) ||
@@ -443,13 +465,15 @@ static bool apply_change_local(zdb_repl *rp, const cJSON *change)
         long long ttl_abs = cJSON_IsNumber(jttl)
                                 ? (long long)jttl->valuedouble
                                 : -1;
-        ok = zdb_replica_put(rp->cfg_engine, jpart->valuestring,
-                             jks->valuestring, jid->valuestring,
-                             value_json, ttl_abs, ts, filters, nfilters);
+        ok = zdb_replica_put_origin(rp->cfg_engine, jpart->valuestring,
+                                    jks->valuestring, jid->valuestring,
+                                    value_json, ttl_abs, ts, origin, filters,
+                                    nfilters);
         free(value_json);
     } else if (strcmp(jop->valuestring, "delete") == 0) {
-        ok = zdb_replica_delete(rp->cfg_engine, jpart->valuestring,
-                                jks->valuestring, jid->valuestring, ts);
+        ok = zdb_replica_delete_origin(rp->cfg_engine, jpart->valuestring,
+                                       jks->valuestring, jid->valuestring, ts,
+                                       origin);
     } else {
         ok = false;
     }
@@ -457,85 +481,164 @@ static bool apply_change_local(zdb_repl *rp, const cJSON *change)
     return ok;
 }
 
+static int replication_factor(zdb_repl *rp, const char *db)
+{
+    zdb_database_info info;
+    if (rp && rp->cfg && zdb_database_get(rp->cfg, db, &info) &&
+        info.replication_factor > 0) {
+        return info.replication_factor;
+    }
+    return 1;
+}
+
+static size_t holder_ids(zdb_repl *rp, const char *partition,
+                         const char *keyspace, int rf,
+                         char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX])
+{
+    char path[1024];
+    char key[33];
+    if (!zdb_shard_path(rp->cfg_engine, partition, keyspace, path,
+                        sizeof(path), key)) {
+        return 0;
+    }
+    char candidates[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    size_t count = zdb_cluster_holders(rp->cluster, key, candidates,
+                                       MAX_PEERS_SNAPSHOT);
+    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    size_t npeers =
+        zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+    size_t used = 0;
+    for (int online_pass = 1; online_pass >= 0 && used < (size_t)rf;
+         online_pass--) {
+        for (size_t i = 0; i < count && used < (size_t)rf; i++) {
+            bool online = strcmp(candidates[i], rp->self_id) == 0;
+            for (size_t p = 0; p < npeers && !online; p++) {
+                if (strcmp(peers[p].id, candidates[i]) == 0) {
+                    online = peers[p].online;
+                }
+            }
+            if (online != (online_pass != 0)) {
+                continue;
+            }
+            snprintf(holders[used], ZDB_NODE_ID_MAX, "%s", candidates[i]);
+            used++;
+        }
+    }
+    return used;
+}
+
+static bool id_in_holders(const char *id,
+                          char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX],
+                          size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(id, holders[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
 zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
                                const char *change_json)
 {
-    if (!rp || !change_json) {
+    if (!rp || !db || !change_json) {
         return ZDB_REPL_LOCAL_FAIL;
     }
     cJSON *change = cJSON_Parse(change_json);
     if (!change) {
         return ZDB_REPL_LOCAL_FAIL;
     }
-
-    /* 1. local application first: this node is always one holder */
-    if (!apply_change_local(rp, change)) {
+    const cJSON *partition =
+        cJSON_GetObjectItemCaseSensitive(change, "partition");
+    const cJSON *keyspace =
+        cJSON_GetObjectItemCaseSensitive(change, "keyspace");
+    if (!cJSON_IsString(partition) || !partition->valuestring ||
+        !cJSON_IsString(keyspace) || !keyspace->valuestring) {
         cJSON_Delete(change);
         return ZDB_REPL_LOCAL_FAIL;
     }
 
-    /* unique change id for dedup across retries/replays */
-    char cid[96];
     pthread_mutex_lock(&rp->replay_lock);
     long long seq = ++rp->change_seq;
     pthread_mutex_unlock(&rp->replay_lock);
+    char cid[96];
     snprintf(cid, sizeof(cid), "%s-%lld-%lld", rp->self_id, epoch_now(),
              seq);
     cJSON_AddStringToObject(change, "cid", cid);
-
+    if (!cJSON_GetObjectItemCaseSensitive(change, "origin")) {
+        cJSON_AddStringToObject(change, "origin", rp->self_id);
+    }
     char *payload = json_print(change);
-    cJSON_Delete(change);
     if (!payload) {
+        cJSON_Delete(change);
         return ZDB_REPL_LOCAL_FAIL;
     }
 
-    /* 2. fan out to every other online peer */
+    int rf = replication_factor(rp, db);
+    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    size_t nholders = holder_ids(rp, partition->valuestring,
+                                 keyspace->valuestring, rf, holders);
+    if (nholders == 0) {
+        snprintf(holders[0], ZDB_NODE_ID_MAX, "%s", rp->self_id);
+        nholders = 1;
+    }
+    int required = (int)nholders / 2 + 1;
+    bool self_holder = id_in_holders(rp->self_id, holders, nholders);
+
     zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
     size_t npeers =
         zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+    bool delivered[MAX_PEERS_SNAPSHOT] = {0};
+    int acknowledgements = self_holder ? 1 : 0;
 
-    int holders = 1;   /* local */
     for (size_t i = 0; i < npeers; i++) {
         if (strcmp(peers[i].id, rp->self_id) == 0) {
+            delivered[i] = true;
             continue;
         }
-        if (peers[i].addr[0] == '\0' || peers[i].port <= 0) {
-            continue;   /* no dialable address; nothing we can cache */
-        }
-        if (!peers[i].online) {
-            /* 3. offline: persist for replay when it returns */
-            cache_append(&rp->cache, peers[i].id, cid, strdup(payload));
+        if (!peers[i].online || !peers[i].addr[0] || peers[i].port <= 0) {
             continue;
         }
         char *reply = NULL;
-        int t = rpc_once(peers[i].addr, peers[i].port, ZSTP_REPL,
-                         payload, ZSTP_ACK, &reply);
-        if (t == ZSTP_ACK && ack_ok(reply)) {
-            holders++;
-            free(reply);
-            continue;
+        int type = rpc_once(peers[i].addr, peers[i].port, ZSTP_REPL, payload,
+                            ZSTP_ACK, &reply);
+        if (type == ZSTP_ACK && ack_ok(reply)) {
+            delivered[i] = true;
+            if (id_in_holders(peers[i].id, holders, nholders)) {
+                acknowledgements++;
+            }
         }
         free(reply);
-        /* 3. unacknowledged (or refused: syncing peer): persist for
-         * later replay */
-        cache_append(&rp->cache, peers[i].id, cid, strdup(payload));
     }
-    free(payload);
 
-    /* 4. write policy: reject unless rf/2+1 holders are current */
-    int rf = 1;
-    zdb_database_info info;
-    if (rp->cfg && zdb_database_get(rp->cfg, db, &info) &&
-        info.replication_factor > 1) {
-        rf = info.replication_factor;
-    }
-    int required = rf / 2 + 1;
-    if (holders < required) {
+    if (acknowledgements < required) {
         fprintf(stderr,
                 "zdb: quorum lost writing '%s': %d/%d holders reached\n",
-                db, holders, required);
+                db, acknowledgements, required);
+        free(payload);
+        cJSON_Delete(change);
         return ZDB_REPL_QUORUM_LOST;
     }
+
+    if (!apply_change_local(rp, change)) {
+        free(payload);
+        cJSON_Delete(change);
+        return ZDB_REPL_LOCAL_FAIL;
+    }
+    cJSON_Delete(change);
+
+    for (size_t i = 0; i < npeers; i++) {
+        if (!delivered[i] && strcmp(peers[i].id, rp->self_id) != 0 &&
+            peers[i].id[0]) {
+            char *copy = strdup(payload);
+            if (copy) {
+                cache_append(&rp->cache, peers[i].id, cid, copy);
+            }
+        }
+    }
+    free(payload);
     return ZDB_REPL_OK;
 }
 
@@ -793,10 +896,6 @@ static void *repl_maint_main(void *arg)
 
 /* How many responding replicas must agree. Responding-based so losing
  * followers degrades availability instead of failing reads. */
-static int quorum_required(int responders)
-{
-    return responders / 2 + 1;
-}
 
 /* Sends a QUERY to all other online peers; returns how many replied and
  * fills replies[] with parsed result documents (caller frees). */
@@ -809,12 +908,31 @@ static size_t query_all(zdb_repl *rp, const cJSON *request,
     if (!payload) {
         return 0;
     }
+    const cJSON *database =
+        cJSON_GetObjectItemCaseSensitive(request, "db");
+    const cJSON *partition =
+        cJSON_GetObjectItemCaseSensitive(request, "partition");
+    const cJSON *keyspace =
+        cJSON_GetObjectItemCaseSensitive(request, "keyspace");
+    if (!cJSON_IsString(database) || !cJSON_IsString(partition) ||
+        !cJSON_IsString(keyspace)) {
+        free(payload);
+        return 0;
+    }
+    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    size_t nholders = holder_ids(rp, partition->valuestring,
+                                 keyspace->valuestring,
+                                 replication_factor(rp, database->valuestring),
+                                 holders);
+
     size_t got = 0;
     zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
     size_t npeers =
         zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
     for (size_t i = 0; i < npeers && got < cap; i++) {
-        if (!peers[i].online || peers[i].addr[0] == '\0' ||
+        if (strcmp(peers[i].id, rp->self_id) == 0 ||
+            !id_in_holders(peers[i].id, holders, nholders) ||
+            !peers[i].online || peers[i].addr[0] == '\0' ||
             peers[i].port <= 0) {
             continue;
         }
@@ -832,6 +950,21 @@ static size_t query_all(zdb_repl *rp, const cJSON *request,
     return got;
 }
 
+/* Canonical fingerprint of a JSON value: agreement between replicas is
+ * decided on the md5 of the printed form so values of any size compare
+ * exactly (a truncated string comparison would silently drop longer
+ * documents from quorum results). */
+static void value_fingerprint(const cJSON *value, char out[33])
+{
+    char *vs = json_print(value);
+    if (!vs) {
+        out[0] = '\0';
+        return;
+    }
+    zdb_md5_hex(vs, strlen(vs), out);
+    free(vs);
+}
+
 /* Merges row arrays [{"id","timestamp","value"},..] from several
  * replicas into a plain value array containing only records where at
  * least `required` copies agree verbatim; conflicts resolve LWW. */
@@ -846,11 +979,17 @@ static cJSON *merge_agreed_rows(cJSON **row_sets, size_t nsets,
 
     typedef struct {
         char id[512];
+        char fp[33];            /* fingerprint of the winning value */
         cJSON *best_value;      /* borrowed from winner_set */
         long long best_ts;
         int agree;
     } entry;
-    entry entries[4096];
+    size_t entries_cap = 256;
+    entry *entries = malloc(entries_cap * sizeof(*entries));
+    if (!entries) {
+        cJSON_Delete(out);
+        return NULL;
+    }
     size_t nentries = 0;
 
     for (size_t s = 0; s < nsets; s++) {
@@ -881,8 +1020,15 @@ static cJSON *merge_agreed_rows(cJSON **row_sets, size_t nsets,
                 }
             }
             if (!e) {
-                if (nentries >= sizeof(entries) / sizeof(entries[0])) {
-                    continue;
+                if (nentries == entries_cap) {
+                    size_t grown_cap = entries_cap * 2;
+                    entry *grown =
+                        realloc(entries, grown_cap * sizeof(*grown));
+                    if (!grown) {
+                        continue;
+                    }
+                    entries = grown;
+                    entries_cap = grown_cap;
                 }
                 e = &entries[nentries++];
                 memset(e, 0, sizeof(*e));
@@ -890,27 +1036,20 @@ static cJSON *merge_agreed_rows(cJSON **row_sets, size_t nsets,
                          jid->valuestring);
             }
 
-            /* agreement is decided on the canonical value string */
-            char *vs = json_print(jval);
-            char best_vs[64] = "";
-            if (e->best_value) {
-                char *tmp = json_print(e->best_value);
-                snprintf(best_vs, sizeof(best_vs), "%.63s",
-                         tmp ? tmp : "");
-                free(tmp);
-            }
-            bool same = e->best_value &&
-                        strlen(vs) < sizeof(best_vs) &&
-                        strcmp(vs, best_vs) == 0;
+            /* agreement is decided on the canonical value fingerprint */
+            char fp[33];
+            value_fingerprint(jval, fp);
+            bool same = e->best_value && e->fp[0] && fp[0] &&
+                        strcmp(fp, e->fp) == 0;
             if (same) {
                 e->agree++;
             }
             if (!e->best_value || ts > e->best_ts) {
                 e->best_value = (cJSON *)jval;
+                snprintf(e->fp, sizeof(e->fp), "%s", fp);
                 e->best_ts = ts;
                 e->agree = same ? e->agree : 1;
             }
-            free(vs);
         }
     }
 
@@ -922,6 +1061,7 @@ static cJSON *merge_agreed_rows(cJSON **row_sets, size_t nsets,
             }
         }
     }
+    free(entries);
     return out;
 }
 
@@ -933,7 +1073,11 @@ static cJSON *merge_agreed_ids(char ***id_lists, size_t *counts,
         char id[512];
         int seen;
     } entry;
-    entry entries[8192];
+    size_t entries_cap = 256;
+    entry *entries = malloc(entries_cap * sizeof(*entries));
+    if (!entries) {
+        return NULL;
+    }
     size_t nentries = 0;
 
     for (size_t s = 0; s < nsets; s++) {
@@ -946,12 +1090,20 @@ static cJSON *merge_agreed_ids(char ***id_lists, size_t *counts,
                 }
             }
             if (!e) {
-                if (nentries >= sizeof(entries) / sizeof(entries[0])) {
-                    continue;
+                if (nentries == entries_cap) {
+                    size_t grown_cap = entries_cap * 2;
+                    entry *grown =
+                        realloc(entries, grown_cap * sizeof(*grown));
+                    if (!grown) {
+                        continue;
+                    }
+                    entries = grown;
+                    entries_cap = grown_cap;
                 }
                 e = &entries[nentries++];
                 memset(e, 0, sizeof(*e));
-                snprintf(e->id, sizeof(e->id), "%.511s", id_lists[s][i]);
+                snprintf(e->id, sizeof(e->id), "%.511s",
+                         id_lists[s][i]);
             }
             e->seen++;
         }
@@ -966,6 +1118,7 @@ static cJSON *merge_agreed_ids(char ***id_lists, size_t *counts,
             cJSON_AddItemToArray(arr, cJSON_CreateString(entries[k].id));
         }
     }
+    free(entries);
     return arr;
 }
 
@@ -994,6 +1147,21 @@ static bool quorum_applies(zdb_repl *rp, const char *db)
     return zdb_database_get(rp->cfg, db, &info) &&
            info.replication_factor > 1;
 }
+
+static int read_quorum(zdb_repl *rp, const char *db, const char *partition,
+                       const char *keyspace, bool *self_holder)
+{
+    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    size_t count = holder_ids(rp, partition, keyspace,
+                              replication_factor(rp, db), holders);
+    if (count == 0) {
+        *self_holder = true;
+        return 1;
+    }
+    *self_holder = id_in_holders(rp->self_id, holders, count);
+    return (int)count / 2 + 1;
+}
+
 
 /* Collects filter/field arrays from JSON string arrays. */
 static char **strings_from_json(const cJSON *arr, size_t *count_out)
@@ -1026,113 +1194,126 @@ static char **strings_from_json(const cJSON *arr, size_t *count_out)
 cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const char *id)
 {
-    /* local copy first */
+    bool self_holder = true;
+    int required = quorum_applies(rp, db)
+                       ? read_quorum(rp, db, partition, keyspace, &self_holder)
+                       : 1;
     long long local_ts = 0;
-    cJSON *local = (rp && rp->cfg_engine)
+    cJSON *local = (rp && rp->cfg_engine && self_holder)
                        ? zdb_get_ts(rp->cfg_engine, partition, keyspace,
                                     id, &local_ts)
                        : NULL;
-
     if (!quorum_applies(rp, db)) {
         return local;
     }
 
     cJSON *req = make_request("get", db, partition, keyspace);
     if (!req) {
-        return local;
+        cJSON_Delete(local);
+        return NULL;
     }
     cJSON_AddStringToObject(req, "id", id);
-
     cJSON *replies[MAX_REPLIES];
     size_t n = query_all(rp, req, replies, MAX_REPLIES);
     cJSON_Delete(req);
 
-    if (n == 0) {
-        return local;   /* no peer responded: serve local view */
+    int responses = (int)n + (self_holder ? 1 : 0);
+    if (responses < required) {
+        for (size_t i = 0; i < n; i++) {
+            cJSON_Delete(replies[i]);
+        }
+        cJSON_Delete(local);
+        return NULL;
     }
 
-    /* pick the value shared by a quorum of responders; fall back to
-     * newest when no exact majority exists */
     typedef struct {
-        char vs[128];
+        char fp[33];
         long long ts;
         cJSON *sample;
         int votes;
     } group;
-    group groups[MAX_REPLIES];
-    size_t ng = 0;
-
-    int responders = n + (local ? 1 : 0);
-    int required = quorum_required(responders);
+    group groups[MAX_REPLIES + 1];
+    size_t ngroups = 0;
+    int absent = self_holder && !local ? 1 : 0;
 
     for (size_t i = 0; i < n; i++) {
         const cJSON *row = cJSON_GetObjectItem(replies[i], "row");
         if (!cJSON_IsObject(row)) {
+            absent++;
             continue;
         }
-        const cJSON *jts =
+        const cJSON *timestamp =
             cJSON_GetObjectItemCaseSensitive(row, "timestamp");
-        const cJSON *jval =
+        const cJSON *value =
             cJSON_GetObjectItemCaseSensitive(row, "value");
-        if (!cJSON_IsObject(jval)) {
+        if (!cJSON_IsObject(value)) {
+            absent++;
             continue;
         }
-        long long ts = cJSON_IsNumber(jts)
-                           ? (long long)jts->valuedouble
-                           : 0;
-        char *vs = json_print(jval);
-        if (!vs) {
+        char fingerprint[33];
+        value_fingerprint(value, fingerprint);
+        if (!fingerprint[0]) {
             continue;
         }
-        group *g = NULL;
-        for (size_t k = 0; k < ng; k++) {
-            if (strcmp(groups[k].vs, vs) == 0) {
-                g = &groups[k];
+        group *candidate = NULL;
+        for (size_t k = 0; k < ngroups; k++) {
+            if (strcmp(groups[k].fp, fingerprint) == 0) {
+                candidate = &groups[k];
                 break;
             }
         }
-        if (!g && ng < MAX_REPLIES) {
-            g = &groups[ng++];
-            memset(g, 0, sizeof(*g));
-            snprintf(g->vs, sizeof(g->vs), "%s", vs);
-            g->sample = (cJSON *)jval;
+        if (!candidate && ngroups < MAX_REPLIES + 1) {
+            candidate = &groups[ngroups++];
+            memset(candidate, 0, sizeof(*candidate));
+            snprintf(candidate->fp, sizeof(candidate->fp), "%s",
+                     fingerprint);
+            candidate->sample = (cJSON *)value;
         }
-        if (g) {
-            g->votes++;
-            if (ts > g->ts) {
-                g->ts = ts;
+        if (candidate) {
+            candidate->votes++;
+            long long ts = cJSON_IsNumber(timestamp)
+                               ? (long long)timestamp->valuedouble
+                               : 0;
+            if (ts > candidate->ts) {
+                candidate->ts = ts;
             }
         }
-        free(vs);
     }
+
     if (local) {
-        char *lvs = json_print(local);
-        for (size_t k = 0; lvs && k < ng; k++) {
-            if (strcmp(groups[k].vs, lvs) == 0) {
-                groups[k].votes++;
-                if (local_ts > groups[k].ts) {
-                    groups[k].ts = local_ts;
-                }
+        char fingerprint[33];
+        value_fingerprint(local, fingerprint);
+        group *candidate = NULL;
+        for (size_t k = 0; k < ngroups; k++) {
+            if (strcmp(groups[k].fp, fingerprint) == 0) {
+                candidate = &groups[k];
+                break;
             }
         }
-        free(lvs);
+        if (!candidate && fingerprint[0] && ngroups < MAX_REPLIES + 1) {
+            candidate = &groups[ngroups++];
+            memset(candidate, 0, sizeof(*candidate));
+            snprintf(candidate->fp, sizeof(candidate->fp), "%s",
+                     fingerprint);
+            candidate->sample = local;
+        }
+        if (candidate) {
+            candidate->votes++;
+            if (local_ts > candidate->ts) {
+                candidate->ts = local_ts;
+            }
+        }
     }
 
     group *winner = NULL;
-    for (size_t k = 0; k < ng; k++) {
-        if (groups[k].votes >= required &&
-            (!winner || groups[k].ts > winner->ts)) {
-            winner = &groups[k];
-        }
-    }
-    if (!winner) {
-        for (size_t k = 0; k < ng; k++) {
-            if (!winner || groups[k].ts > winner->ts) {
+    if (absent < required) {
+        for (size_t k = 0; k < ngroups; k++) {
+            if (groups[k].votes >= required &&
+                (!winner || groups[k].ts > winner->ts)) {
                 winner = &groups[k];
             }
         }
     }
-
     cJSON *result = winner ? cJSON_Duplicate(winner->sample, 1) : NULL;
     for (size_t i = 0; i < n; i++) {
         cJSON_Delete(replies[i]);
@@ -1158,10 +1339,13 @@ cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
 
     cJSON *sets[MAX_REPLIES + 1];
     size_t n = 0;
+    bool self_holder = false;
+    int required = read_quorum(rp, db, partition, keyspace, &self_holder);
 
-    /* local set in the same wire shape */
-    cJSON *local_rows = zdb_all_ts(rp->cfg_engine, partition, keyspace,
-                                   filters, nfilters);
+    cJSON *local_rows = self_holder
+                            ? zdb_all_ts(rp->cfg_engine, partition, keyspace,
+                                         filters, nfilters)
+                            : NULL;
     if (local_rows) {
         cJSON *wrap = cJSON_CreateObject();
         if (wrap) {
@@ -1185,10 +1369,12 @@ cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
         }
     }
 
-    if (n == 0) {
+    if ((int)n < required) {
+        for (size_t i = 0; i < n; i++) {
+            cJSON_Delete(sets[i]);
+        }
         return cJSON_CreateArray();
     }
-    int required = quorum_required((int)n);
     cJSON *merged = merge_agreed_rows(sets, n, required);
     for (size_t i = 0; i < n; i++) {
         cJSON_Delete(sets[i]);
@@ -1219,14 +1405,15 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
     char **lists[MAX_REPLIES + 1];
     size_t counts[MAX_REPLIES + 1];
     size_t n = 0;
+    bool self_holder = false;
+    int required = read_quorum(rp, db, partition, keyspace, &self_holder);
 
-    lists[n] = zdb_ids(rp->cfg_engine, partition, keyspace, filters,
-                       nfilters, &counts[n]);
-    if (lists[n]) {
-        n++;   /* keep even empty: counts[n]==0, list NULL-safe below */
-    } else {
-        lists[n] = NULL;
-        counts[n] = 0;
+    if (self_holder) {
+        lists[n] = zdb_ids(rp->cfg_engine, partition, keyspace, filters,
+                           nfilters, &counts[n]);
+        if (!lists[n]) {
+            counts[n] = 0;
+        }
         n++;
     }
 
@@ -1246,7 +1433,12 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
         cJSON_Delete(replies[i]);
     }
 
-    int required = quorum_required((int)n);
+    if ((int)n < required) {
+        for (size_t i = 0; i < n; i++) {
+            zdb_free_strings(lists[i]);
+        }
+        return NULL;
+    }
     cJSON *agreed = merge_agreed_ids(lists, counts, n, required);
     for (size_t i = 0; i < n; i++) {
         zdb_free_strings(lists[i]);
@@ -1300,8 +1492,12 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
 
     cJSON *sets[MAX_REPLIES + 1];
     size_t n = 0;
-    cJSON *local_rows = zdb_query_ts(rp->cfg_engine, partition, keyspace,
-                                     filters, nfilters, fields, nfields);
+    bool self_holder = false;
+    int required = read_quorum(rp, db, partition, keyspace, &self_holder);
+    cJSON *local_rows = self_holder
+                            ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+                                           filters, nfilters, fields, nfields)
+                            : NULL;
     if (local_rows) {
         cJSON *wrap = cJSON_CreateObject();
         if (wrap) {
@@ -1319,10 +1515,12 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
         sets[n++] = replies[i];
     }
 
-    if (n == 0) {
+    if ((int)n < required) {
+        for (size_t i = 0; i < n; i++) {
+            cJSON_Delete(sets[i]);
+        }
         return cJSON_CreateArray();
     }
-    int required = quorum_required((int)n);
     cJSON *merged = merge_agreed_rows(sets, n, required);
     for (size_t i = 0; i < n; i++) {
         cJSON_Delete(sets[i]);
@@ -1349,68 +1547,67 @@ void zdb_repl_set_syncing(zdb_repl *rp, bool syncing)
  * pending == 0. */
 bool zdb_repl_flush(zdb_repl *rp)
 {
+    if (!rp) {
+        return false;
+    }
     long long deadline = mono_ms() + 20000;
-    bool all_empty = false;
     for (;;) {
         zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-        size_t n = zdb_cluster_peers(rp->cluster, peers,
-                                     MAX_PEERS_SNAPSHOT);
-        all_empty = true;
-        bool any = false;
-        for (size_t i = 0; i < n; i++) {
-            if (strcmp(peers[i].id, rp->self_id) == 0) {
+        size_t count = zdb_cluster_peers(rp->cluster, peers,
+                                         MAX_PEERS_SNAPSHOT);
+        bool all_empty = true;
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(peers[i].id, rp->self_id) == 0 || !peers[i].online) {
                 continue;
             }
-            if (!peers[i].online || peers[i].addr[0] == '\0' ||
-                peers[i].port <= 0) {
+            if (!peers[i].addr[0] || peers[i].port <= 0) {
+                all_empty = false;
                 continue;
             }
-            any = true;
-            char req[96];
-            snprintf(req, sizeof(req), "{\"target\":\"%.63s\"}",
+            char request[96];
+            snprintf(request, sizeof(request), "{\"target\":\"%.63s\"}",
                      rp->self_id);
             char *reply = NULL;
-            int t = rpc_once(peers[i].addr, peers[i].port, ZSTP_FLUSH,
-                             req, ZSTP_ACK, &reply);
-            long long pending = 0;
-            if (t == ZSTP_ACK && reply) {
+            int type = rpc_once(peers[i].addr, peers[i].port, ZSTP_FLUSH,
+                                request, ZSTP_ACK, &reply);
+            bool valid_empty = false;
+            if (type == ZSTP_ACK && reply) {
                 cJSON *doc = cJSON_Parse(reply);
-                const cJSON *jp =
+                const cJSON *ok = doc
+                                      ? cJSON_GetObjectItemCaseSensitive(doc,
+                                                                         "ok")
+                                      : NULL;
+                const cJSON *pending =
                     doc ? cJSON_GetObjectItemCaseSensitive(doc, "pending")
                         : NULL;
-                if (cJSON_IsNumber(jp)) {
-                    pending = (long long)jp->valuedouble;
-                }
+                valid_empty = cJSON_IsTrue(ok) && cJSON_IsNumber(pending) &&
+                              pending->valuedouble == 0;
                 cJSON_Delete(doc);
             }
             free(reply);
-            if (pending > 0) {
+            if (!valid_empty) {
                 all_empty = false;
             }
         }
-        if (!any || all_empty) {
-            break;
+        if (all_empty) {
+            return true;
         }
         if (mono_ms() >= deadline) {
-            break;
+            return false;
         }
         sleep_ms(100);
     }
-    return all_empty;
 }
 
-bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
-                      const char *partition, const char *keyspace)
+static bool repl_catchup(zdb_repl *rp, const char *owner_addr,
+                         int owner_port, const char *partition,
+                         const char *keyspace, bool source_required)
 {
     if (!rp || !owner_addr || !partition || !keyspace) {
         return false;
     }
 
-    /* refuse writes while we replace the shard file so writers cache
-     * deltas instead of applying them to a file the snapshot will
-     * overwrite (LWW replays them idempotently afterwards) */
     zdb_repl_set_syncing(rp, true);
-
     char key[33];
     char path[1024];
     if (!zdb_shard_path(rp->cfg_engine, partition, keyspace, path,
@@ -1418,16 +1615,34 @@ bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
         zdb_repl_set_syncing(rp, false);
         return false;
     }
-    if (zdb_snap_fetch(owner_addr, owner_port, key, rp->data_dir) != 0) {
+    int snapshot_rc = source_required
+                          ? zdb_snap_fetch_required(owner_addr, owner_port, key,
+                                                    rp->data_dir)
+                          : zdb_snap_fetch(owner_addr, owner_port, key,
+                                           rp->data_dir);
+    if (snapshot_rc != 0 ||
+        !zdb_shard_invalidate(rp->cfg_engine, partition, keyspace)) {
         zdb_repl_set_syncing(rp, false);
         return false;
     }
-    zdb_shard_invalidate(rp->cfg_engine, partition, keyspace);
 
-    /* reopen writes; cached deltas now land safely after the snapshot */
     zdb_repl_set_syncing(rp, false);
-
     return zdb_repl_flush(rp);
+}
+
+bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
+                      const char *partition, const char *keyspace)
+{
+    return repl_catchup(rp, owner_addr, owner_port, partition, keyspace,
+                        false);
+}
+
+bool zdb_repl_catchup_required(zdb_repl *rp, const char *owner_addr,
+                               int owner_port, const char *partition,
+                               const char *keyspace)
+{
+    return repl_catchup(rp, owner_addr, owner_port, partition, keyspace,
+                        true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1473,13 +1688,18 @@ zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
      * starts servicing frames */
     zdb_cluster_set_dispatcher(cluster, repl_dispatch, rp);
 
+    /* set running before the thread starts: the loop checks it first
+     * thing and would exit immediately on a lost race otherwise */
+    rp->running = true;
     if (pthread_create(&rp->maint_thread, NULL, repl_maint_main, rp) != 0) {
+        rp->running = false;
         zdb_cluster_set_dispatcher(cluster, NULL, NULL);
         cache_close(&rp->cache);
+        pthread_mutex_destroy(&rp->sync_lock);
+        pthread_mutex_destroy(&rp->replay_lock);
         free(rp);
         return NULL;
     }
-    rp->running = true;
 
     return rp;
 }

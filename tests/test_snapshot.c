@@ -184,9 +184,14 @@ static void stop_serving(snap_node *n)
 static void shard_key_of(const char *partition, const char *keyspace,
                          char out[33])
 {
-    char combined[1024];
-    snprintf(combined, sizeof(combined), "%s%s", partition, keyspace);
-    zdb_md5_hex(combined, strlen(combined), out);
+    char partition_hash[33];
+    char keyspace_hash[33];
+    char framed[66];
+    zdb_md5_hex(partition, strlen(partition), partition_hash);
+    zdb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
+    snprintf(framed, sizeof(framed), "%s:%s", partition_hash,
+             keyspace_hash);
+    zdb_md5_hex(framed, strlen(framed), out);
 }
 
 /* Row-by-row comparison of two shards via timestamp-tagged reads:
