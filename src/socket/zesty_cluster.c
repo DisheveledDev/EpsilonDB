@@ -44,6 +44,8 @@
 #include <unistd.h>
 
 #include "../engine/md5.h"
+#include "../engine/random.h"
+#include "../engine/zesty_crypto.h"
 #include "../../vendor/cjson/cJSON.h"
 
 #define HEARTBEAT_SECONDS     3
@@ -217,11 +219,48 @@ void zstp_set_dispatcher(zstp_dispatch_fn fn, void *ctx)
     pthread_mutex_unlock(&g_dispatch_lock);
 }
 
-int zstp_send_frame(int fd, zstp_type type, const char *json,
-                    void *send_lock)
+/* ------------------------------------------------------------------ */
+/* mesh encryption key (process-wide)                                  */
+
+static struct {
+    bool active;
+    uint8_t enc_key[32];
+    uint8_t mac_key[32];
+} g_mesh_key;
+static pthread_mutex_t g_mesh_key_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void zstp_set_mesh_key(const uint8_t enc_key[32], const uint8_t mac_key[32])
 {
-    size_t plen = json ? strlen(json) : 0;
-    if (!zstp_type_valid((int)type) || plen > ZSTP_MAX_PAYLOAD) {
+    pthread_mutex_lock(&g_mesh_key_lock);
+    if (enc_key && mac_key) {
+        memcpy(g_mesh_key.enc_key, enc_key, 32);
+        memcpy(g_mesh_key.mac_key, mac_key, 32);
+        g_mesh_key.active = true;
+    } else {
+        memset(g_mesh_key.enc_key, 0, 32);
+        memset(g_mesh_key.mac_key, 0, 32);
+        g_mesh_key.active = false;
+    }
+    pthread_mutex_unlock(&g_mesh_key_lock);
+}
+
+static bool mesh_key_snapshot(uint8_t enc_key[32], uint8_t mac_key[32])
+{
+    bool active;
+    pthread_mutex_lock(&g_mesh_key_lock);
+    active = g_mesh_key.active;
+    if (active) {
+        memcpy(enc_key, g_mesh_key.enc_key, 32);
+        memcpy(mac_key, g_mesh_key.mac_key, 32);
+    }
+    pthread_mutex_unlock(&g_mesh_key_lock);
+    return active;
+}
+
+int zstp_send_frame_raw(int fd, zstp_type type, const void *data, size_t len,
+                        void *send_lock)
+{
+    if (!zstp_type_valid((int)type) || len > ZSTP_MAX_PAYLOAD) {
         return -1;
     }
     unsigned char hdr[ZSTP_HEADER_SIZE];
@@ -231,7 +270,33 @@ int zstp_send_frame(int fd, zstp_type type, const char *json,
     hdr[3] = 'P';
     hdr[4] = ZSTP_VERSION;
     hdr[5] = (unsigned char)type;
-    uint32_t be = htonl((uint32_t)plen);
+
+    uint8_t enc_key[32];
+    uint8_t mac_key[32];
+    bool encrypted = mesh_key_snapshot(enc_key, mac_key);
+
+    /* Body is either the raw payload (plaintext) or
+     * nonce || ciphertext || tag (encrypted). */
+    uint8_t *body = NULL;
+    size_t body_len = len;
+    if (encrypted) {
+        uint8_t nonce[ZDB_NONCE_LEN];
+        zdb_random_bytes(nonce, sizeof(nonce));
+        body_len = ZDB_NONCE_LEN + len + ZDB_TAG_LEN;
+        body = malloc(body_len ? body_len : 1);
+        if (!body) {
+            return -1;
+        }
+        if (zdb_aead_seal(enc_key, mac_key, nonce, hdr + 4, 2,
+                          (const uint8_t *)data, len, body, body_len) != 0) {
+            free(body);
+            return -1;
+        }
+    } else {
+        body = (uint8_t *)data;
+    }
+
+    uint32_t be = htonl((uint32_t)body_len);
     memcpy(hdr + 6, &be, 4);
 
     int rc = -1;
@@ -239,13 +304,23 @@ int zstp_send_frame(int fd, zstp_type type, const char *json,
         pthread_mutex_lock(send_lock);
     }
     if (write_full(fd, hdr, sizeof(hdr)) == 0 &&
-        (plen == 0 || write_full(fd, json, plen) == 0)) {
+        (body_len == 0 || write_full(fd, body, body_len) == 0)) {
         rc = 0;
     }
     if (send_lock) {
         pthread_mutex_unlock(send_lock);
     }
+    if (encrypted) {
+        free(body);
+    }
     return rc;
+}
+
+int zstp_send_frame(int fd, zstp_type type, const char *json,
+                    void *send_lock)
+{
+    return zstp_send_frame_raw(fd, type, json, json ? strlen(json) : 0,
+                               send_lock);
 }
 
 int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
@@ -265,22 +340,61 @@ int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
     }
     uint32_t be;
     memcpy(&be, hdr + 6, 4);
-    uint32_t plen = ntohl(be);
-    if (plen > ZSTP_MAX_PAYLOAD) {
+    uint32_t body_len = ntohl(be);
+    if (body_len > ZSTP_MAX_PAYLOAD + ZDB_NONCE_LEN + ZDB_TAG_LEN) {
         return -1;
     }
-    char *payload = NULL;
-    if (plen) {
-        payload = malloc((size_t)plen + 1);
-        if (!payload) {
+
+    uint8_t *body = NULL;
+    if (body_len) {
+        body = malloc(body_len);
+        if (!body) {
             return -1;
         }
-        if (read_full(fd, payload, plen) != 0) {
+        if (read_full(fd, body, body_len) != 0) {
+            free(body);
+            return -1;
+        }
+    }
+
+    uint8_t enc_key[32];
+    uint8_t mac_key[32];
+    bool encrypted = mesh_key_snapshot(enc_key, mac_key);
+
+    char *payload = NULL;
+    uint32_t plen = body_len;
+    if (encrypted) {
+        if (body_len < ZDB_NONCE_LEN + ZDB_TAG_LEN) {
+            free(body);
+            return -1;
+        }
+        plen = body_len - ZDB_NONCE_LEN - ZDB_TAG_LEN;
+        payload = malloc((size_t)plen + 1);
+        if (!payload) {
+            free(body);
+            return -1;
+        }
+        if (zdb_aead_open(enc_key, mac_key, hdr + 4, 2, body, body_len,
+                          (uint8_t *)payload, plen) < 0) {
             free(payload);
+            free(body);
             return -1;
         }
         payload[plen] = '\0';
+        free(body);
+    } else {
+        payload = (char *)body;
+        if (payload && plen) {
+            char *nul = realloc(payload, (size_t)plen + 1);
+            if (!nul) {
+                free(payload);
+                return -1;
+            }
+            payload = nul;
+            payload[plen] = '\0';
+        }
     }
+
     *payload_out = payload;
     if (plen_out) {
         *plen_out = plen;
@@ -1960,7 +2074,11 @@ static int join_exchange(zdb_cluster *cl, int fd)
 {
     send_hello_state(cl, fd, true);
 
-    /* read frames for a short while to absorb their state */
+    /* read frames for a short while to absorb their state. A wrong (or
+     * missing) secret makes every inbound frame fail authentication, so
+     * no valid reply ever arrives: that is a failed handshake, not a
+     * successful join. */
+    bool got_reply = false;
     time_t deadline = time(NULL) + 2;
     while (time(NULL) < deadline) {
         char *payload = NULL;
@@ -1968,6 +2086,7 @@ static int join_exchange(zdb_cluster *cl, int fd)
         if (t < 0) {
             break;
         }
+        got_reply = true;
         if (t == ZSTP_HELLO && payload) {
             cJSON *h = cJSON_Parse(payload);
             const cJSON *jr =
@@ -1991,7 +2110,7 @@ static int join_exchange(zdb_cluster *cl, int fd)
         }
         free(payload);
     }
-    return 0;
+    return got_reply ? 0 : -1;
 }
 
 int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
@@ -2481,4 +2600,86 @@ bool zdb_cluster_request_void(zdb_cluster *cl)
     free(payload);
     close(fd);
     return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* mesh key management                                                 */
+
+int zdb_cluster_derive_keys(const char *secret, uint8_t enc_key[32],
+                            uint8_t mac_key[32])
+{
+    static const uint8_t salt[] = "zestyd-mesh";
+    static const uint8_t info[] = "zestyd-mesh-v1";
+    uint8_t okm[64];
+    if (!secret || !*secret) {
+        return -1;
+    }
+    if (zdb_hkdf_sha256((const uint8_t *)secret, strlen(secret), salt,
+                        sizeof(salt) - 1, info, sizeof(info) - 1, okm,
+                        sizeof(okm)) != 0) {
+        return -1;
+    }
+    memcpy(enc_key, okm, 32);
+    memcpy(mac_key, okm + 32, 32);
+    return 0;
+}
+
+bool zdb_cluster_persist_keys(const char *data_dir, const uint8_t enc_key[32],
+                              const uint8_t mac_key[32])
+{
+    char path[1024];
+    uint8_t buf[64];
+    int fd;
+    size_t n = 0;
+    if (!data_dir || !enc_key || !mac_key) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/mesh.key", data_dir);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    memcpy(buf, enc_key, 32);
+    memcpy(buf + 32, mac_key, 32);
+    while (n < sizeof(buf)) {
+        ssize_t w = write(fd, buf + n, sizeof(buf) - n);
+        if (w <= 0) {
+            close(fd);
+            return false;
+        }
+        n += (size_t)w;
+    }
+    close(fd);
+    return true;
+}
+
+bool zdb_cluster_load_keys(const char *data_dir, uint8_t enc_key[32],
+                           uint8_t mac_key[32])
+{
+    char path[1024];
+    uint8_t buf[64];
+    int fd;
+    size_t n = 0;
+    if (!data_dir || !enc_key || !mac_key) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/mesh.key", data_dir);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    while (n < sizeof(buf)) {
+        ssize_t r = read(fd, buf + n, sizeof(buf) - n);
+        if (r <= 0) {
+            break;
+        }
+        n += (size_t)r;
+    }
+    close(fd);
+    if (n != sizeof(buf)) {
+        return false;
+    }
+    memcpy(enc_key, buf, 32);
+    memcpy(mac_key, buf + 32, 32);
+    return true;
 }

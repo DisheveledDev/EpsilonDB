@@ -79,40 +79,6 @@ static bool valid_key(const char *key)
     return true;
 }
 
-static int write_full(int fd, const void *buf, size_t len)
-{
-    const unsigned char *p = buf;
-    while (len > 0) {
-        ssize_t w = send(fd, p, len, MSG_NOSIGNAL);
-        if (w <= 0) {
-            if (w < 0 && errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        p += w;
-        len -= (size_t)w;
-    }
-    return 0;
-}
-
-/* Builds the 10-byte ZSTP header into a thread-local buffer. */
-static unsigned char *make_header(zstp_type type, uint32_t len)
-{
-    static _Thread_local unsigned char hdr[ZSTP_HEADER_SIZE];
-    hdr[0] = 'Z';
-    hdr[1] = 'S';
-    hdr[2] = 'T';
-    hdr[3] = 'P';
-    hdr[4] = ZSTP_VERSION;
-    hdr[5] = (unsigned char)type;
-    hdr[6] = (unsigned char)(len >> 24);
-    hdr[7] = (unsigned char)(len >> 16);
-    hdr[8] = (unsigned char)(len >> 8);
-    hdr[9] = (unsigned char)len;
-    return hdr;
-}
-
 /* True when the shard file does not exist (so an empty snapshot is the
  * right answer rather than an error). */
 static bool shard_missing(const char *dir, const char *key)
@@ -256,9 +222,8 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         char *meta_str = json_print(meta);
         cJSON_Delete(meta);
         if (!meta_str ||
-            write_full(fd, make_header(ZSTP_SNAP_ACK, strlen(meta_str)),
-                       ZSTP_HEADER_SIZE) != 0 ||
-            write_full(fd, meta_str, strlen(meta_str)) != 0) {
+            zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, meta_str,
+                                strlen(meta_str), NULL) != 0) {
             free(meta_str);
             fclose(f);
             break;
@@ -272,9 +237,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
             if (n == 0) {
                 break;
             }
-            if (write_full(fd, make_header(ZSTP_SNAP_DATA, n),
-                           ZSTP_HEADER_SIZE) != 0 ||
-                write_full(fd, chunk, n) != 0) {
+            if (zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, chunk, n, NULL) != 0) {
                 ok = false;
                 break;
             }
@@ -285,8 +248,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         fclose(f);
 
         /* EOF marker terminates the data stream */
-        sent_eof = write_full(fd, make_header(ZSTP_SNAP_DATA, 0),
-                              ZSTP_HEADER_SIZE) == 0;
+        sent_eof = zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, NULL, 0, NULL) == 0;
         ok = ok && sent_eof;
         unlink(tmp);
         tmp[0] = '\0';
@@ -299,11 +261,9 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
      * and an EOF marker before the final acknowledgement */
     if (ok && !sent_eof) {
         const char *meta = "{\"ok\":true,\"size\":0}";
-        ok = write_full(fd, make_header(ZSTP_SNAP_ACK, strlen(meta)),
-                        ZSTP_HEADER_SIZE) == 0 &&
-             write_full(fd, meta, strlen(meta)) == 0 &&
-             write_full(fd, make_header(ZSTP_SNAP_DATA, 0),
-                        ZSTP_HEADER_SIZE) == 0;
+        ok = zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, meta, strlen(meta),
+                                 NULL) == 0 &&
+             zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, NULL, 0, NULL) == 0;
     }
 
     cJSON *ack = cJSON_CreateObject();
@@ -312,9 +272,8 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         char *ack_str = json_print(ack);
         cJSON_Delete(ack);
         if (ack_str) {
-            write_full(fd, make_header(ZSTP_SNAP_ACK, strlen(ack_str)),
-                       ZSTP_HEADER_SIZE);
-            write_full(fd, ack_str, strlen(ack_str));
+            zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, ack_str, strlen(ack_str),
+                                NULL);
             free(ack_str);
         }
     }

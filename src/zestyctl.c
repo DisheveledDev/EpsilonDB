@@ -15,8 +15,8 @@
  *   delete database <name>
  *   create group <name>
  *   delete group <name>
- *   create user <name> <group_mask>
- *   set user <name> <group_mask>
+ *   create user <name> <group_mask> [password]
+ *   set user <name> <group_mask> [password]
  *   delete user <name>
  *   create partition <db> <name> <create_mask> <update_mask> <read_mask> <delete_mask>
  *   delete partition <db> <name>
@@ -647,8 +647,8 @@ static void print_usage(void)
         "  delete database <name>",
         "  create group <name>",
         "  delete group <name>",
-        "  create user <name> <group_mask>",
-        "  set user <name> <group_mask>",
+        "  create user <name> <group_mask> [password]",
+        "  set user <name> <group_mask> [password]",
         "  delete user <name>",
         "  create partition <db> <name> <create_mask> <update_mask>",
         "                   <read_mask> <delete_mask>",
@@ -665,7 +665,7 @@ static void print_usage(void)
         "  query <db>/<partition>/<keyspace> [--filter <json>]...",
         "",
         "cluster (requires zestyd -n <peer_port>):",
-        "  join node <addr> <port>     join an existing mesh via seed",
+        "  join node <addr> <port> [secret]   join an existing mesh via seed",
         "  list nodes | cluster        membership, leader and ranges",
         NULL,
     };
@@ -684,6 +684,25 @@ static bool uint64_argument(const char *text)
     char *end = NULL;
     strtoull(text, &end, 10);
     return errno == 0 && end && *end == '\0';
+}
+
+/* Builds the JSON body for creating/updating a user, optionally carrying a
+ * password. Returns a malloc'd string (caller frees) or NULL on failure. */
+static char *user_json(const char *name, const char *groups,
+                       const char *password)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return NULL;
+    }
+    cJSON_AddStringToObject(obj, "name", name);
+    cJSON_AddStringToObject(obj, "groups", groups);
+    if (password && *password) {
+        cJSON_AddStringToObject(obj, "password", password);
+    }
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    return json;
 }
 
 
@@ -837,9 +856,16 @@ static int execute_command(int argc, char **argv)
     }
     if (sub && strcmp(cmd, "join") == 0 && strcmp(sub, "node") == 0 &&
         argi + 1 < argc) {
-        char body[256];
-        snprintf(body, sizeof(body), "{\"addr\":\"%s\",\"port\":%s}",
-                 argv[argi], argv[argi + 1]);
+        char body[512];
+        const char *secret = argi + 2 < argc ? argv[argi + 2] : NULL;
+        if (secret) {
+            snprintf(body, sizeof(body),
+                     "{\"addr\":\"%s\",\"port\":%s,\"secret\":\"%s\"}",
+                     argv[argi], argv[argi + 1], secret);
+        } else {
+            snprintf(body, sizeof(body), "{\"addr\":\"%s\",\"port\":%s}",
+                     argv[argi], argv[argi + 1]);
+        }
         return run("POST", "/admin/join", body);
     }
 
@@ -862,10 +888,14 @@ static int execute_command(int argc, char **argv)
             if (!uint64_argument(argv[argi + 1])) {
                 return 1;
             }
-            snprintf(body, sizeof(body),
-                     "{\"name\":\"%s\",\"groups\":\"%s\"}", argv[argi],
-                     argv[argi + 1]);
-            return run("POST", "/admin/users", body);
+            const char *password = argi + 2 < argc ? argv[argi + 2] : NULL;
+            char *json = user_json(argv[argi], argv[argi + 1], password);
+            if (!json) {
+                return 1;
+            }
+            int rc = run("POST", "/admin/users", json);
+            free(json);
+            return rc;
         }
         if (strcmp(sub, "partition") == 0 && argi + 5 < argc) {
             for (int i = 2; i <= 5; i++) {
@@ -913,11 +943,14 @@ static int execute_command(int argc, char **argv)
         if (!uint64_argument(argv[argi + 1])) {
             return 1;
         }
-        char body[512];
-        snprintf(body, sizeof(body),
-                 "{\"name\":\"%s\",\"groups\":\"%s\"}", argv[argi],
-                 argv[argi + 1]);
-        return run("POST", "/admin/users", body);
+        const char *password = argi + 2 < argc ? argv[argi + 2] : NULL;
+        char *json = user_json(argv[argi], argv[argi + 1], password);
+        if (!json) {
+            return 1;
+        }
+        int rc = run("PUT", "/admin/users", json);
+        free(json);
+        return rc;
     }
 
     /* ---- settings shortcuts ---- */

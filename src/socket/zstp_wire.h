@@ -19,6 +19,7 @@
 #define ZSTP_WIRE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define ZSTP_VERSION      1
@@ -49,6 +50,11 @@ typedef enum {
 int zstp_send_frame(int fd, zstp_type type, const char *json,
                     void *send_lock);
 
+/* Like zstp_send_frame but takes an explicit length so binary frames
+ * (e.g. ZSTP_SNAP_DATA) can be sent without relying on strlen. */
+int zstp_send_frame_raw(int fd, zstp_type type, const void *data, size_t len,
+                        void *send_lock);
+
 /* Reads one framed message. Fills *payload_out with a malloc'd NUL-
  * terminated buffer the caller frees (NULL when plen == 0). Returns the
  * message type, or -1 on EOF/protocol error. */
@@ -61,6 +67,12 @@ int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out);
 
 /* True when the type byte is a known message type. */
 bool zstp_type_valid(int type);
+
+/* Enables (or, with NULL keys, disables) authenticated encryption of
+ * every ZSTP frame. enc_key/mac_key are 32 bytes each (see zesty_crypto).
+ * The key is process-wide: a node runs one cluster per process. When the
+ * key is inactive, frames are sent in plaintext. */
+void zstp_set_mesh_key(const uint8_t enc_key[32], const uint8_t mac_key[32]);
 
 /* Dial addr:port (IPv4, TCP_NODELAY). Returns fd or -1. */
 int zstp_dial(const char *addr, int port);

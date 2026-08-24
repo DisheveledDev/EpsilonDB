@@ -1007,6 +1007,103 @@ static cJSON *merge_agreed_rows(cJSON **row_sets, size_t nsets,
     free(entries);
     return out;
 }
+/* Like merge_agreed_rows but keeps id/timestamp metadata in the output
+ * rows so a cross-keyspace query can reorder them afterwards. */
+static cJSON *merge_agreed_rows_meta(cJSON **row_sets, size_t nsets,
+                                     int required)
+{
+    cJSON *out = cJSON_CreateArray();
+    if (!out) {
+        return NULL;
+    }
+    typedef struct {
+        char id[512];
+        char fp[33];
+        cJSON *best_value;
+        long long best_ts;
+        int agree;
+    } entry;
+    size_t entries_cap = 256;
+    entry *entries = malloc(entries_cap * sizeof(*entries));
+    if (!entries) {
+        cJSON_Delete(out);
+        return NULL;
+    }
+    size_t nentries = 0;
+
+    for (size_t s = 0; s < nsets; s++) {
+        const cJSON *rows = cJSON_GetObjectItem(row_sets[s], "rows");
+        if (!cJSON_IsArray(rows)) {
+            continue;
+        }
+        const cJSON *r = NULL;
+        cJSON_ArrayForEach(r, rows) {
+            const cJSON *jid = cJSON_GetObjectItemCaseSensitive(r, "id");
+            const cJSON *jts =
+                cJSON_GetObjectItemCaseSensitive(r, "timestamp");
+            const cJSON *jval =
+                cJSON_GetObjectItemCaseSensitive(r, "value");
+            if (!cJSON_IsString(jid) || !jid->valuestring ||
+                !cJSON_IsObject(jval)) {
+                continue;
+            }
+            long long ts = cJSON_IsNumber(jts)
+                               ? (long long)jts->valuedouble
+                               : 0;
+            entry *e = NULL;
+            for (size_t k = 0; k < nentries; k++) {
+                if (strcmp(entries[k].id, jid->valuestring) == 0) {
+                    e = &entries[k];
+                    break;
+                }
+            }
+            if (!e) {
+                if (nentries == entries_cap) {
+                    size_t grown_cap = entries_cap * 2;
+                    entry *grown =
+                        realloc(entries, grown_cap * sizeof(*grown));
+                    if (!grown) {
+                        continue;
+                    }
+                    entries = grown;
+                    entries_cap = grown_cap;
+                }
+                e = &entries[nentries++];
+                memset(e, 0, sizeof(*e));
+                snprintf(e->id, sizeof(e->id), "%.511s",
+                         jid->valuestring);
+            }
+            char fp[33];
+            value_fingerprint(jval, fp);
+            bool same = e->best_value && e->fp[0] && fp[0] &&
+                        strcmp(fp, e->fp) == 0;
+            if (same) {
+                e->agree++;
+            }
+            if (!e->best_value || ts > e->best_ts) {
+                e->best_value = (cJSON *)jval;
+                snprintf(e->fp, sizeof(e->fp), "%s", fp);
+                e->best_ts = ts;
+                e->agree = same ? e->agree : 1;
+            }
+        }
+    }
+
+    for (size_t k = 0; k < nentries; k++) {
+        if (entries[k].best_value && entries[k].agree >= required) {
+            cJSON *row = cJSON_CreateObject();
+            cJSON_AddStringToObject(row, "id", entries[k].id);
+            cJSON_AddNumberToObject(row, "timestamp",
+                                    (double)entries[k].best_ts);
+            cJSON_AddItemToObject(row, "value",
+                                  cJSON_Duplicate(entries[k].best_value, 1));
+            cJSON_AddItemToArray(out, row);
+        }
+    }
+    free(entries);
+    return out;
+}
+
 
 /* Same merge but emits plain id strings (for the ids operation). */
 static cJSON *merge_agreed_ids(char ***id_lists, size_t *counts,
@@ -1461,6 +1558,65 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
         return cJSON_CreateArray();
     }
     cJSON *merged = merge_agreed_rows(sets, n, required);
+    for (size_t i = 0; i < n; i++) {
+        cJSON_Delete(sets[i]);
+    }
+    return merged ? merged : cJSON_CreateArray();
+}
+
+/* Like zdb_repl_read_query but returns timestamp-tagged rows
+ * {"id","timestamp","value"} so a partition-wide query can merge several
+ * keyspaces and reorder them afterwards. */
+cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
+                                const char *partition, const char *keyspace,
+                                const cJSON *filters)
+{
+    if (!quorum_applies(rp, db)) {
+        return rp ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+                                 filters)
+                  : NULL;
+    }
+
+    cJSON *req = make_request("query_ts", db, partition, keyspace);
+    if (!req) {
+        return NULL;
+    }
+    if (filters) {
+        cJSON_AddItemToObject(req, "filters", cJSON_Duplicate(filters, 1));
+    }
+
+    cJSON *sets[MAX_REPLIES + 1];
+    size_t n = 0;
+    bool self_holder = false;
+    int required = read_quorum(rp, db, partition, keyspace, &self_holder);
+    cJSON *local_rows = self_holder
+                            ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+                                           filters)
+                            : NULL;
+    if (local_rows) {
+        cJSON *wrap = cJSON_CreateObject();
+        if (wrap) {
+            cJSON_AddItemToObject(wrap, "rows", local_rows);
+            sets[n++] = wrap;
+        } else {
+            cJSON_Delete(local_rows);
+        }
+    }
+
+    cJSON *replies[MAX_REPLIES];
+    size_t got = query_all(rp, req, replies, MAX_REPLIES);
+    cJSON_Delete(req);
+    for (size_t i = 0; i < got; i++) {
+        sets[n++] = replies[i];
+    }
+
+    if ((int)n < required) {
+        for (size_t i = 0; i < n; i++) {
+            cJSON_Delete(sets[i]);
+        }
+        return cJSON_CreateArray();
+    }
+    cJSON *merged = merge_agreed_rows_meta(sets, n, required);
     for (size_t i = 0; i < n; i++) {
         cJSON_Delete(sets[i]);
     }

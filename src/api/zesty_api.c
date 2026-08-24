@@ -709,20 +709,128 @@ static bool handle_data_delete(const zdb_http_request *req,
     return true;
 }
 
+/* Lists the keyspaces that have been written under a database/partition. */
+static size_t partition_keyspaces(const char *db, const char *partition,
+                                  char out[][128], size_t cap)
+{
+    size_t total = 0;
+    zdb_keyspace_info *list = zdb_keyspace_list(g_ctx.config, &total);
+    size_t found = 0;
+    for (size_t i = 0; list && i < total && found < cap; i++) {
+        if (strcmp(list[i].database, db) == 0 &&
+            strcmp(list[i].partition, partition) == 0) {
+            snprintf(out[found], 128, "%s", list[i].name);
+            found++;
+        }
+    }
+    free(list);
+    return found;
+}
+
+typedef struct {
+    long long ts;
+    cJSON *value;   /* borrowed */
+} ts_value;
+
+static int cmp_ts_desc(const void *a, const void *b)
+{
+    const ts_value *x = a;
+    const ts_value *y = b;
+    if (x->ts < y->ts) {
+        return 1;
+    }
+    if (x->ts > y->ts) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Runs a query over every keyspace in a partition, merges the
+ * timestamp-tagged rows and returns them newest-first as plain values.
+ * Handles both the replicated and single-node paths. */
+static cJSON *partition_wide_query(const char *db, const char *part,
+                                   const cJSON *filters)
+{
+    char keyspaces[64][128];
+    size_t nks = partition_keyspaces(db, part, keyspaces, 64);
+
+    cJSON *rows = cJSON_CreateArray();
+    if (!rows) {
+        return NULL;
+    }
+    for (size_t i = 0; i < nks; i++) {
+        cJSON *meta = g_repl
+                          ? zdb_repl_read_query_meta(g_repl, db, part,
+                                                     keyspaces[i], filters)
+                          : zdb_query_ts(g_ctx.engine, part, keyspaces[i],
+                                         filters);
+        if (!meta) {
+            continue;
+        }
+        cJSON *row = NULL;
+        cJSON_ArrayForEach(row, meta) {
+            cJSON_AddItemToArray(rows, cJSON_Duplicate(row, 1));
+        }
+        cJSON_Delete(meta);
+    }
+
+    size_t count = (size_t)cJSON_GetArraySize(rows);
+    ts_value *values = calloc(count ? count : 1, sizeof(*values));
+    if (!values) {
+        cJSON_Delete(rows);
+        return NULL;
+    }
+    size_t n = 0;
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+        const cJSON *jts = cJSON_GetObjectItemCaseSensitive(row, "timestamp");
+        cJSON *jval = cJSON_GetObjectItemCaseSensitive(row, "value");
+        if (!cJSON_IsObject(jval)) {
+            continue;
+        }
+        values[n].ts = cJSON_IsNumber(jts) ? (long long)jts->valuedouble : 0;
+        values[n].value = jval;
+        n++;
+    }
+    qsort(values, n, sizeof(*values), cmp_ts_desc);
+
+    cJSON *out = cJSON_CreateArray();
+    if (!out) {
+        free(values);
+        cJSON_Delete(rows);
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        cJSON_AddItemToArray(out, cJSON_Duplicate(values[i].value, 1));
+    }
+    free(values);
+    cJSON_Delete(rows);
+    return out;
+}
+
 /* Collection reads accept structured JSON filters in POST bodies and
  * unfiltered GET requests for convenience. */
 static bool handle_data_collect(const zdb_http_request *req,
                                 zdb_http_response *res)
 {
-    char db[128], part[256], ks[128];
     const char *path = req->path;
-    if (sscanf(path, "/data/%127[^/]/%255[^/]/%127[^/]", db, part, ks) != 3) {
-        respond_error(res, 400,
-                      "expected /data/{db}/{partition}/{keyspace}/<op>");
+    if (strncmp(path, "/data/", 6) != 0) {
+        respond_error(res, 400, "expected /data/...");
         return true;
     }
-    const char *operation = strrchr(path, '/');
-    operation = operation ? operation + 1 : "";
+    char work[1024];
+    snprintf(work, sizeof(work), "%s", path + 6);
+
+    char *tokens[8];
+    int ntokens = 0;
+    char *save = NULL;
+    char *tok = strtok_r(work, "/", &save);
+    while (tok && ntokens < 8) {
+        tokens[ntokens++] = tok;
+        tok = strtok_r(NULL, "/", &save);
+    }
+
+    const char *operation = ntokens > 0 ? tokens[ntokens - 1] : "";
     bool collection = strcmp(operation, "ids") == 0 ||
                       strcmp(operation, "all") == 0 ||
                       strcmp(operation, "query") == 0;
@@ -730,6 +838,24 @@ static bool handle_data_collect(const zdb_http_request *req,
         return strcmp(req->method, "GET") == 0
                    ? handle_data_get(req, res)
                    : (respond_error(res, 404, "unknown operation"), true);
+    }
+
+    char db[128], part[256], ks[128];
+    bool keyspace_omitted = false;
+    if (ntokens == 4) {
+        snprintf(db, sizeof(db), "%s", tokens[0]);
+        snprintf(part, sizeof(part), "%s", tokens[1]);
+        snprintf(ks, sizeof(ks), "%s", tokens[2]);
+    } else if (ntokens == 3 && strcmp(operation, "query") == 0) {
+        /* /data/{db}/{partition}/query: keyspace omitted => whole partition */
+        snprintf(db, sizeof(db), "%s", tokens[0]);
+        snprintf(part, sizeof(part), "%s", tokens[1]);
+        ks[0] = '\0';
+        keyspace_omitted = true;
+    } else {
+        respond_error(res, 400,
+                      "expected /data/{db}/{partition}/{keyspace}/<op>");
+        return true;
     }
 
     bool auth_ok = false;
@@ -779,6 +905,10 @@ static bool handle_data_collect(const zdb_http_request *req,
         }
         zdb_free_strings(ids);
         respond_json(res, 200, array);
+    } else if (keyspace_omitted) {
+        cJSON *documents = partition_wide_query(db, part, filters);
+        respond_json(res, 200,
+                     documents ? documents : cJSON_CreateArray());
     } else {
         cJSON *documents;
         if (g_repl) {
@@ -937,7 +1067,7 @@ static bool handle_admin_users(const zdb_http_request *req,
             char bits[32];
             snprintf(bits, sizeof(bits), "%llu",
                      (unsigned long long)list[i].groups);
-            cJSON_AddRawToObject(o, "groups", bits);
+            cJSON_AddStringToObject(o, "groups", bits);
             cJSON_AddItemToArray(arr, o);
         }
         free(list);
@@ -954,6 +1084,8 @@ static bool handle_admin_users(const zdb_http_request *req,
         const cJSON *name = cJSON_GetObjectItemCaseSensitive(body, "name");
         const cJSON *groups = cJSON_GetObjectItemCaseSensitive(body,
                                                                "groups");
+        const cJSON *password = cJSON_GetObjectItemCaseSensitive(body,
+                                                                 "password");
         uint64_t group_mask = 0;
         if (!cJSON_IsString(name) || !json_u64_value(groups, &group_mask)) {
             respond_error(res, 400, "name and groups required");
@@ -962,6 +1094,11 @@ static bool handle_admin_users(const zdb_http_request *req,
         }
         bool ok = zdb_user_create(g_ctx.config, name->valuestring,
                                   group_mask);
+        if (ok && cJSON_IsString(password) && password->valuestring &&
+            *password->valuestring) {
+            ok = zdb_user_set_password(g_ctx.config, name->valuestring,
+                                       password->valuestring);
+        }
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 409, "create failed (duplicate?)");
@@ -969,6 +1106,40 @@ static bool handle_admin_users(const zdb_http_request *req,
         }
         respond_json(res, 201, NULL);
         res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        return true;
+    }
+    if (strcmp(req->method, "PUT") == 0) {
+        cJSON *body = NULL;
+        if (!body_json(req, &body) || !cJSON_IsObject(body)) {
+            respond_error(res, 400, "JSON object required");
+            cJSON_Delete(body);
+            return true;
+        }
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(body, "name");
+        const cJSON *groups = cJSON_GetObjectItemCaseSensitive(body,
+                                                               "groups");
+        const cJSON *password = cJSON_GetObjectItemCaseSensitive(body,
+                                                                 "password");
+        uint64_t group_mask = 0;
+        if (!cJSON_IsString(name) || !json_u64_value(groups, &group_mask)) {
+            respond_error(res, 400, "name and groups required");
+            cJSON_Delete(body);
+            return true;
+        }
+        bool ok = zdb_user_set_groups(g_ctx.config, name->valuestring,
+                                      group_mask);
+        if (ok && cJSON_IsString(password) && password->valuestring &&
+            *password->valuestring) {
+            ok = zdb_user_set_password(g_ctx.config, name->valuestring,
+                                       password->valuestring);
+        }
+        cJSON_Delete(body);
+        if (!ok) {
+            respond_error(res, 404, "user not found");
+            return true;
+        }
+        respond_json(res, 200, NULL);
+        res->body = zdb_http_body_printf(&res->body_len, "{\"updated\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
@@ -1004,16 +1175,16 @@ static bool handle_admin_partitions(const zdb_http_request *req,
                     char b[32];
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].read_mask);
-                    cJSON_AddRawToObject(o, "read_mask", b);
+                    cJSON_AddStringToObject(o, "read_mask", b);
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].update_mask);
-                    cJSON_AddRawToObject(o, "update_mask", b);
+                    cJSON_AddStringToObject(o, "update_mask", b);
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].create_mask);
-                    cJSON_AddRawToObject(o, "create_mask", b);
+                    cJSON_AddStringToObject(o, "create_mask", b);
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].delete_mask);
-                    cJSON_AddRawToObject(o, "delete_mask", b);
+                    cJSON_AddStringToObject(o, "delete_mask", b);
                     cJSON_AddItemToArray(arr2, o);
                 }
                 free(parts);
@@ -1030,16 +1201,16 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             char b[32];
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].read_mask);
-            cJSON_AddRawToObject(o, "read_mask", b);
+            cJSON_AddStringToObject(o, "read_mask", b);
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].update_mask);
-            cJSON_AddRawToObject(o, "update_mask", b);
+            cJSON_AddStringToObject(o, "update_mask", b);
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].create_mask);
-            cJSON_AddRawToObject(o, "create_mask", b);
+            cJSON_AddStringToObject(o, "create_mask", b);
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].delete_mask);
-            cJSON_AddRawToObject(o, "delete_mask", b);
+            cJSON_AddStringToObject(o, "delete_mask", b);
             cJSON_AddItemToArray(arr, o);
         }
         free(list);
@@ -1088,6 +1259,51 @@ static bool handle_admin_partitions(const zdb_http_request *req,
         }
         respond_json(res, 201, NULL);
         res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        return true;
+    }
+    if (strcmp(req->method, "PUT") == 0) {
+        cJSON *body = NULL;
+        if (!body_json(req, &body) || !cJSON_IsObject(body)) {
+            respond_error(res, 400, "JSON object required");
+            cJSON_Delete(body);
+            return true;
+        }
+        const cJSON *database = cJSON_GetObjectItemCaseSensitive(body,
+                                                             "database");
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(body, "name");
+        const cJSON *cm = cJSON_GetObjectItemCaseSensitive(body,
+                                                           "create_mask");
+        const cJSON *um = cJSON_GetObjectItemCaseSensitive(body,
+                                                           "update_mask");
+        const cJSON *rm = cJSON_GetObjectItemCaseSensitive(body,
+                                                           "read_mask");
+        const cJSON *dm = cJSON_GetObjectItemCaseSensitive(body,
+                                                           "delete_mask");
+        uint64_t create_mask = 0;
+        uint64_t update_mask = 0;
+        uint64_t read_mask = 0;
+        uint64_t delete_mask = 0;
+        if (!cJSON_IsString(database) || !cJSON_IsString(name) ||
+            !json_u64_value(cm, &create_mask) ||
+            !json_u64_value(um, &update_mask) ||
+            !json_u64_value(rm, &read_mask) ||
+            !json_u64_value(dm, &delete_mask)) {
+            respond_error(res, 400,
+                          "database, name and all four masks required");
+            cJSON_Delete(body);
+            return true;
+        }
+        bool ok = zdb_partition_set_masks(g_ctx.config, database->valuestring,
+                                          name->valuestring, create_mask,
+                                          update_mask, read_mask,
+                                          delete_mask);
+        cJSON_Delete(body);
+        if (!ok) {
+            respond_error(res, 404, "partition not found");
+            return true;
+        }
+        respond_json(res, 200, NULL);
+        res->body = zdb_http_body_printf(&res->body_len, "{\"updated\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
@@ -1263,6 +1479,22 @@ static bool handle_admin_cluster(const zdb_http_request *req,
 }
 
 
+/* Removes every non-system shard file so a joining node starts fresh
+ * (its local demo/scratch data is discarded in favour of the shared
+ * cluster data). Config shards are left in place: the seed sync below
+ * snapshots them over the local copies. */
+static void wipe_local_shards(void)
+{
+    char keys[512][33];
+    size_t n = zdb_engine_shard_keys(g_ctx.engine, keys, 512);
+    for (size_t i = 0; i < n; i++) {
+        if (zdb_config_is_system_key(g_ctx.config, keys[i])) {
+            continue;
+        }
+        zdb_shard_gc(g_ctx.engine, keys[i]);
+    }
+}
+
 static bool catchup_from_holder(const char key[33], const char *partition,
                                 const char *keyspace)
 {
@@ -1312,6 +1544,7 @@ static bool handle_admin_join(const zdb_http_request *req,
     }
     const cJSON *addr = cJSON_GetObjectItemCaseSensitive(body, "addr");
     const cJSON *port = cJSON_GetObjectItemCaseSensitive(body, "port");
+    const cJSON *secret = cJSON_GetObjectItemCaseSensitive(body, "secret");
     if (!cJSON_IsString(addr) || !addr->valuestring ||
         !cJSON_IsNumber(port) || port->valueint <= 0 ||
         port->valueint > 65535) {
@@ -1320,6 +1553,24 @@ static bool handle_admin_join(const zdb_http_request *req,
         cJSON_Delete(body);
         return true;
     }
+    /* Optional cluster secret: derive and enable mesh encryption before
+     * dialling so the HELLO is authenticated. A wrong (or missing)
+     * secret fails the handshake and the join is refused. */
+    const char *secret_str =
+        cJSON_IsString(secret) && secret->valuestring && *secret->valuestring
+            ? secret->valuestring
+            : NULL;
+    uint8_t enc_key[32], mac_key[32];
+    bool key_set = false;
+    if (secret_str) {
+        if (zdb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
+            cJSON_Delete(body);
+            respond_error(res, 400, "invalid cluster secret");
+            return true;
+        }
+        zstp_set_mesh_key(enc_key, mac_key);
+        key_set = true;
+    }
     int rc = zdb_cluster_join(g_cluster, addr->valuestring,
                               port->valueint);
     char seed_addr[ZDB_ADDR_MAX];
@@ -1327,14 +1578,25 @@ static bool handle_admin_join(const zdb_http_request *req,
     snprintf(seed_addr, sizeof(seed_addr), "%s", addr->valuestring);
     cJSON_Delete(body);
     if (rc == -2) {
+        if (key_set) {
+            zstp_set_mesh_key(NULL, NULL);
+        }
         respond_error(res, 409, "rebalance in progress: one node may"
                                 " join at a time; retry later");
         return true;
     }
     if (rc != 0) {
-        respond_error(res, 502, "cannot reach seed peer");
+        if (key_set) {
+            zstp_set_mesh_key(NULL, NULL);
+        }
+        respond_error(res, 502, "cannot reach seed peer (wrong secret?)");
         return true;
     }
+    if (key_set) {
+        zdb_cluster_persist_keys(zdb_engine_path(g_ctx.engine), enc_key,
+                                 mac_key);
+    }
+    wipe_local_shards();
     respond_json(res, 200, NULL);
 
     /* --- stage 6e: run the full rebalance flow for this node -------- */
@@ -1617,6 +1879,88 @@ static bool handle_admin_login(const zdb_http_request *req,
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* first-run demo data                                                 */
+
+typedef struct {
+    const char *partition;
+    const char *keyspace;
+    const char *id;
+    const char *json;
+} demo_record;
+
+static const demo_record DEMO_RECORDS[] = {
+    { "People", "employees", "e1001",
+      "{\"name\":\"Alice Johnson\",\"title\":\"Software Engineer\","
+      "\"department\":\"Engineering\",\"email\":\"alice@acme.example\","
+      "\"salary\":95000,\"manager\":\"e1004\",\"active\":true}" },
+    { "People", "employees", "e1002",
+      "{\"name\":\"Bob Smith\",\"title\":\"Product Manager\","
+      "\"department\":\"Product\",\"email\":\"bob@acme.example\","
+      "\"salary\":88000,\"manager\":\"e1004\",\"active\":true}" },
+    { "People", "employees", "e1003",
+      "{\"name\":\"Carol Williams\",\"title\":\"Data Analyst\","
+      "\"department\":\"Data\",\"email\":\"carol@acme.example\","
+      "\"salary\":72000,\"manager\":\"e1005\",\"active\":true}" },
+    { "People", "employees", "e1004",
+      "{\"name\":\"Dave Brown\",\"title\":\"Engineering Director\","
+      "\"department\":\"Engineering\",\"email\":\"dave@acme.example\","
+      "\"salary\":140000,\"manager\":null,\"active\":true}" },
+    { "People", "employees", "e1005",
+      "{\"name\":\"Eve Davis\",\"title\":\"Head of Data\","
+      "\"department\":\"Data\",\"email\":\"eve@acme.example\","
+      "\"salary\":130000,\"manager\":null,\"active\":true}" },
+    { "Departments", "depts", "eng",
+      "{\"name\":\"Engineering\",\"head\":\"Dave Brown\","
+      "\"budget\":2500000,\"headcount\":42}" },
+    { "Departments", "depts", "prod",
+      "{\"name\":\"Product\",\"head\":\"Bob Smith\","
+      "\"budget\":900000,\"headcount\":12}" },
+    { "Departments", "depts", "data",
+      "{\"name\":\"Data\",\"head\":\"Eve Davis\","
+      "\"budget\":1200000,\"headcount\":18}" },
+    { "Departments", "depts", "sales",
+      "{\"name\":\"Sales\",\"head\":\"Frank Lee\","
+      "\"budget\":1500000,\"headcount\":30}" },
+    { "Departments", "depts", "hr",
+      "{\"name\":\"Human Resources\",\"head\":\"Grace Kim\","
+      "\"budget\":400000,\"headcount\":6}" },
+    { "Projects", "projects", "p100",
+      "{\"name\":\"Website Redesign\",\"owner\":\"Product\","
+      "\"status\":\"active\",\"budget\":180000,\"progress\":0.65}" },
+    { "Projects", "projects", "p200",
+      "{\"name\":\"Mobile App\",\"owner\":\"Engineering\","
+      "\"status\":\"active\",\"budget\":320000,\"progress\":0.4}" },
+    { "Projects", "projects", "p300",
+      "{\"name\":\"Data Warehouse\",\"owner\":\"Data\","
+      "\"status\":\"planned\",\"budget\":150000,\"progress\":0.0}" },
+    { "Locations", "offices", "l1",
+      "{\"city\":\"London\",\"country\":\"United Kingdom\","
+      "\"address\":\"1 Acme Way\",\"headcount\":58,\"hq\":true}" },
+    { "Locations", "offices", "l2",
+      "{\"city\":\"New York\",\"country\":\"United States\","
+      "\"address\":\"500 Park Ave\",\"headcount\":34,\"hq\":false}" },
+    { "Locations", "offices", "l3",
+      "{\"city\":\"Berlin\",\"country\":\"Germany\","
+      "\"address\":\"Mitte 12\",\"headcount\":16,\"hq\":false}" },
+};
+
+/* Seeds a local example company database so a fresh node has something
+ * to explore before it joins a cluster. Data is written straight to the
+ * engine (not replicated) so it stays purely local; the join flow wipes
+ * it when the node adopts the shared cluster data. */
+static void seed_demo_data(void)
+{
+    zdb_database_create(g_ctx.config, "demo", 1);
+    size_t n = sizeof(DEMO_RECORDS) / sizeof(DEMO_RECORDS[0]);
+    for (size_t i = 0; i < n; i++) {
+        const demo_record *r = &DEMO_RECORDS[i];
+        zdb_put(g_ctx.engine, r->partition, r->keyspace, r->id, r->json, -1);
+        zdb_partition_ensure(g_ctx.config, "demo", r->partition,
+                             r->keyspace, NULL);
+    }
+}
+
 static bool handle_admin_setup(const zdb_http_request *req,
                                zdb_http_response *res)
 {
@@ -1636,6 +1980,7 @@ static bool handle_admin_setup(const zdb_http_request *req,
     }
     const cJSON *username = cJSON_GetObjectItemCaseSensitive(body, "username");
     const cJSON *password = cJSON_GetObjectItemCaseSensitive(body, "password");
+    const cJSON *secret = cJSON_GetObjectItemCaseSensitive(body, "secret");
     const char *name = cJSON_IsString(username) && username->valuestring &&
                                *username->valuestring
                            ? username->valuestring
@@ -1647,7 +1992,33 @@ static bool handle_admin_setup(const zdb_http_request *req,
         respond_error(res, 400, "password must be 4-256 characters");
         return true;
     }
-    if (!zdb_user_create(g_ctx.config, name, 1ULL)) {
+    /* Optional cluster secret: derive mesh keys, persist them and enable
+     * frame encryption. Nodes must present the same secret to join. */
+    const char *secret_str =
+        cJSON_IsString(secret) && secret->valuestring &&
+                *secret->valuestring
+            ? secret->valuestring
+            : NULL;
+    uint8_t enc_key[32], mac_key[32];
+    if (secret_str) {
+        if (zdb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
+            cJSON_Delete(body);
+            respond_error(res, 400, "invalid cluster secret");
+            return true;
+        }
+        zdb_cluster_persist_keys(zdb_engine_path(g_ctx.engine), enc_key,
+                                 mac_key);
+        zstp_set_mesh_key(enc_key, mac_key);
+    }
+    /* First run: create the default SysAdmins group (bit 1) and add the
+     * admin user to it, then set the admin password. */
+    zdb_group_create(g_ctx.config, "SysAdmins");
+    zdb_group_info sysadmins;
+    uint64_t admin_groups = 1ULL;
+    if (zdb_group_get(g_ctx.config, "SysAdmins", &sysadmins)) {
+        admin_groups = 1ULL << (sysadmins.bit_position - 1);
+    }
+    if (!zdb_user_create(g_ctx.config, name, admin_groups)) {
         cJSON_Delete(body);
         respond_error(res, 409, "could not create admin user");
         return true;
@@ -1657,10 +2028,11 @@ static bool handle_admin_setup(const zdb_http_request *req,
         respond_error(res, 500, "could not store password");
         return true;
     }
+    seed_demo_data();
     char token[65];
-    session_create(name, 1ULL, token);
+    session_create(name, admin_groups, token);
     cJSON_Delete(body);
-    respond_groups_json(res, 200, token, name, 1ULL);
+    respond_groups_json(res, 200, token, name, admin_groups);
     return true;
 }
 
@@ -1708,9 +2080,13 @@ bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
                                handle_admin_users);
     ok &= zdb_http_add_handler(srv, "POST", "/admin/users",
                                handle_admin_users);
+    ok &= zdb_http_add_handler(srv, "PUT", "/admin/users",
+                               handle_admin_users);
     ok &= zdb_http_add_handler(srv, "GET", "/admin/partitions",
                                handle_admin_partitions);
     ok &= zdb_http_add_handler(srv, "POST", "/admin/partitions",
+                               handle_admin_partitions);
+    ok &= zdb_http_add_handler(srv, "PUT", "/admin/partitions",
                                handle_admin_partitions);
     ok &= zdb_http_add_handler(srv, "GET", "/admin/keyspaces",
                                handle_admin_keyspaces);

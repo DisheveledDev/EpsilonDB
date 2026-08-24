@@ -26,21 +26,23 @@ endif
 VENDOR_SRC = vendor/cjson/cJSON.c src/sqlite/sqlite3.c
 
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
-             src/engine/shard.c src/engine/manager.c \
-             src/engine/zesty_config.c
+             src/engine/zesty_crypto.c src/engine/shard.c \
+             src/engine/manager.c src/engine/zesty_config.c
 ENGINE_OBJ = $(ENGINE_SRC:.c=.o) $(VENDOR_SRC:.c=.o)
 ENGINE_LIB = bin/libzesty.a
 SERVER_BIN = bin/zestyd
 CLI_BIN = bin/zestyctl
 
-TEST_SRC = tests/test_engine.c tests/test_config.c tests/test_http.c \
-           tests/test_replication.c tests/test_structure.c \
-           tests/test_snapshot.c tests/test_delta.c tests/test_rebalance.c \
-           tests/test_join.c tests/test_chaos.c tests/test_console.c
-TEST_BINS = tests/test_engine tests/test_config tests/test_http \
-            tests/test_cluster tests/test_replication tests/test_structure \
-            tests/test_snapshot tests/test_delta tests/test_rebalance \
-            tests/test_join tests/test_chaos tests/test_console
+TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \
+           tests/test_http.c tests/test_replication.c \
+           tests/test_structure.c tests/test_snapshot.c tests/test_delta.c \
+           tests/test_rebalance.c tests/test_join.c tests/test_chaos.c \
+           tests/test_console.c
+TEST_BINS = tests/test_crypto tests/test_engine tests/test_config \
+            tests/test_http tests/test_cluster tests/test_replication \
+            tests/test_structure tests/test_snapshot tests/test_delta \
+            tests/test_rebalance tests/test_join tests/test_chaos \
+            tests/test_console
 .PHONY: all test clean
 
 all: $(SERVER_BIN) $(CLI_BIN)
@@ -81,12 +83,16 @@ src/admin/admin_console.o: src/admin/admin_console.c
 
 test: all $(TEST_BINS)
 	mkdir -p tests/data
-	./tests/test_engine && ./tests/test_config && ./tests/test_http_run.sh \
+	./tests/test_crypto && ./tests/test_engine && ./tests/test_config \
+		&& ./tests/test_http_run.sh \
 		&& ./tests/test_cluster && ./tests/test_replication \
 		&& ./tests/test_structure && ./tests/test_snapshot \
 		&& ./tests/test_delta && ./tests/test_rebalance \
 		&& ./tests/test_join_run.sh && ./tests/test_chaos \
 		&& ./tests/test_console_run.sh
+
+tests/test_crypto: tests/test_crypto.c $(ENGINE_LIB)
+	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
 
 tests/test_engine: tests/test_engine.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)

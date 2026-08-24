@@ -200,6 +200,29 @@ int main(int argc, char **argv)
     s = http_request("GET", "/admin/databases", token, NULL, &body);
     CHECK(s == 200);
 
+    /* first run seeds the demo company database with sample data */
+    CHECK(body_has(body, "demo"));
+    s = http_request("GET", "/data/demo/People/employees/all", token, NULL,
+                     &body);
+    CHECK(s == 200 && body_has(body, "Alice Johnson"));
+    s = http_request("POST", "/data/demo/Departments/depts/query", token,
+                     "{\"filters\":[{\"key\":\"headcount\",\"operator\":\"gte\",\"value\":20}]}",
+                     &body);
+    CHECK(s == 200 && body_has(body, "Engineering"));
+
+    /* keyspace-less query spans the whole partition */
+    s = http_request("POST", "/data/demo/People/query", token,
+                     "{\"filters\":[{\"key\":\"salary\",\"operator\":\"gte\",\"value\":90000}]}",
+                     &body);
+    CHECK(s == 200 && body_has(body, "Alice Johnson") &&
+          body_has(body, "Eve Davis"));
+
+    /* first run created the default SysAdmins group and the admin user */
+    s = http_request("GET", "/admin/groups", token, NULL, &body);
+    CHECK(s == 200 && body_has(body, "SysAdmins"));
+    s = http_request("GET", "/admin/users", token, NULL, &body);
+    CHECK(s == 200 && body_has(body, "admin"));
+
     /* logout invalidates the token */
     s = http_request("POST", "/admin/logout", token, NULL, &body);
     CHECK(s == 200);

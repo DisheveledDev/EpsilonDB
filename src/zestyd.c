@@ -120,6 +120,15 @@ int main(int argc, char **argv)
                " (peer port %d)\n",
                node_id, advertise_addr, peer_port, peer_port);
 
+        /* re-enable mesh encryption from the persisted key (restart) */
+        {
+            uint8_t enc_key[32];
+            uint8_t mac_key[32];
+            if (zdb_cluster_load_keys(data_dir, enc_key, mac_key)) {
+                zstp_set_mesh_key(enc_key, mac_key);
+            }
+        }
+
         /* stage 5 replication on top of the mesh */
         repl = zdb_repl_start(cluster, config, data_dir);
         if (!repl) {

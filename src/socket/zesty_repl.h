@@ -95,6 +95,12 @@ cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
 cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
                            const char *partition, const char *keyspace,
                            const cJSON *filters);
+
+/* Like zdb_repl_read_query but each row carries {"id","timestamp",
+ * "value"} so a partition-wide query can reorder merged keyspaces. */
+cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
+                                const char *partition, const char *keyspace,
+                                const cJSON *filters);
 char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters,
                          size_t *count_out);

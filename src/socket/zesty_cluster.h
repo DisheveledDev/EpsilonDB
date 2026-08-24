@@ -172,4 +172,17 @@ bool zdb_cluster_void_target(zdb_cluster *cl);
  * rolls back to the live structure instead of waiting for promotion. */
 bool zdb_cluster_request_void(zdb_cluster *cl);
 
+/* --- mesh encryption key management ----------------------------------- */
+
+/* Derives the 32-byte encryption and MAC keys from the cluster join
+ * secret (HKDF-SHA256). Returns 0 on success, -1 on a bad argument. */
+int zdb_cluster_derive_keys(const char *secret, uint8_t enc_key[32],
+                            uint8_t mac_key[32]);
+
+/* Persist/load the mesh keys to/from data_dir/mesh.key (mode 0600). */
+bool zdb_cluster_persist_keys(const char *data_dir, const uint8_t enc_key[32],
+                              const uint8_t mac_key[32]);
+bool zdb_cluster_load_keys(const char *data_dir, uint8_t enc_key[32],
+                           uint8_t mac_key[32]);
+
 #endif
