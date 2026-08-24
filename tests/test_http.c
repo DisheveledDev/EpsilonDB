@@ -201,33 +201,56 @@ int main(int argc, char **argv)
     s = http_request("GET", "/data/app/cache/main/nope", "root", NULL, &body);
     CHECK(s == 404);
 
-    /* more docs for queries */
+    /* more docs for structured JSON filters */
     s = http_request("PUT", "/data/app/cache/main/w2", "root",
-                     "{\"kind\":\"widget\",\"color\":\"red\",\"n\":8}",
-                     NULL);
+                     "{\"kind\":\"widget\",\"color\":\"red\",\"n\":8,"
+                     "\"manager\":{\"age\":42}}", NULL);
     CHECK(s == 200);
-    s = http_request("PUT", "/data/app/cache/main/g1?filter=color=green",
-                     "root",
-                     "{\"kind\":\"gadget\",\"color\":\"green\",\"n\":9}",
-                     NULL);
+    s = http_request("PUT", "/data/app/cache/main/g1", "root",
+                     "{\"kind\":\"gadget\",\"color\":\"green\",\"n\":9,"
+                     "\"manager\":{\"age\":51}}", NULL);
     CHECK(s == 200);
 
-    /* ids with indexed filter */
-    s = http_request("GET", "/data/app/cache/main/ids?filter=color=green",
-                     "root", NULL, &body);
-    CHECK(s == 200);
-    CHECK(body_contains(body, "g1"));
+    s = http_request("PUT", "/data/app/cache/main/legacy?filter=color=green",
+                     "root", "{\"legacy\":true}", &body);
+    CHECK(s == 400);
 
-    /* all */
+    s = http_request("POST", "/data/app/cache/main/ids", "root",
+                     "{\"key\":\"color\",\"operator\":\"eq\","
+                     "\"value\":\"green\"}", &body);
+    CHECK(s == 200 && body_contains(body, "g1"));
+
+    s = http_request("POST", "/data/app/cache/main/all", "root",
+                     "{\"key\":\"n\",\"operator\":\"lte\",\"value\":8}",
+                     &body);
+    CHECK(s == 200 && body_contains(body, "blue") &&
+          body_contains(body, "red") && !body_contains(body, "green"));
+
     s = http_request("GET", "/data/app/cache/main/all", "root", NULL, &body);
     CHECK(s == 200);
     CHECK(body_contains(body, "widget") && body_contains(body, "gadget"));
 
-    /* query with field match in body */
     s = http_request("POST", "/data/app/cache/main/query", "root",
-                     "{\"fields\":{\"color\":\"blue\"}}", &body);
-    CHECK(s == 200);
-    CHECK(body_contains(body, "widget"));
+                     "{\"key\":\"manager.age\",\"operator\":\"gt\","
+                     "\"value\":42}", &body);
+    CHECK(s == 200 && body_contains(body, "gadget") &&
+          !body_contains(body, "red"));
+
+    s = http_request("POST", "/data/app/cache/main/query", "root",
+                     "{\"filters\":["
+                     "{\"key\":\"n\",\"operator\":\"gte\",\"value\":8},"
+                     "{\"key\":\"kind\",\"operator\":\"eq\","
+                     "\"value\":\"widget\"}]}", &body);
+    CHECK(s == 200 && body_contains(body, "red") &&
+          !body_contains(body, "green"));
+
+    s = http_request("POST", "/data/app/cache/main/query", "root",
+                     "{\"key\":\"n\",\"operator\":\"wat\",\"value\":8}",
+                     &body);
+    CHECK(s == 400);
+    s = http_request("GET", "/data/app/cache/main/ids?filter=color=green",
+                     "root", NULL, &body);
+    CHECK(s == 400);
 
     /* ttl expiry param accepted (not expired yet) */
     s = http_request("PUT", "/data/app/cache/main/ttl1?ttl=3600", "root",

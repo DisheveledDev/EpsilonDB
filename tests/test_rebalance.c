@@ -74,7 +74,7 @@ static bool test_apply_change(void *ud, const cJSON *change)
                                 : -1;
         bool ok = zdb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
-                                  value_json, ttl_abs, ts, NULL, 0);
+                                  value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
@@ -103,7 +103,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
     }
     if (strcmp(jq->valuestring, "all_ts") == 0) {
         cJSON *rows = zdb_all_ts(n->engine, jpart->valuestring,
-                                 jks->valuestring, NULL, 0);
+                                 jks->valuestring, NULL);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
     } else {
@@ -278,9 +278,8 @@ int main(void)
         system(cmd);
         zdb_engine *e = zdb_engine_open(dir);
         CHECK(e != NULL);
-        CHECK(zdb_put(e, "main", "kv", "id-0", "{\"n\":0}", -1, NULL, 0));
-        CHECK(zdb_put(e, "other", "docs", "d-0", "{\"d\":0}", -1, NULL,
-                      0));
+        CHECK(zdb_put(e, "main", "kv", "id-0", "{\"n\":0}", -1));
+        CHECK(zdb_put(e, "other", "docs", "d-0", "{\"d\":0}", -1));
 
         char keys[8][33];
         size_t nk = zdb_engine_shard_keys(e, keys, 8);
@@ -437,7 +436,7 @@ int main(void)
         } else {
             holder = &d;
         }
-        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL, 0);
+        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL);
         CHECK(all && cJSON_GetArraySize(all) == 100);
         cJSON_Delete(all);
     }
@@ -489,7 +488,7 @@ int main(void)
         } else {
             holder = &d;
         }
-        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL, 0);
+        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL);
         CHECK(all && cJSON_GetArraySize(all) == 100);
         cJSON_Delete(all);
 

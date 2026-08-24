@@ -70,7 +70,7 @@ static bool test_apply_change(void *ud, const cJSON *change)
                                 : -1;
         bool ok = zdb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
-                                  value_json, ttl_abs, ts, NULL, 0);
+                                  value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
@@ -119,15 +119,23 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
         } else {
             cJSON_AddNullToObject(out, "row");
         }
-    } else if (strcmp(jq->valuestring, "all_ts") == 0) {
-        cJSON *rows = zdb_all_ts(n->engine, jpart->valuestring,
-                                 jks->valuestring, NULL, 0);
+    } else if (strcmp(jq->valuestring, "all_ts") == 0 ||
+               strcmp(jq->valuestring, "query_ts") == 0) {
+        const cJSON *filters =
+            cJSON_GetObjectItemCaseSensitive(request, "filters");
+        cJSON *rows = strcmp(jq->valuestring, "all_ts") == 0
+                          ? zdb_all_ts(n->engine, jpart->valuestring,
+                                       jks->valuestring, filters)
+                          : zdb_query_ts(n->engine, jpart->valuestring,
+                                         jks->valuestring, filters);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
     } else if (strcmp(jq->valuestring, "ids") == 0) {
         size_t cnt = 0;
+        const cJSON *filters =
+            cJSON_GetObjectItemCaseSensitive(request, "filters");
         char **ids = zdb_ids(n->engine, jpart->valuestring,
-                             jks->valuestring, NULL, 0, &cnt);
+                             jks->valuestring, filters, &cnt);
         cJSON *arr = cJSON_AddArrayToObject(out, "ids");
         for (size_t i = 0; arr && ids && i < cnt; i++) {
             cJSON_AddItemToArray(arr, cJSON_CreateString(ids[i]));
@@ -384,7 +392,12 @@ int main(void)
     {
         char change[512];
         build_put(change, sizeof(change), "app", "main", "users", "u1",
-                  (long long)time(NULL), "{\"name\":\"ada\"}");
+                  (long long)time(NULL),
+                  "{\"name\":\"ada\",\"manager\":{\"age\":50}}");
+        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        build_put(change, sizeof(change), "app", "main", "users", "u2",
+                  (long long)time(NULL),
+                  "{\"name\":\"bob\",\"manager\":{\"age\":30}}");
         CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
 
         /* direct engine read confirms local copy */
@@ -407,14 +420,26 @@ int main(void)
         /* ids/all merges across replicas */
         size_t nids = 0;
         char **ids = zdb_repl_read_ids(a.repl, "app", "main", "users",
-                                       NULL, 0, &nids);
-        CHECK(ids != NULL && nids == 1);
+                                       NULL, &nids);
+        CHECK(ids != NULL && nids == 2);
         zdb_free_strings(ids);
 
         cJSON *all = zdb_repl_read_all(a.repl, "app", "main", "users",
-                                       NULL, 0);
-        CHECK(all != NULL && cJSON_GetArraySize(all) == 1);
+                                       NULL);
+        CHECK(all != NULL && cJSON_GetArraySize(all) == 2);
         cJSON_Delete(all);
+
+        cJSON *filters = cJSON_Parse(
+            "{\"key\":\"manager.age\",\"operator\":\"gt\",\"value\":40}");
+        cJSON *filtered = zdb_repl_read_query(a.repl, "app", "main", "users",
+                                              filters);
+        CHECK(filtered && cJSON_GetArraySize(filtered) == 1);
+        cJSON_Delete(filtered);
+        ids = zdb_repl_read_ids(a.repl, "app", "main", "users", filters,
+                                &nids);
+        CHECK(ids && nids == 1 && strcmp(ids[0], "u1") == 0);
+        zdb_free_strings(ids);
+        cJSON_Delete(filters);
     }
 
     /* --- quorum rejection: rf=3 database with one node down ---------- */

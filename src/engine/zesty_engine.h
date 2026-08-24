@@ -82,13 +82,9 @@ size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap);
 bool zdb_shard_gc(zdb_engine *mgr, const char key[33]);
 
 /* Store a JSON document under id in partition/keyspace.
- * ttl_seconds: seconds until expiry, or -1 for no expiry.
- * filters: array of "key=value" strings used for later query filtering,
- *          may be NULL/empty.
- * Returns true on success. */
+ * ttl_seconds: seconds until expiry, or -1 for no expiry. */
 bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
-             const char *id, const char *json_value, long long ttl_seconds,
-             const char **filters, size_t nfilters);
+             const char *id, const char *json_value, long long ttl_seconds);
 
 /* Fetch a document as a parsed cJSON value, or NULL if absent/expired. */
 cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
@@ -98,22 +94,16 @@ cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
 bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
                 const char *id);
 
-/* Return ids of all live documents matching ALL of the given
- * "key=value" filters (md5-hashed and matched via DataFilter). */
+/* Structured filters are one object or an array of objects shaped as
+ * {"key":"manager.age","operator":"eq","value":42}. Multiple filters
+ * use AND semantics. Supported operators: eq, ne, gt, gte, lt, lte. */
 char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
-               const char **filters, size_t nfilters, size_t *count_out);
-
-/* Return all live documents matching the filters as a cJSON array. */
+               const cJSON *filters, size_t *count_out);
 cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
-               const char **filters, size_t nfilters);
-
-/* Return live documents matching the filters whose top-level object also
- * contains every given "field=value" string comparison, as a cJSON array.
- * Filter hashes select candidate rows cheaply; the field/value pairs are
- * then checked against the parsed JSON. */
-cJSON *zdb_query(zdb_engine *mgr, const char *partition, const char *keyspace,
-                 const char **filters, size_t nfilters,
-                 const char **fields, size_t nfields);
+               const cJSON *filters);
+cJSON *zdb_query(zdb_engine *mgr, const char *partition,
+                 const char *keyspace, const cJSON *filters);
+bool zdb_filters_valid(const cJSON *filters);
 
 /* Force a cleanup + reindex pass over one shard now (mainly for tests). */
 bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
@@ -129,13 +119,11 @@ bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
 bool zdb_replica_put(zdb_engine *mgr, const char *partition,
                      const char *keyspace, const char *id,
                      const char *json_value, long long ttl_absolute,
-                     long long timestamp, const char **filters,
-                     size_t nfilters);
+                     long long timestamp);
 bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
                             const char *keyspace, const char *id,
                             const char *json_value, long long ttl_absolute,
-                            long long timestamp, const char *origin,
-                            const char **filters, size_t nfilters);
+                            long long timestamp, const char *origin);
 
 /* Apply a replicated soft-delete carrying an explicit origin timestamp.
  * LWW semantics as above; ttl becomes timestamp - 5 (tombstone). */
@@ -156,11 +144,9 @@ cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
  * {"id":..,"timestamp":..,"value":{..}} so replicas can be merged by
  * comparing timestamps. */
 cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
-                  const char *keyspace, const char **filters,
-                  size_t nfilters);
+                  const char *keyspace, const cJSON *filters);
 cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
-                    const char *keyspace, const char **filters,
-                    size_t nfilters, const char **fields, size_t nfields);
+                    const char *keyspace, const cJSON *filters);
 
 /* Free a NULL-terminated list of malloc'd strings. */
 void zdb_free_strings(char **strings);

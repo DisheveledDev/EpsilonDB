@@ -29,13 +29,120 @@ void zdb_api_set_cluster(zdb_cluster *cluster)
     g_cluster = cluster;
 }
 
-static void free_collected(char **arr, size_t count);
-static char **strings_from_json(const cJSON *arr, size_t *count_out);
-static bool api_apply_change_impl(void *ud, const cJSON *change);
-static cJSON *api_read_request(void *ud, const cJSON *request);
+static bool api_apply_change_impl(void *ud, const cJSON *change)
+{
+    (void)ud;
+    const cJSON *operation = cJSON_GetObjectItemCaseSensitive(change, "op");
+    const cJSON *database = cJSON_GetObjectItemCaseSensitive(change, "db");
+    const cJSON *partition =
+        cJSON_GetObjectItemCaseSensitive(change, "partition");
+    const cJSON *keyspace =
+        cJSON_GetObjectItemCaseSensitive(change, "keyspace");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(change, "id");
+    const cJSON *timestamp = cJSON_GetObjectItemCaseSensitive(change, "ts");
+    const cJSON *origin_item =
+        cJSON_GetObjectItemCaseSensitive(change, "origin");
+    const char *origin = cJSON_IsString(origin_item)
+                             ? origin_item->valuestring
+                             : "";
+    if (!cJSON_IsString(operation) || !cJSON_IsString(database) ||
+        !cJSON_IsString(partition) || !cJSON_IsString(keyspace) ||
+        !cJSON_IsString(id) || !cJSON_IsNumber(timestamp)) {
+        return false;
+    }
+    long long modified = (long long)timestamp->valuedouble;
+    bool ok = false;
+    if (strcmp(operation->valuestring, "put") == 0) {
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(change, "value");
+        const cJSON *ttl = cJSON_GetObjectItemCaseSensitive(change, "ttl_abs");
+        char *encoded = cJSON_IsObject(value)
+                            ? cJSON_PrintUnformatted(value)
+                            : NULL;
+        if (!encoded) {
+            return false;
+        }
+        long long absolute_ttl = cJSON_IsNumber(ttl)
+                                     ? (long long)ttl->valuedouble
+                                     : -1;
+        ok = zdb_replica_put_origin(
+            g_ctx.engine, partition->valuestring, keyspace->valuestring,
+            id->valuestring, encoded, absolute_ttl, modified, origin);
+        free(encoded);
+        if (ok && strcmp(database->valuestring, ZDB_SYSTEM_DB) != 0) {
+            zdb_partition_ensure(g_ctx.config, database->valuestring,
+                                 partition->valuestring,
+                                 keyspace->valuestring, NULL);
+        }
+    } else if (strcmp(operation->valuestring, "delete") == 0) {
+        ok = zdb_replica_delete_origin(
+            g_ctx.engine, partition->valuestring, keyspace->valuestring,
+            id->valuestring, modified, origin);
+    }
+    return ok;
+}
+static cJSON *api_read_request(void *ud, const cJSON *request)
+{
+    (void)ud;
+    const cJSON *query = cJSON_GetObjectItemCaseSensitive(request, "q");
+    const cJSON *partition =
+        cJSON_GetObjectItemCaseSensitive(request, "partition");
+    const cJSON *keyspace =
+        cJSON_GetObjectItemCaseSensitive(request, "keyspace");
+    const cJSON *filters =
+        cJSON_GetObjectItemCaseSensitive(request, "filters");
+    if (!cJSON_IsString(query) || !cJSON_IsString(partition) ||
+        !cJSON_IsString(keyspace) || !zdb_filters_valid(filters)) {
+        return NULL;
+    }
+    cJSON *out = cJSON_CreateObject();
+    if (!out) {
+        return NULL;
+    }
+    if (strcmp(query->valuestring, "get") == 0) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
+        long long timestamp = 0;
+        cJSON *document = cJSON_IsString(id)
+                              ? zdb_get_ts(g_ctx.engine,
+                                           partition->valuestring,
+                                           keyspace->valuestring,
+                                           id->valuestring, &timestamp)
+                              : NULL;
+        if (document) {
+            cJSON *row = cJSON_CreateObject();
+            cJSON_AddStringToObject(row, "id", id->valuestring);
+            cJSON_AddNumberToObject(row, "timestamp", (double)timestamp);
+            cJSON_AddItemToObject(row, "value", document);
+            cJSON_AddItemToObject(out, "row", row);
+        } else {
+            cJSON_AddNullToObject(out, "row");
+        }
+    } else if (strcmp(query->valuestring, "all_ts") == 0 ||
+               strcmp(query->valuestring, "query_ts") == 0) {
+        cJSON *rows = strcmp(query->valuestring, "all_ts") == 0
+                          ? zdb_all_ts(g_ctx.engine,
+                                       partition->valuestring,
+                                       keyspace->valuestring, filters)
+                          : zdb_query_ts(g_ctx.engine,
+                                         partition->valuestring,
+                                         keyspace->valuestring, filters);
+        cJSON_AddItemToObject(out, "rows", rows ? rows : cJSON_CreateArray());
+    } else if (strcmp(query->valuestring, "ids") == 0) {
+        size_t count = 0;
+        char **ids = zdb_ids(g_ctx.engine, partition->valuestring,
+                             keyspace->valuestring, filters, &count);
+        cJSON *array = cJSON_AddArrayToObject(out, "ids");
+        for (size_t i = 0; array && ids && i < count; i++) {
+            cJSON_AddItemToArray(array, cJSON_CreateString(ids[i]));
+        }
+        zdb_free_strings(ids);
+    } else {
+        cJSON_Delete(out);
+        return NULL;
+    }
+    return out;
+}
 static bool api_replicate_config(void *ctx, const char *keyspace,
-                                 const char *id, const char *json,
-                                 const char *type_filter);
+                                 const char *id, const char *json);
 
 void zdb_api_set_repl(zdb_repl *repl)
 {
@@ -51,8 +158,7 @@ void zdb_api_set_repl(zdb_repl *repl)
 }
 
 static bool api_replicate_config(void *ctx, const char *keyspace,
-                                 const char *id, const char *json,
-                                 const char *type_filter)
+                                 const char *id, const char *json)
 {
     zdb_repl *repl = ctx;
     cJSON *change = cJSON_CreateObject();
@@ -74,10 +180,6 @@ static bool api_replicate_config(void *ctx, const char *keyspace,
         }
         cJSON_AddItemToObject(change, "value", value);
         cJSON_AddNumberToObject(change, "ttl_abs", -1);
-        cJSON *filters = cJSON_AddArrayToObject(change, "filters");
-        if (filters && type_filter) {
-            cJSON_AddItemToArray(filters, cJSON_CreateString(type_filter));
-        }
     }
     char *encoded = cJSON_PrintUnformatted(change);
     cJSON_Delete(change);
@@ -91,171 +193,6 @@ static bool api_replicate_config(void *ctx, const char *keyspace,
 
 
 /* --- stage 5 replication handlers ----------------------------------- */
-
-/* Applies a replicated change document to the local engine. Used both
- * for peer REPL frames (dispatcher) and for the local leg of fan-out. */
-static bool api_apply_change_impl(void *ud, const cJSON *change)
-{
-    (void)ud;
-    const cJSON *jop = cJSON_GetObjectItemCaseSensitive(change, "op");
-    const cJSON *jdb = cJSON_GetObjectItemCaseSensitive(change, "db");
-    const cJSON *jpart =
-        cJSON_GetObjectItemCaseSensitive(change, "partition");
-    const cJSON *jks =
-        cJSON_GetObjectItemCaseSensitive(change, "keyspace");
-    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(change, "id");
-    const cJSON *jts = cJSON_GetObjectItemCaseSensitive(change, "ts");
-    const cJSON *jorigin =
-        cJSON_GetObjectItemCaseSensitive(change, "origin");
-    const char *origin = cJSON_IsString(jorigin) && jorigin->valuestring
-                             ? jorigin->valuestring
-                             : "";
-
-    if (!cJSON_IsString(jop) || !cJSON_IsString(jdb) ||
-        !cJSON_IsString(jpart) || !cJSON_IsString(jks) ||
-        !cJSON_IsString(jid) || !cJSON_IsNumber(jts)) {
-        return false;
-    }
-    long long ts = (long long)jts->valuedouble;
-
-    const char **filters = NULL;
-    size_t nfilters = 0;
-    const cJSON *jfilters =
-        cJSON_GetObjectItemCaseSensitive(change, "filters");
-    if (cJSON_IsArray(jfilters)) {
-        int n = cJSON_GetArraySize(jfilters);
-        filters = malloc((size_t)n * sizeof(char *));
-        if (filters) {
-            const cJSON *f = NULL;
-            cJSON_ArrayForEach(f, jfilters) {
-                if (cJSON_IsString(f) && f->valuestring) {
-                    filters[nfilters++] = f->valuestring;
-                }
-            }
-        }
-    }
-
-    bool ok;
-    if (strcmp(jop->valuestring, "put") == 0) {
-        const cJSON *jval =
-            cJSON_GetObjectItemCaseSensitive(change, "value");
-        const cJSON *jttl =
-            cJSON_GetObjectItemCaseSensitive(change, "ttl_abs");
-        if (!cJSON_IsObject(jval)) {
-            free(filters);
-            return false;
-        }
-        char *value_json = cJSON_PrintUnformatted(jval);
-        if (!value_json) {
-            free(filters);
-            return false;
-        }
-        long long ttl_abs = cJSON_IsNumber(jttl)
-                                ? (long long)jttl->valuedouble
-                                : -1;
-        ok = zdb_replica_put_origin(g_ctx.engine, jpart->valuestring,
-                                    jks->valuestring, jid->valuestring,
-                                    value_json, ttl_abs, ts, origin, filters,
-                                    nfilters);
-        free(value_json);
-
-        /* transparent partition registration on replicas too */
-        if (ok && strcmp(jdb->valuestring, ZDB_SYSTEM_DB) != 0) {
-            zdb_partition_ensure(g_ctx.config, jdb->valuestring,
-                                 jpart->valuestring, jks->valuestring,
-                                 NULL);
-        }
-    } else if (strcmp(jop->valuestring, "delete") == 0) {
-        ok = zdb_replica_delete_origin(g_ctx.engine, jpart->valuestring,
-                                       jks->valuestring, jid->valuestring, ts,
-                                       origin);
-    } else {
-        ok = false;
-    }
-    free(filters);
-    return ok;
-}
-
-/* Answers a quorum read request from a peer against the local engine. */
-static cJSON *api_read_request(void *ud, const cJSON *request)
-{
-    (void)ud;
-    const cJSON *jq = cJSON_GetObjectItemCaseSensitive(request, "q");
-    const cJSON *jpart =
-        cJSON_GetObjectItemCaseSensitive(request, "partition");
-    const cJSON *jks =
-        cJSON_GetObjectItemCaseSensitive(request, "keyspace");
-    if (!cJSON_IsString(jq) || !cJSON_IsString(jpart) ||
-        !cJSON_IsString(jks)) {
-        return NULL;
-    }
-    const char *part = jpart->valuestring;
-    const char *ks = jks->valuestring;
-
-    size_t nfilters = 0;
-    size_t nfields = 0;
-    char **filters = strings_from_json(
-        cJSON_GetObjectItemCaseSensitive(request, "filters"), &nfilters);
-    char **fields = strings_from_json(
-        cJSON_GetObjectItemCaseSensitive(request, "fields"), &nfields);
-
-    cJSON *out = cJSON_CreateObject();
-    if (!out) {
-        free_collected(filters, nfilters);
-        free_collected(fields, nfields);
-        return NULL;
-    }
-
-    if (strcmp(jq->valuestring, "get") == 0) {
-        const cJSON *jid =
-            cJSON_GetObjectItemCaseSensitive(request, "id");
-        long long ts = 0;
-        cJSON *doc = cJSON_IsString(jid) && jid->valuestring
-                         ? zdb_get_ts(g_ctx.engine, part, ks,
-                                      jid->valuestring, &ts)
-                         : NULL;
-        if (doc) {
-            cJSON *row = cJSON_CreateObject();
-            const cJSON *idstr =
-                cJSON_GetObjectItemCaseSensitive(request, "id");
-            cJSON_AddStringToObject(row, "id", idstr->valuestring);
-            cJSON_AddNumberToObject(row, "timestamp", (double)ts);
-            cJSON_AddItemToObject(row, "value", doc);
-            cJSON_AddItemToObject(out, "row", row);
-        } else {
-            cJSON_AddNullToObject(out, "row");
-        }
-    } else if (strcmp(jq->valuestring, "all_ts") == 0 ||
-               strcmp(jq->valuestring, "query_ts") == 0) {
-        cJSON *rows =
-            jq->valuestring[0] == 'a'
-                ? zdb_all_ts(g_ctx.engine, part, ks,
-                             (const char **)filters, nfilters)
-                : zdb_query_ts(g_ctx.engine, part, ks,
-                               (const char **)filters, nfilters,
-                               (const char **)fields, nfields);
-        if (!rows) {
-            rows = cJSON_CreateArray();
-        }
-        cJSON_AddItemToObject(out, "rows", rows);
-    } else if (strcmp(jq->valuestring, "ids") == 0) {
-        size_t n = 0;
-        char **ids = zdb_ids(g_ctx.engine, part, ks,
-                             (const char **)filters, nfilters, &n);
-        cJSON *arr = cJSON_AddArrayToObject(out, "ids");
-        for (size_t i = 0; arr && ids && i < n; i++) {
-            cJSON_AddItemToArray(arr, cJSON_CreateString(ids[i]));
-        }
-        zdb_free_strings(ids);
-    } else {
-        cJSON_Delete(out);
-        out = NULL;
-    }
-
-    free_collected(filters, nfilters);
-    free_collected(fields, nfields);
-    return out;
-}
 
 static void respond_json(zdb_http_response *res, int status, cJSON *obj)
 {
@@ -338,94 +275,6 @@ static bool query_param(const zdb_http_request *req, const char *name,
     }
     out[0] = '\0';
     return false;
-}
-
-/* Collects repeated ?filter=key=value params into a malloc'd array. */
-static char **collect_params(const zdb_http_request *req, const char *name,
-                             size_t *count_out)
-{
-    *count_out = 0;
-    size_t cap = 8;
-    char **arr = malloc(cap * sizeof(char *));
-    if (!arr) {
-        return NULL;
-    }
-    size_t name_len = strlen(name);
-    const char *q = req->query;
-    while (q && *q) {
-        const char *amp = strchr(q, '&');
-        size_t seg_len = amp ? (size_t)(amp - q) : strlen(q);
-        if (seg_len > name_len + 1 && strncmp(q, name, name_len) == 0 &&
-            q[name_len] == '=') {
-            if (*count_out == cap) {
-                cap *= 2;
-                char **grown = realloc(arr, cap * sizeof(char *));
-                if (!grown) {
-                    goto fail;
-                }
-                arr = grown;
-            }
-            char *val = malloc(seg_len - name_len);   /* name + '=' removed */
-            if (!val) {
-                goto fail;
-            }
-            memcpy(val, q + name_len + 1, seg_len - name_len - 1);
-            val[seg_len - name_len - 1] = '\0';
-            arr[(*count_out)++] = val;
-        }
-        q = amp ? amp + 1 : NULL;
-    }
-    if (*count_out == 0) {
-        free(arr);
-        return NULL;
-    }
-    return arr;
-fail:
-    for (size_t i = 0; i < *count_out; i++) {
-        free(arr[i]);
-    }
-    free(arr);
-    *count_out = 0;
-    return NULL;
-}
-
-static void free_collected(char **arr, size_t count)
-{
-    if (!arr) {
-        return;
-    }
-    for (size_t i = 0; i < count; i++) {
-        free(arr[i]);
-    }
-    free(arr);
-}
-
-/* Copies a JSON array of strings into a malloc'd char* array. */
-static char **strings_from_json(const cJSON *arr, size_t *count_out)
-{
-    *count_out = 0;
-    if (!cJSON_IsArray(arr)) {
-        return NULL;
-    }
-    int n = cJSON_GetArraySize(arr);
-    if (n <= 0) {
-        return NULL;
-    }
-    char **out = calloc((size_t)n, sizeof(char *));
-    if (!out) {
-        return NULL;
-    }
-    const cJSON *i = NULL;
-    cJSON_ArrayForEach(i, arr) {
-        if (cJSON_IsString(i) && i->valuestring) {
-            out[(*count_out)++] = strdup(i->valuestring);
-        }
-    }
-    if (*count_out == 0) {
-        free(out);
-        return NULL;
-    }
-    return out;
 }
 
 /* --- stage 5 replication handlers ----------------------------------- */
@@ -572,6 +421,10 @@ static bool handle_data_put(const zdb_http_request *req,
                       "expected /data/{db}/{partition}/{keyspace}/{id}");
         return true;
     }
+    if (strstr(req->query, "filter=")) {
+        respond_error(res, 400, "filters apply to reads, not stored records");
+        return true;
+    }
 
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
@@ -598,9 +451,6 @@ static bool handle_data_put(const zdb_http_request *req,
     if (query_param(req, "ttl", ttlbuf, sizeof(ttlbuf))) {
         ttl = strtoll(ttlbuf, NULL, 10);
     }
-    size_t nfilters = 0;
-    char **filters = collect_params(req, "filter", &nfilters);
-
     pthread_mutex_lock(&g_data_put_lock);
     cJSON *existing = zdb_get(g_ctx.engine, part, ks, id);
     zdb_permission permission = existing ? ZDB_PERM_UPDATE : ZDB_PERM_CREATE;
@@ -608,7 +458,6 @@ static bool handle_data_put(const zdb_http_request *req,
     if (!authorize_partition(g_ctx.config, db, part, groups, permission, res)) {
         pthread_mutex_unlock(&g_data_put_lock);
         free(json);
-        free_collected(filters, nfilters);
         return true;
     }
 
@@ -626,11 +475,6 @@ static bool handle_data_put(const zdb_http_request *req,
             cJSON_AddNumberToObject(change, "ttl_abs",
                                     ttl >= 0 ? (double)(ts + ttl) : -1);
             cJSON_AddNumberToObject(change, "ts", (double)ts);
-            cJSON *filter_array = cJSON_AddArrayToObject(change, "filters");
-            for (size_t i = 0; filter_array && i < nfilters; i++) {
-                cJSON_AddItemToArray(filter_array,
-                                     cJSON_CreateString(filters[i]));
-            }
             char *change_json = cJSON_PrintUnformatted(change);
             cJSON_Delete(change);
             if (change_json) {
@@ -640,7 +484,6 @@ static bool handle_data_put(const zdb_http_request *req,
                 if (status == ZDB_REPL_QUORUM_LOST) {
                     pthread_mutex_unlock(&g_data_put_lock);
                     free(json);
-                    free_collected(filters, nfilters);
                     respond_error(res, 503,
                                   "quorum unavailable: write rejected");
                     return true;
@@ -649,15 +492,13 @@ static bool handle_data_put(const zdb_http_request *req,
             }
         }
     } else {
-        ok = zdb_put(g_ctx.engine, part, ks, id, json, ttl,
-                     (const char **)filters, nfilters);
+        ok = zdb_put(g_ctx.engine, part, ks, id, json, ttl);
     }
     if (ok) {
         zdb_partition_ensure(g_ctx.config, db, part, ks, NULL);
     }
     pthread_mutex_unlock(&g_data_put_lock);
     free(json);
-    free_collected(filters, nfilters);
 
     if (!ok) {
         respond_error(res, 500, "storage failed");
@@ -771,46 +612,27 @@ static bool handle_data_delete(const zdb_http_request *req,
     return true;
 }
 
-/* POST body may carry {"fields":{"k":"v",...}} narrowing the result set
- * beyond any ?filter= params (which use the indexed filter path).
- * Also handles GET .../all|ids (no body) for convenience. */
+/* Collection reads accept structured JSON filters in POST bodies and
+ * unfiltered GET requests for convenience. */
 static bool handle_data_collect(const zdb_http_request *req,
                                 zdb_http_response *res)
 {
     char db[128], part[256], ks[128];
-    const char *p = req->path;
-    if (sscanf(p, "/data/%127[^/]/%255[^/]/%127[^/]", db, part, ks) != 3) {
+    const char *path = req->path;
+    if (sscanf(path, "/data/%127[^/]/%255[^/]/%127[^/]", db, part, ks) != 3) {
         respond_error(res, 400,
                       "expected /data/{db}/{partition}/{keyspace}/<op>");
         return true;
     }
-    const char *op = strrchr(p, '/');
-    op = op ? op + 1 : "";
-
-    /* id lookup (GET .../{keyspace}/{id}, 4 segments) falls through to
-     * handle_data_get; collection ops are .../keyspace/all|ids|query */
-    bool is_op = strcmp(op, "ids") == 0 || strcmp(op, "all") == 0 ||
-                 strcmp(op, "query") == 0;
-    if (!is_op) {
-        if (strcmp(req->method, "GET") != 0) {
-            respond_error(res, 404, "unknown operation");
-            return true;
-        }
-        /* count segments: /data + db/partition/keyspace[/id] */
-        int slashes = 0;
-        for (const char *c = p; *c; c++) {
-            if (*c == '/') {
-                slashes++;
-            }
-        }
-        if (slashes < 4) {
-            /* /data/db/partition/keyspace has exactly 4 slashes; anything
-             * less is malformed */
-            respond_error(res, 400,
-                          "expected id: /data/{db}/{partition}/{keyspace}/{id}");
-            return true;
-        }
-        return handle_data_get(req, res);
+    const char *operation = strrchr(path, '/');
+    operation = operation ? operation + 1 : "";
+    bool collection = strcmp(operation, "ids") == 0 ||
+                      strcmp(operation, "all") == 0 ||
+                      strcmp(operation, "query") == 0;
+    if (!collection) {
+        return strcmp(req->method, "GET") == 0
+                   ? handle_data_get(req, res)
+                   : (respond_error(res, 404, "unknown operation"), true);
     }
 
     bool auth_ok = false;
@@ -824,81 +646,58 @@ static bool handle_data_collect(const zdb_http_request *req,
         return true;
     }
 
-    size_t nfilters = 0;
-    char **filters = collect_params(req, "filter", &nfilters);
-
-    size_t nfields = 0;
-    char **fields = NULL;
     cJSON *body = NULL;
-    if (body_json(req, &body)) {
-        const cJSON *f = cJSON_GetObjectItemCaseSensitive(body, "fields");
-        if (cJSON_IsObject(f)) {
-            int count = cJSON_GetArraySize(f);
-            fields = malloc((size_t)count * sizeof(char *));
-            if (fields) {
-                const cJSON *item = NULL;
-                cJSON_ArrayForEach(item, f) {
-                    if (!cJSON_IsString(item)) {
-                        continue;
-                    }
-                    size_t need = strlen(item->string) +
-                                  strlen(item->valuestring) + 2;
-                    fields[nfields] = malloc(need);
-                    if (!fields[nfields]) {
-                        continue;
-                    }
-                    snprintf(fields[nfields], need, "%s=%s", item->string,
-                             item->valuestring);
-                    nfields++;
-                }
-            }
+    const cJSON *filters = NULL;
+    if (req->body_len > 0) {
+        if (!body_json(req, &body)) {
+            respond_error(res, 400, "body must be valid JSON");
+            return true;
         }
+        const cJSON *wrapped = cJSON_IsObject(body)
+                                   ? cJSON_GetObjectItemCaseSensitive(body,
+                                                                      "filters")
+                                   : NULL;
+        filters = wrapped ? wrapped : body;
+        if (!zdb_filters_valid(filters)) {
+            cJSON_Delete(body);
+            respond_error(res, 400, "invalid JSON filter");
+            return true;
+        }
+    }
+    if (strstr(req->query, "filter=") || strstr(req->query, "field=")) {
         cJSON_Delete(body);
+        respond_error(res, 400, "use structured JSON filters in the body");
+        return true;
     }
 
-    if (strcmp(op, "ids") == 0) {
-        size_t n = 0;
-        char **ids =
-            g_repl
-                ? zdb_repl_read_ids(g_repl, db, part, ks,
-                                    (const char **)filters, nfilters, &n)
-                : zdb_ids(g_ctx.engine, part, ks,
-                          (const char **)filters, nfilters, &n);
-        cJSON *arr = cJSON_CreateArray();
-        for (size_t i = 0; ids && i < n; i++) {
-            cJSON_AddItemToArray(arr, cJSON_CreateString(ids[i]));
+    if (strcmp(operation, "ids") == 0) {
+        size_t count = 0;
+        char **ids = g_repl
+                         ? zdb_repl_read_ids(g_repl, db, part, ks, filters,
+                                             &count)
+                         : zdb_ids(g_ctx.engine, part, ks, filters, &count);
+        cJSON *array = cJSON_CreateArray();
+        for (size_t i = 0; array && ids && i < count; i++) {
+            cJSON_AddItemToArray(array, cJSON_CreateString(ids[i]));
         }
         zdb_free_strings(ids);
-        respond_json(res, 200, arr);
-    } else if (strcmp(op, "all") == 0) {
-        cJSON *docs =
-            g_repl
-                ? zdb_repl_read_all(g_repl, db, part, ks,
-                                    (const char **)filters, nfilters)
-                : zdb_all(g_ctx.engine, part, ks,
-                          (const char **)filters, nfilters);
-        respond_json(res, 200, docs ? docs : cJSON_CreateArray());
-    } else if (strcmp(op, "query") == 0) {
-        cJSON *docs =
-            g_repl
-                ? zdb_repl_read_query(g_repl, db, part, ks,
-                                      (const char **)filters, nfilters,
-                                      (const char **)fields, nfields)
-                : zdb_query(g_ctx.engine, part, ks,
-                            (const char **)filters, nfilters,
-                            (const char **)fields, nfields);
-        respond_json(res, 200, docs ? docs : cJSON_CreateArray());
+        respond_json(res, 200, array);
     } else {
-        respond_error(res, 404, "unknown operation");
-    }
-
-    free_collected(filters, nfilters);
-    if (fields) {
-        for (size_t i = 0; i < nfields; i++) {
-            free(fields[i]);
+        cJSON *documents;
+        if (g_repl) {
+            documents = strcmp(operation, "all") == 0
+                            ? zdb_repl_read_all(g_repl, db, part, ks, filters)
+                            : zdb_repl_read_query(g_repl, db, part, ks,
+                                                  filters);
+        } else {
+            documents = strcmp(operation, "all") == 0
+                            ? zdb_all(g_ctx.engine, part, ks, filters)
+                            : zdb_query(g_ctx.engine, part, ks, filters);
         }
-        free(fields);
+        respond_json(res, 200,
+                     documents ? documents : cJSON_CreateArray());
     }
+    cJSON_Delete(body);
     return true;
 }
 

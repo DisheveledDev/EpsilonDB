@@ -6,8 +6,6 @@
 #include <string.h>
 #include <time.h>
 
-#include "md5.h"
-
 #define ZDB_BUSY_TIMEOUT_MS 5000
 
 static int64_t now_epoch(void)
@@ -48,52 +46,136 @@ static sqlite3_stmt *stmt_for(zdb_shard *sh, const char *sql)
     return stmt;
 }
 
-/* Builds the shared filter clause:
- *   AND id IN (SELECT id FROM DataFilter WHERE filter_hash IN (...)
- *              GROUP BY id HAVING COUNT(DISTINCT filter_hash) = ?)
- * Returns a malloc'd SQL fragment (or NULL when nfilters == 0) and fills
- * hash_out (array of nfilters 33-byte buffers) with the md5 hashes. */
-static char *build_filter_clause(const char **filters, size_t nfilters,
-                                 char (*hash_out)[33])
+static size_t filter_count(const cJSON *filters)
 {
-    if (nfilters == 0) {
-        return NULL;
+    if (!filters) {
+        return 0;
     }
-    if (nfilters > (SIZE_MAX - 129) / 2) {
-        return NULL;
-    }
-    size_t cap = 1;
-    for (size_t i = 0; i < nfilters; i++) {
-        zdb_md5_hex(filters[i], strlen(filters[i]), hash_out[i]);
-        cap += strlen("?,") + 1;
-    }
-    char *clause = malloc(cap + 128);
-    if (!clause) {
-        return NULL;
-    }
-    strcpy(clause, " AND id IN (SELECT id FROM DataFilter WHERE filter_hash IN (");
-    size_t pos = strlen(clause);
-    for (size_t i = 0; i < nfilters; i++) {
-        clause[pos++] = '?';
-        if (i + 1 < nfilters) {
-            clause[pos++] = ',';
-        }
-    }
-    pos += (size_t)snprintf(clause + pos, cap + 128 - pos,
-                            ") GROUP BY id HAVING COUNT(DISTINCT filter_hash)"
-                            " = ?)");
-    return clause;
+    return cJSON_IsArray(filters) ? (size_t)cJSON_GetArraySize(filters) : 1;
 }
 
-static void bind_hashes(sqlite3_stmt *stmt, char (*hashes)[33],
-                        size_t nfilters, int start_index)
+static const cJSON *filter_at(const cJSON *filters, size_t index)
 {
-    for (size_t i = 0; i < nfilters; i++) {
-        sqlite3_bind_text(stmt, (int)(start_index + i), hashes[i], -1,
-                          SQLITE_STATIC);
+    return cJSON_IsArray(filters)
+               ? cJSON_GetArrayItem(filters, (int)index)
+               : (index == 0 ? filters : NULL);
+}
+
+static bool filter_operator_valid(const char *operator_name)
+{
+    return operator_name &&
+           (strcmp(operator_name, "eq") == 0 ||
+            strcmp(operator_name, "ne") == 0 ||
+            strcmp(operator_name, "gt") == 0 ||
+            strcmp(operator_name, "gte") == 0 ||
+            strcmp(operator_name, "lt") == 0 ||
+            strcmp(operator_name, "lte") == 0);
+}
+
+static bool filter_key_valid(const char *key)
+{
+    if (!key || !*key || strlen(key) > 512 || key[0] == '.' ||
+        key[strlen(key) - 1] == '.') {
+        return false;
     }
-    sqlite3_bind_int64(stmt, (int)(start_index + nfilters),
-                       (sqlite3_int64)nfilters);
+    bool segment = false;
+    for (const unsigned char *c = (const unsigned char *)key; *c; c++) {
+        if (*c == '.') {
+            if (!segment) {
+                return false;
+            }
+            segment = false;
+        } else {
+            if (*c < 0x20) {
+                return false;
+            }
+            segment = true;
+        }
+    }
+    return segment;
+}
+
+static bool filter_valid(const cJSON *filter)
+{
+    if (!cJSON_IsObject(filter)) {
+        return false;
+    }
+    const cJSON *key = cJSON_GetObjectItemCaseSensitive(filter, "key");
+    const cJSON *operator_item =
+        cJSON_GetObjectItemCaseSensitive(filter, "operator");
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(filter, "value");
+    if (!cJSON_IsString(key) || !filter_key_valid(key->valuestring) ||
+        !cJSON_IsString(operator_item) ||
+        !filter_operator_valid(operator_item->valuestring) || !value) {
+        return false;
+    }
+    if (strcmp(operator_item->valuestring, "eq") != 0 &&
+        strcmp(operator_item->valuestring, "ne") != 0 &&
+        !cJSON_IsNumber(value)) {
+        return false;
+    }
+    return true;
+}
+
+bool zdb_filters_valid(const cJSON *filters)
+{
+    if (!filters) {
+        return true;
+    }
+    if (!cJSON_IsArray(filters) && !cJSON_IsObject(filters)) {
+        return false;
+    }
+    size_t count = filter_count(filters);
+    for (size_t i = 0; i < count; i++) {
+        if (!filter_valid(filter_at(filters, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *json_path_for_key(const char *key)
+{
+    size_t length = strlen(key);
+    if (length > (SIZE_MAX - 4) / 2) {
+        return NULL;
+    }
+    char *path = malloc(length * 2 + 4);
+    if (!path) {
+        return NULL;
+    }
+    size_t position = 0;
+    path[position++] = '$';
+    const char *segment = key;
+    for (;;) {
+        const char *dot = strchr(segment, '.');
+        size_t segment_length = dot ? (size_t)(dot - segment) : strlen(segment);
+        path[position++] = '.';
+        path[position++] = '"';
+        for (size_t i = 0; i < segment_length; i++) {
+            if (segment[i] == '"' || segment[i] == '\\') {
+                path[position++] = '\\';
+            }
+            path[position++] = segment[i];
+        }
+        path[position++] = '"';
+        if (!dot) {
+            break;
+        }
+        segment = dot + 1;
+    }
+    path[position] = '\0';
+    return path;
+}
+
+static const char *sql_operator(const char *operator_name)
+{
+    if (strcmp(operator_name, "eq") == 0) return "=";
+    if (strcmp(operator_name, "ne") == 0) return "<>";
+    if (strcmp(operator_name, "gt") == 0) return ">";
+    if (strcmp(operator_name, "gte") == 0) return ">=";
+    if (strcmp(operator_name, "lt") == 0) return "<";
+    return "<=";
 }
 
 zdb_shard *zdb_shard_open(const char *path, const char *key)
@@ -142,17 +224,10 @@ zdb_shard *zdb_shard_open(const char *path, const char *key)
                      " timestamp INT,"
                      " model TEXT,"
                      " version INTEGER,"
-                     " filter TEXT,"
                      " origin TEXT"
                      ");"
-                     "CREATE TABLE IF NOT EXISTS DataFilter ("
-                     " id TEXT NOT NULL,"
-                     " filter_hash TEXT NOT NULL,"
-                     " PRIMARY KEY (id, filter_hash)"
-                     ");"
                      "CREATE INDEX IF NOT EXISTS idx_ttl ON Data (ttl);"
-                     "CREATE INDEX IF NOT EXISTS idx_filter_lookup"
-                     " ON DataFilter (filter_hash);",
+                     "DROP TABLE IF EXISTS DataFilter;",
                      NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "zdb: shard %s: schema failed: %s\n", sh->key,
                 err ? err : "?");
@@ -199,110 +274,32 @@ void zdb_shard_free(zdb_shard *sh)
 
 /* Core write path. Assumes sh->lock held. ttl_absolute is an epoch
  * expiry or -1 for none; timestamp is stored verbatim as last-modified.
- * Replaces any existing row and rebuilds its filter index. */
+ * Replaces any existing row. */
 static bool do_put_locked(zdb_shard *sh, const char *id,
                           const char *json_value, long long ttl_absolute,
-                          long long timestamp, const char *origin,
-                          const char **filters, size_t nfilters)
+                          long long timestamp, const char *origin)
 {
-    char *err = NULL;
-    if (sqlite3_exec(sh->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "zdb: shard %s: begin failed: %s\n", sh->key,
-                err ? err : "?");
-        sqlite3_free(err);
-        return false;
-    }
-
-    bool ok = false;
     sqlite3_stmt *stmt = stmt_for(
         sh, "INSERT OR REPLACE INTO Data"
-            " (id, value, ttl, timestamp, filter, origin)"
-            " VALUES (?, ?, ?, ?, ?, ?)");
-    if (stmt) {
-        sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, json_value, -1, SQLITE_TRANSIENT);
-        if (ttl_absolute >= 0) {
-            sqlite3_bind_int64(stmt, 3, ttl_absolute);
-        } else {
-            sqlite3_bind_null(stmt, 3);
-        }
-        sqlite3_bind_int64(stmt, 4, timestamp);
-
-        char (*hashes)[33] =
-            nfilters > 0 && nfilters <= SIZE_MAX / sizeof(*hashes)
-                ? malloc(nfilters * sizeof(*hashes))
-                : NULL;
-        char *filter_col_dyn = NULL;
-        if (nfilters > 0 && hashes) {
-            size_t filter_len = nfilters * 33;
-            filter_col_dyn = malloc(filter_len);
-            if (filter_col_dyn) {
-                filter_col_dyn[0] = '\0';
-                for (size_t i = 0; i < nfilters; i++) {
-                    zdb_md5_hex(filters[i], strlen(filters[i]), hashes[i]);
-                    if (i > 0) {
-                        strcat(filter_col_dyn, ",");
-                    }
-                    strcat(filter_col_dyn, hashes[i]);
-                }
-            }
-        }
-        if (nfilters == 0 || (hashes && filter_col_dyn)) {
-            sqlite3_bind_text(stmt, 5, filter_col_dyn ? filter_col_dyn : "",
-                              -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 6, origin ? origin : "", -1,
-                              SQLITE_TRANSIENT);
-            ok = sqlite3_step(stmt) == SQLITE_DONE;
-            if (!ok) {
-                log_sqlite(sh, "put");
-            }
-        }
-        free(hashes);
-        free(filter_col_dyn);
+            " (id, value, ttl, timestamp, model, version, origin)"
+            " VALUES (?, ?, ?, ?, NULL, NULL, ?)");
+    if (!stmt) {
+        return false;
     }
-
-    if (ok) {
-        stmt = stmt_for(sh, "DELETE FROM DataFilter WHERE id = ?");
-        if (stmt) {
-            sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
-            ok = (sqlite3_step(stmt) == SQLITE_DONE);
-            if (!ok) {
-                log_sqlite(sh, "put: clear filters");
-            }
-        } else {
-            ok = false;
-        }
-    }
-
-    if (ok) {
-        stmt = stmt_for(sh, "INSERT INTO DataFilter (id, filter_hash)"
-                            " VALUES (?, ?)");
-        for (size_t i = 0; ok && i < nfilters; i++) {
-            char hash[33];
-            zdb_md5_hex(filters[i], strlen(filters[i]), hash);
-            sqlite3_reset(stmt);
-            sqlite3_clear_bindings(stmt);
-            sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, hash, -1, SQLITE_STATIC);
-            if (sqlite3_step(stmt) != SQLITE_DONE) {
-                log_sqlite(sh, "put: filter index");
-                ok = false;
-            }
-        }
-    }
-
-    err = NULL;
-    if (ok) {
-        ok = (sqlite3_exec(sh->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK);
-        if (!ok) {
-            fprintf(stderr, "zdb: shard %s: commit failed: %s\n", sh->key,
-                    err ? err : "?");
-        }
+    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, json_value, -1, SQLITE_TRANSIENT);
+    if (ttl_absolute >= 0) {
+        sqlite3_bind_int64(stmt, 3, ttl_absolute);
     } else {
-        sqlite3_exec(sh->db, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_bind_null(stmt, 3);
     }
-    sqlite3_free(err);
-    return ok;
+    sqlite3_bind_int64(stmt, 4, timestamp);
+    sqlite3_bind_text(stmt, 5, origin ? origin : "", -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        log_sqlite(sh, "put");
+        return false;
+    }
+    return true;
 }
 
 /* Current stored timestamp for id (any row, including soft-deleted).
@@ -327,29 +324,24 @@ static bool stored_version_locked(zdb_shard *sh, const char *id,
 }
 
 bool zdb_shard_put(zdb_shard *sh, const char *id, const char *json_value,
-                   long long ttl_seconds, const char **filters,
-                   size_t nfilters)
+                   long long ttl_seconds)
 {
     pthread_mutex_lock(&sh->lock);
-
-    char filter_col[1] = "";
-    (void)filter_col;
-
     int64_t now = now_epoch();
-    long long abs_ttl = ttl_seconds >= 0 ? (long long)now + ttl_seconds : -1;
-    bool ok = do_put_locked(sh, id, json_value, abs_ttl, (long long)now,
-                            "", filters, nfilters);
+    long long absolute_ttl = ttl_seconds >= 0
+                                 ? (long long)now + ttl_seconds
+                                 : -1;
+    bool ok = do_put_locked(sh, id, json_value, absolute_ttl,
+                            (long long)now, "");
     pthread_mutex_unlock(&sh->lock);
     return ok;
 }
 
 bool zdb_shard_replica_put(zdb_shard *sh, const char *id,
                            const char *json_value, long long ttl_absolute,
-                           long long timestamp, const char *origin,
-                           const char **filters, size_t nfilters)
+                           long long timestamp, const char *origin)
 {
     pthread_mutex_lock(&sh->lock);
-
     long long stored_ts = 0;
     char stored_origin[64] = "";
     if (stored_version_locked(sh, id, &stored_ts, stored_origin) &&
@@ -359,9 +351,8 @@ bool zdb_shard_replica_put(zdb_shard *sh, const char *id,
         pthread_mutex_unlock(&sh->lock);
         return true;
     }
-
     bool ok = do_put_locked(sh, id, json_value, ttl_absolute, timestamp,
-                            origin, filters, nfilters);
+                            origin);
     pthread_mutex_unlock(&sh->lock);
     return ok;
 }
@@ -382,10 +373,11 @@ bool zdb_shard_replica_delete(zdb_shard *sh, const char *id,
     }
 
     sqlite3_stmt *stmt = stmt_for(
-        sh, "INSERT INTO Data (id,value,ttl,timestamp,filter,origin)"
-            " VALUES (?,NULL,?,?,'',?)"
+        sh, "INSERT INTO Data (id,value,ttl,timestamp,model,version,origin)"
+            " VALUES (?,NULL,?,?,NULL,NULL,?)"
             " ON CONFLICT(id) DO UPDATE SET value=NULL,ttl=excluded.ttl,"
-            " timestamp=excluded.timestamp,filter='',origin=excluded.origin");
+            " timestamp=excluded.timestamp,model=NULL,version=NULL,"
+            " origin=excluded.origin");
     bool ok = false;
     if (stmt) {
         sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
@@ -498,60 +490,126 @@ bool zdb_shard_delete(zdb_shard *sh, const char *id)
 }
 
 static sqlite3_stmt *prepare_live_query(zdb_shard *sh, const char *select,
-                                        const char **filters,
-                                        size_t nfilters,
-                                        char (*hashes)[33],
+                                        const cJSON *filters,
                                         bool order_by_timestamp)
 {
-    char *clause = build_filter_clause(filters, nfilters, hashes);
-    if (nfilters > 0 && !clause) {
+    if (!zdb_filters_valid(filters)) {
         return NULL;
     }
-    size_t len = strlen(select) + (clause ? strlen(clause) : 0) + 64;
-    char *sql = malloc(len);
+    size_t count = filter_count(filters);
+    if (count > (SIZE_MAX - strlen(select) - 96) / 256) {
+        return NULL;
+    }
+    size_t capacity = strlen(select) + count * 256 + 96;
+    char *sql = malloc(capacity);
     if (!sql) {
-        free(clause);
         return NULL;
     }
-    snprintf(sql, len, "%s (ttl IS NULL OR ttl >= ?)%s%s", select,
-             clause ? clause : "",
-             order_by_timestamp ? " ORDER BY timestamp ASC" : "");
+    size_t length = (size_t)snprintf(sql, capacity,
+                                     "%s (ttl IS NULL OR ttl >= ?)", select);
+    for (size_t i = 0; i < count; i++) {
+        const cJSON *filter = filter_at(filters, i);
+        const char *operator_name =
+            cJSON_GetObjectItemCaseSensitive(filter, "operator")->valuestring;
+        const char *fragment;
+        if (strcmp(operator_name, "eq") == 0) {
+            fragment = " AND json_type(value, ?) IS json_type(?, '$')"
+                       " AND json_extract(value, ?) IS json_extract(?, '$')";
+        } else if (strcmp(operator_name, "ne") == 0) {
+            fragment = " AND json_type(value, ?) IS NOT NULL"
+                       " AND (json_type(value, ?) IS NOT json_type(?, '$')"
+                       " OR json_extract(value, ?) IS NOT json_extract(?, '$'))";
+        } else {
+            char comparison[160];
+            snprintf(comparison, sizeof(comparison),
+                     " AND json_type(value, ?) IN ('integer','real')"
+                     " AND json_extract(value, ?) %s json_extract(?, '$')",
+                     sql_operator(operator_name));
+            size_t needed = strlen(comparison);
+            if (needed >= capacity - length) {
+                free(sql);
+                return NULL;
+            }
+            memcpy(sql + length, comparison, needed + 1);
+            length += needed;
+            continue;
+        }
+        size_t needed = strlen(fragment);
+        if (needed >= capacity - length) {
+            free(sql);
+            return NULL;
+        }
+        memcpy(sql + length, fragment, needed + 1);
+        length += needed;
+    }
+    if (order_by_timestamp) {
+        snprintf(sql + length, capacity - length, " ORDER BY timestamp ASC");
+    }
+
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(sh->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        log_sqlite(sh, "prepare query");
-        stmt = NULL;
+        log_sqlite(sh, "prepare JSON filter query");
+        free(sql);
+        return NULL;
     }
     free(sql);
-    free(clause);
+    sqlite3_bind_int64(stmt, 1, now_epoch());
+    int parameter = 2;
+    for (size_t i = 0; i < count; i++) {
+        const cJSON *filter = filter_at(filters, i);
+        const cJSON *key = cJSON_GetObjectItemCaseSensitive(filter, "key");
+        const cJSON *operator_item =
+            cJSON_GetObjectItemCaseSensitive(filter, "operator");
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(filter, "value");
+        char *path = json_path_for_key(key->valuestring);
+        char *encoded_value = cJSON_PrintUnformatted(value);
+        if (!path || !encoded_value) {
+            free(path);
+            free(encoded_value);
+            sqlite3_finalize(stmt);
+            return NULL;
+        }
+        if (strcmp(operator_item->valuestring, "eq") == 0) {
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, encoded_value, -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, encoded_value, -1,
+                              SQLITE_TRANSIENT);
+        } else if (strcmp(operator_item->valuestring, "ne") == 0) {
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, encoded_value, -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, encoded_value, -1,
+                              SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, path, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, parameter++, encoded_value, -1,
+                              SQLITE_TRANSIENT);
+        }
+        free(path);
+        free(encoded_value);
+    }
     return stmt;
 }
 
-char **zdb_shard_ids(zdb_shard *sh, const char **filters, size_t nfilters,
+char **zdb_shard_ids(zdb_shard *sh, const cJSON *filters,
                      size_t *count_out)
 {
     *count_out = 0;
     char **results = NULL;
     size_t count = 0;
     size_t capacity = 0;
-    char (*hashes)[33] =
-        nfilters > 0 && nfilters <= SIZE_MAX / sizeof(*hashes)
-            ? malloc(nfilters * sizeof(*hashes))
-            : NULL;
-    if (nfilters > 0 && !hashes) {
-        return NULL;
-    }
-
     pthread_mutex_lock(&sh->lock);
     sqlite3_stmt *stmt = prepare_live_query(sh, "SELECT id FROM Data WHERE",
-                                            filters, nfilters, hashes, true);
+                                            filters, true);
     if (!stmt) {
         pthread_mutex_unlock(&sh->lock);
-        free(hashes);
         return NULL;
     }
-    sqlite3_bind_int64(stmt, 1, now_epoch());
-    bind_hashes(stmt, hashes, nfilters, 2);
-
     bool ok = true;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         if (count == capacity) {
@@ -564,30 +622,24 @@ char **zdb_shard_ids(zdb_shard *sh, const char **filters, size_t nfilters,
             results = grown;
             capacity = new_capacity;
         }
-        const unsigned char *id = sqlite3_column_text(stmt, 0);
-        char *copy = id ? strdup((const char *)id) : NULL;
-        if (!copy) {
+        const char *id = (const char *)sqlite3_column_text(stmt, 0);
+        results[count] = id ? strdup(id) : NULL;
+        if (!results[count]) {
             ok = false;
             break;
         }
-        results[count++] = copy;
+        count++;
     }
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&sh->lock);
-    free(hashes);
-
     if (!ok) {
-        for (size_t i = 0; i < count; i++) {
-            free(results[i]);
-        }
+        for (size_t i = 0; i < count; i++) free(results[i]);
         free(results);
         return NULL;
     }
     char **terminated = realloc(results, (count + 1) * sizeof(char *));
     if (!terminated) {
-        for (size_t i = 0; i < count; i++) {
-            free(results[i]);
-        }
+        for (size_t i = 0; i < count; i++) free(results[i]);
         free(results);
         return NULL;
     }
@@ -598,128 +650,70 @@ char **zdb_shard_ids(zdb_shard *sh, const char **filters, size_t nfilters,
 
 /* meta=true returns [{"id":..,"timestamp":..,"value":..}, ...] for
  * replica merging instead of a plain array of values. */
-static cJSON *collect_values(zdb_shard *sh, const char **filters,
-                             size_t nfilters, const char **fields,
-                             size_t nfields, bool meta)
+static cJSON *collect_values(zdb_shard *sh, const cJSON *filters, bool meta)
 {
     cJSON *array = cJSON_CreateArray();
     if (!array) {
         return NULL;
     }
-    char (*hashes)[33] =
-        nfilters > 0 && nfilters <= SIZE_MAX / sizeof(*hashes)
-            ? malloc(nfilters * sizeof(*hashes))
-            : NULL;
-    if (nfilters > 0 && !hashes) {
-        cJSON_Delete(array);
-        return NULL;
-    }
-
     pthread_mutex_lock(&sh->lock);
-    sqlite3_stmt *stmt =
-        prepare_live_query(sh,
-                           meta ? "SELECT id, value, timestamp FROM Data WHERE"
-                                : "SELECT value FROM Data WHERE",
-                           filters, nfilters, hashes, false);
+    sqlite3_stmt *stmt = prepare_live_query(
+        sh, meta ? "SELECT id, value, timestamp FROM Data WHERE"
+                 : "SELECT value FROM Data WHERE",
+        filters, false);
     if (!stmt) {
         pthread_mutex_unlock(&sh->lock);
-        free(hashes);
         cJSON_Delete(array);
         return NULL;
     }
-    sqlite3_bind_int64(stmt, 1, now_epoch());
-    bind_hashes(stmt, hashes, nfilters, 2);
-
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *json = (const char *)sqlite3_column_blob(stmt, meta ? 1 : 0);
-        int len = sqlite3_column_bytes(stmt, meta ? 1 : 0);
-        if (!json || len <= 0) {
-            continue;
-        }
-        cJSON *doc = cJSON_ParseWithLength(json, (size_t)len);
-        if (!doc) {
-            continue;
-        }
-        bool match = true;
-        for (size_t i = 0; match && i < nfields; i++) {
-            const char *eq = strchr(fields[i], '=');
-            if (!eq) {
-                match = false;
-                break;
-            }
-            size_t name_len = (size_t)(eq - fields[i]);
-            char field[128];
-            if (name_len >= sizeof(field)) {
-                match = false;
-                break;
-            }
-            memcpy(field, fields[i], name_len);
-            field[name_len] = '\0';
-            const char *expected = eq + 1;
-
-            cJSON *item =
-                cJSON_GetObjectItemCaseSensitive(doc, field);
-            if (cJSON_IsString(item)) {
-                match = (strcmp(item->valuestring, expected) == 0);
-            } else if (cJSON_IsNumber(item)) {
-                char *end = NULL;
-                double want = strtod(expected, &end);
-                match = (end && *end == '\0' &&
-                         item->valuedouble == want);
-            } else {
-                match = false;
-            }
-        }
-        if (!match) {
-            cJSON_Delete(doc);
+        int length = sqlite3_column_bytes(stmt, meta ? 1 : 0);
+        cJSON *document = json && length > 0
+                              ? cJSON_ParseWithLength(json, (size_t)length)
+                              : NULL;
+        if (!document) {
             continue;
         }
         if (meta) {
-            cJSON *wrap = cJSON_CreateObject();
-            const char *rid =
-                (const char *)sqlite3_column_text(stmt, 0);
-            cJSON_AddStringToObject(wrap, "id", rid ? rid : "");
-            cJSON_AddNumberToObject(
-                wrap, "timestamp",
-                (double)sqlite3_column_int64(stmt, 2));
-            cJSON_AddItemToObject(wrap, "value", doc);
-            cJSON_AddItemToArray(array, wrap);
+            cJSON *row = cJSON_CreateObject();
+            const char *id = (const char *)sqlite3_column_text(stmt, 0);
+            if (!row) {
+                cJSON_Delete(document);
+                continue;
+            }
+            cJSON_AddStringToObject(row, "id", id ? id : "");
+            cJSON_AddNumberToObject(row, "timestamp",
+                                    (double)sqlite3_column_int64(stmt, 2));
+            cJSON_AddItemToObject(row, "value", document);
+            cJSON_AddItemToArray(array, row);
         } else {
-            cJSON_AddItemToArray(array, doc);
+            cJSON_AddItemToArray(array, document);
         }
-    }
-    if (sqlite3_errcode(sh->db) != SQLITE_OK &&
-        sqlite3_errcode(sh->db) != SQLITE_DONE) {
-        log_sqlite(sh, "query");
     }
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&sh->lock);
-    free(hashes);
     return array;
 }
 
-cJSON *zdb_shard_all(zdb_shard *sh, const char **filters, size_t nfilters)
+cJSON *zdb_shard_all(zdb_shard *sh, const cJSON *filters)
 {
-    return collect_values(sh, filters, nfilters, NULL, 0, false);
+    return collect_values(sh, filters, false);
 }
 
-cJSON *zdb_shard_query(zdb_shard *sh, const char **filters, size_t nfilters,
-                       const char **fields, size_t nfields)
+cJSON *zdb_shard_query(zdb_shard *sh, const cJSON *filters)
 {
-    return collect_values(sh, filters, nfilters, fields, nfields, false);
+    return collect_values(sh, filters, false);
 }
 
-cJSON *zdb_shard_all_ts(zdb_shard *sh, const char **filters,
-                        size_t nfilters)
+cJSON *zdb_shard_all_ts(zdb_shard *sh, const cJSON *filters)
 {
-    return collect_values(sh, filters, nfilters, NULL, 0, true);
+    return collect_values(sh, filters, true);
 }
 
-cJSON *zdb_shard_query_ts(zdb_shard *sh, const char **filters,
-                          size_t nfilters, const char **fields,
-                          size_t nfields)
+cJSON *zdb_shard_query_ts(zdb_shard *sh, const cJSON *filters)
 {
-    return collect_values(sh, filters, nfilters, fields, nfields, true);
+    return collect_values(sh, filters, true);
 }
 
 bool zdb_shard_cleanup(zdb_shard *sh)
@@ -748,19 +742,6 @@ bool zdb_shard_cleanup(zdb_shard *sh)
         }
     } else {
         ok = false;
-    }
-
-    if (ok) {
-        stmt = stmt_for(
-            sh, "DELETE FROM DataFilter WHERE id NOT IN (SELECT id FROM Data)");
-        if (stmt) {
-            if (sqlite3_step(stmt) != SQLITE_DONE) {
-                log_sqlite(sh, "cleanup filters");
-                ok = false;
-            }
-        } else {
-            ok = false;
-        }
     }
 
     err = NULL;

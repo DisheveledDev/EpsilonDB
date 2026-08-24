@@ -6,9 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Every config record is a JSON document stored in the __system__ database
- * with filters selecting the record type, so list operations can use the
- * engine's filter index. */
+/* Every config record is a JSON document stored in a dedicated __system__
+ * keyspace, so list operations need no secondary filter records. */
 
 #define CFG_KEYSPACE_DATABASES   "config_databases"
 #define CFG_KEYSPACE_GROUPS      "config_groups"
@@ -16,13 +15,6 @@
 #define CFG_KEYSPACE_PARTITIONS  "config_partitions"
 #define CFG_KEYSPACE_KEYSPACES   "config_keyspaces"
 #define CFG_KEYSPACE_SETTINGS    "config_settings"
-
-#define FILTER_TYPE_DATABASE     "type=database"
-#define FILTER_TYPE_GROUP        "type=group"
-#define FILTER_TYPE_USER         "type=user"
-#define FILTER_TYPE_PARTITION    "type=partition"
-#define FILTER_TYPE_KEYSPACE     "type=keyspace"
-#define FILTER_TYPE_SETTING      "type=setting"
 
 struct zdb_config {
     zdb_engine *engine;
@@ -47,27 +39,6 @@ static cJSON *fetch(zdb_config *cfg, const char *keyspace, const char *id)
     return zdb_get(cfg->engine, ZDB_SYSTEM_DB, keyspace, id);
 }
 
-/* Maps a config keyspace to its record type filter for store(). */
-static const char *filter_for_keyspace(const char *keyspace)
-{
-    if (strcmp(keyspace, CFG_KEYSPACE_DATABASES) == 0) {
-        return FILTER_TYPE_DATABASE;
-    }
-    if (strcmp(keyspace, CFG_KEYSPACE_GROUPS) == 0) {
-        return FILTER_TYPE_GROUP;
-    }
-    if (strcmp(keyspace, CFG_KEYSPACE_USERS) == 0) {
-        return FILTER_TYPE_USER;
-    }
-    if (strcmp(keyspace, CFG_KEYSPACE_KEYSPACES) == 0) {
-        return FILTER_TYPE_KEYSPACE;
-    }
-    if (strcmp(keyspace, CFG_KEYSPACE_SETTINGS) == 0) {
-        return FILTER_TYPE_SETTING;
-    }
-    return FILTER_TYPE_PARTITION;
-}
-
 static bool internal_cluster_setting(const char *keyspace, const char *id)
 {
     return strcmp(keyspace, CFG_KEYSPACE_SETTINGS) == 0 &&
@@ -82,17 +53,14 @@ static bool store(zdb_config *cfg, const char *keyspace, const char *id,
     if (!json) {
         return false;
     }
-    const char *type_filter = filter_for_keyspace(keyspace);
     pthread_mutex_lock(&cfg->replicate_lock);
     bool ok;
     if (cfg->replicate && !internal_cluster_setting(keyspace, id)) {
-        ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, json,
-                            type_filter);
+        ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, json);
         pthread_mutex_unlock(&cfg->replicate_lock);
     } else {
         pthread_mutex_unlock(&cfg->replicate_lock);
-        ok = zdb_put(cfg->engine, ZDB_SYSTEM_DB, keyspace, id, json, -1,
-                     &type_filter, 1);
+        ok = zdb_put(cfg->engine, ZDB_SYSTEM_DB, keyspace, id, json, -1);
     }
     free(json);
     return ok;
@@ -103,7 +71,7 @@ static bool remove_record(zdb_config *cfg, const char *keyspace,
 {
     pthread_mutex_lock(&cfg->replicate_lock);
     if (cfg->replicate && !internal_cluster_setting(keyspace, id)) {
-        bool ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, NULL, NULL);
+        bool ok = cfg->replicate(cfg->replicate_ctx, keyspace, id, NULL);
         pthread_mutex_unlock(&cfg->replicate_lock);
         return ok;
     }
@@ -111,10 +79,9 @@ static bool remove_record(zdb_config *cfg, const char *keyspace,
     return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, keyspace, id);
 }
 
-static cJSON *collect(zdb_config *cfg, const char *keyspace,
-                      const char *type_filter)
+static cJSON *collect(zdb_config *cfg, const char *keyspace)
 {
-    return zdb_all(cfg->engine, ZDB_SYSTEM_DB, keyspace, &type_filter, 1);
+    return zdb_all(cfg->engine, ZDB_SYSTEM_DB, keyspace, NULL);
 }
 
 /* Extract helpers with bounds-checked copies. */
@@ -259,7 +226,7 @@ zdb_database_info *zdb_database_list(zdb_config *cfg, size_t *count_out)
     if (!cfg) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_DATABASES, FILTER_TYPE_DATABASE);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_DATABASES);
     if (!all) {
         return NULL;
     }
@@ -365,7 +332,7 @@ zdb_group_info *zdb_group_list(zdb_config *cfg, size_t *count_out)
     if (!cfg) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_GROUPS, FILTER_TYPE_GROUP);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_GROUPS);
     if (!all) {
         return NULL;
     }
@@ -465,7 +432,7 @@ zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out)
     if (!cfg) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_USERS, FILTER_TYPE_USER);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_USERS);
     if (!all) {
         return NULL;
     }
@@ -652,8 +619,7 @@ zdb_keyspace_info *zdb_keyspace_list(zdb_config *cfg, size_t *count_out)
     if (!cfg) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_KEYSPACES,
-                         FILTER_TYPE_KEYSPACE);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_KEYSPACES);
     if (!all) {
         return NULL;
     }
@@ -687,8 +653,7 @@ zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
     if (!cfg || !database) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS,
-                         FILTER_TYPE_PARTITION);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS);
     if (!all) {
         return NULL;
     }
@@ -797,7 +762,7 @@ char **zdb_setting_list(zdb_config *cfg, size_t *count_out)
     if (!cfg) {
         return NULL;
     }
-    cJSON *all = collect(cfg, CFG_KEYSPACE_SETTINGS, FILTER_TYPE_SETTING);
+    cJSON *all = collect(cfg, CFG_KEYSPACE_SETTINGS);
     if (!all) {
         return NULL;
     }

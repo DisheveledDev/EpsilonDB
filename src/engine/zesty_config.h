@@ -36,8 +36,7 @@
 
 typedef struct zdb_config zdb_config;
 typedef bool (*zdb_config_replicate_fn)(void *ctx, const char *keyspace,
-                                        const char *id, const char *json,
-                                        const char *type_filter);
+                                        const char *id, const char *json);
 
 zdb_config *zdb_config_open(zdb_engine *engine);
 void zdb_config_close(zdb_config *cfg);

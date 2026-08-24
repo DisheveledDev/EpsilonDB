@@ -199,8 +199,8 @@ static void shard_key_of(const char *partition, const char *keyspace,
 static bool rows_match(zdb_engine *a, zdb_engine *b, const char *part,
                        const char *ks)
 {
-    cJSON *ra = zdb_all_ts(a, part, ks, NULL, 0);
-    cJSON *rb = zdb_all_ts(b, part, ks, NULL, 0);
+    cJSON *ra = zdb_all_ts(a, part, ks, NULL);
+    cJSON *rb = zdb_all_ts(b, part, ks, NULL);
     bool match = false;
 
     if (ra && rb &&
@@ -274,7 +274,7 @@ static void chunk_populate(void)
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value),
                  "{\"n\":%d,\"pad\":\"%.*d\"}", i, 40, 0);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1, NULL, 0));
+        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 50; i++) {
         char id[32];
@@ -282,11 +282,10 @@ static void chunk_populate(void)
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d,\"txt\":\"hello %d\"}",
                  i, i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1, NULL,
-                      0));
+        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
-    cJSON *all = zdb_all_ts(f.a.engine, "main", "kv", NULL, 0);
+    cJSON *all = zdb_all_ts(f.a.engine, "main", "kv", NULL);
     CHECK(all && cJSON_GetArraySize(all) == 500);
     cJSON_Delete(all);
 
@@ -310,7 +309,7 @@ static void chunk_transfer(void)
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value),
                  "{\"n\":%d,\"pad\":\"%.*d\"}", i, 40, 0);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1, NULL, 0));
+        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 50; i++) {
         char id[32];
@@ -318,8 +317,7 @@ static void chunk_transfer(void)
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d,\"txt\":\"hello %d\"}",
                  i, i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1, NULL,
-                      0));
+        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
     CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, key_main, f.b.dir) == 0);
@@ -371,7 +369,7 @@ static void chunk_errors(void)
     char key_main[33];
     shard_key_of("main", "kv", key_main);
     CHECK(zdb_put(f.a.engine, "main", "kv", "id-0",
-                  "{\"n\":0}", -1, NULL, 0));
+                  "{\"n\":0}", -1));
 
     /* unknown key: server refuses cleanly */
     CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, "zzzzzzzzzzzzzzzzzzzzz"
@@ -404,15 +402,14 @@ static void chunk_invalidate(void)
         char value[64];
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value), "{\"n\":%d}", i);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1, NULL, 0));
+        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 5; i++) {
         char id[32];
         char value[64];
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d}", i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1, NULL,
-                      0));
+        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
     cJSON *doc = zdb_get(f.a.engine, "main", "kv", "id-0007");

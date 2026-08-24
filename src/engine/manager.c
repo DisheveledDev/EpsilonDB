@@ -585,15 +585,13 @@ bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
 
 
 bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
-             const char *id, const char *json_value, long long ttl_seconds,
-             const char **filters, size_t nfilters)
+             const char *id, const char *json_value, long long ttl_seconds)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_put(sh, id, json_value, ttl_seconds, filters,
-                            nfilters);
+    bool ok = zdb_shard_put(sh, id, json_value, ttl_seconds);
     shard_release(mgr, sh);
     return ok;
 }
@@ -623,39 +621,38 @@ bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
 }
 
 char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
-               const char **filters, size_t nfilters, size_t *count_out)
+               const cJSON *filters, size_t *count_out)
 {
     *count_out = 0;
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    char **result = zdb_shard_ids(sh, filters, nfilters, count_out);
+    char **result = zdb_shard_ids(sh, filters, count_out);
     shard_release(mgr, sh);
     return result;
 }
 
 cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
-               const char **filters, size_t nfilters)
+               const cJSON *filters)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_all(sh, filters, nfilters);
+    cJSON *result = zdb_shard_all(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
 cJSON *zdb_query(zdb_engine *mgr, const char *partition, const char *keyspace,
-                 const char **filters, size_t nfilters, const char **fields,
-                 size_t nfields)
+                 const cJSON *filters)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_query(sh, filters, nfilters, fields, nfields);
+    cJSON *result = zdb_shard_query(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
@@ -675,26 +672,23 @@ bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
 bool zdb_replica_put(zdb_engine *mgr, const char *partition,
                      const char *keyspace, const char *id,
                      const char *json_value, long long ttl_absolute,
-                     long long timestamp, const char **filters,
-                     size_t nfilters)
+                     long long timestamp)
 {
     return zdb_replica_put_origin(mgr, partition, keyspace, id, json_value,
-                                  ttl_absolute, timestamp, "", filters,
-                                  nfilters);
+                                  ttl_absolute, timestamp, "");
 }
 
 bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
                             const char *keyspace, const char *id,
                             const char *json_value, long long ttl_absolute,
-                            long long timestamp, const char *origin,
-                            const char **filters, size_t nfilters)
+                            long long timestamp, const char *origin)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
     bool ok = zdb_shard_replica_put(sh, id, json_value, ttl_absolute,
-                                    timestamp, origin, filters, nfilters);
+                                    timestamp, origin);
     shard_release(mgr, sh);
     return ok;
 }
@@ -736,28 +730,25 @@ cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
 }
 
 cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
-                  const char *keyspace, const char **filters,
-                  size_t nfilters)
+                  const char *keyspace, const cJSON *filters)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_all_ts(sh, filters, nfilters);
+    cJSON *result = zdb_shard_all_ts(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
 cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
-                    const char *keyspace, const char **filters,
-                    size_t nfilters, const char **fields, size_t nfields)
+                    const char *keyspace, const cJSON *filters)
 {
     zdb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_query_ts(sh, filters, nfilters, fields,
-                                       nfields);
+    cJSON *result = zdb_shard_query_ts(sh, filters);
     shard_release(mgr, sh);
     return result;
 }

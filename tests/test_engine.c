@@ -64,7 +64,7 @@ static void test_put_get_delete(void)
     CHECK(mgr != NULL);
 
     const char *doc = "{\"name\":\"alice\",\"age\":30}";
-    CHECK(zdb_put(mgr, "users", "profiles", "u1", doc, -1, NULL, 0));
+    CHECK(zdb_put(mgr, "users", "profiles", "u1", doc, -1));
 
     cJSON *got = zdb_get(mgr, "users", "profiles", "u1");
     CHECK(got != NULL);
@@ -74,7 +74,7 @@ static void test_put_get_delete(void)
 
     /* overwrite */
     CHECK(zdb_put(mgr, "users", "profiles", "u1",
-                  "{\"name\":\"alice2\",\"age\":31}", -1, NULL, 0));
+                  "{\"name\":\"alice2\",\"age\":31}", -1));
     got = zdb_get(mgr, "users", "profiles", "u1");
     CHECK(got != NULL && json_string_eq(got, "name", "alice2"));
     cJSON_Delete(got);
@@ -95,8 +95,8 @@ static void test_ttl_expiry(void)
     zdb_engine *mgr = zdb_engine_open("tests/data/ttl");
     CHECK(mgr != NULL);
 
-    CHECK(zdb_put(mgr, "sess", "tokens", "s1", "{\"v\":1}", 1, NULL, 0));
-    CHECK(zdb_put(mgr, "sess", "tokens", "s2", "{\"v\":2}", -1, NULL, 0));
+    CHECK(zdb_put(mgr, "sess", "tokens", "s1", "{\"v\":1}", 1));
+    CHECK(zdb_put(mgr, "sess", "tokens", "s2", "{\"v\":2}", -1));
 
     cJSON *got = zdb_get(mgr, "sess", "tokens", "s1");
     CHECK(got != NULL);
@@ -118,72 +118,114 @@ static void test_filters_and_query(void)
     zdb_engine *mgr = zdb_engine_open("tests/data/filters");
     CHECK(mgr != NULL);
 
-    const char *f_tenant[] = {"tenant=acme"};
-    const char *f_region[] = {"region=eu"};
-    const char *f_both[] = {"tenant=acme", "region=eu"};
+    CHECK(zdb_put(mgr, "kv", "main", "a",
+                  "{\"name\":\"Alice\",\"age\":41,\"active\":true,"
+                  "\"manager\":{\"age\":50},\"deleted\":null,"
+                  "\"tags\":[\"red\",\"blue\"],\"meta\":{\"rank\":1}}",
+                  -1));
+    CHECK(zdb_put(mgr, "kv", "main", "b",
+                  "{\"name\":\"Bob\",\"age\":42,\"active\":false,"
+                  "\"manager\":{\"age\":42},\"deleted\":null,"
+                  "\"tags\":[\"green\"],\"meta\":{\"rank\":2}}",
+                  -1));
+    CHECK(zdb_put(mgr, "kv", "main", "c",
+                  "{\"name\":\"Carol\",\"age\":60,\"active\":true,"
+                  "\"manager\":{\"age\":30},\"deleted\":\"yes\","
+                  "\"tags\":[\"red\",\"blue\"],\"meta\":{\"rank\":1}}",
+                  -1));
 
-    CHECK(zdb_put(mgr, "kv", "main", "a", "{\"kind\":\"widget\",\"size\":1}",
-                  -1, f_tenant, 1));
-    CHECK(zdb_put(mgr, "kv", "main", "b", "{\"kind\":\"gadget\",\"size\":2}",
-                  -1, f_both, 2));
-    CHECK(zdb_put(mgr, "kv", "main", "c", "{\"kind\":\"widget\",\"size\":3}",
-                  -1, f_region, 1));
-    CHECK(zdb_put(mgr, "kv", "main", "d", "{\"kind\":\"widget\",\"size\":4}",
-                  -1, NULL, 0));
-
-    size_t n = 0;
-    char **ids = zdb_ids(mgr, "kv", "main", f_tenant, 1, &n);
-    CHECK(ids != NULL && n == 2);
-    zdb_free_strings(ids);
-
-    ids = zdb_ids(mgr, "kv", "main", f_both, 2, &n);
-    CHECK(ids != NULL && n == 1);
-    zdb_free_strings(ids);
-
-    ids = zdb_ids(mgr, "kv", "main", NULL, 0, &n);
-    CHECK(ids != NULL && n == 4);
-    zdb_free_strings(ids);
-
-    /* all: filter selects a and b */
-    cJSON *all = zdb_all(mgr, "kv", "main", f_tenant, 1);
-    CHECK(all != NULL && cJSON_GetArraySize(all) == 2);
-    cJSON_Delete(all);
-
-    /* query adds field=value matching on top of filters */
-    const char *field_widget[] = {"kind=widget"};
-    cJSON *q = zdb_query(mgr, "kv", "main", f_tenant, 1, field_widget, 1);
-    CHECK(q != NULL && cJSON_GetArraySize(q) == 1);
-    cJSON *first = cJSON_GetArrayItem(q, 0);
-    CHECK(json_string_eq(first, "kind", "widget"));
-
-    const char *field_size2[] = {"size=2"};
-    q = zdb_query(mgr, "kv", "main", NULL, 0, field_size2, 1);
-    CHECK(q != NULL && cJSON_GetArraySize(q) == 1);
-    first = cJSON_GetArrayItem(q, 0);
-    CHECK(json_string_eq(first, "kind", "gadget"));
-    cJSON_Delete(q);
-
-    /* deleting removes from ids */
-    CHECK(zdb_delete(mgr, "kv", "main", "a"));
-    ids = zdb_ids(mgr, "kv", "main", f_tenant, 1, &n);
-    CHECK(ids != NULL && n == 1);
-    zdb_free_strings(ids);
-
-    char filter_storage[20][32];
-    const char *many_filters[20];
-    for (size_t i = 0; i < 20; i++) {
-        snprintf(filter_storage[i], sizeof(filter_storage[i]), "f%zu=v%zu", i,
-                 i);
-        many_filters[i] = filter_storage[i];
+    struct {
+        const char *json;
+        int expected;
+    } cases[] = {
+        {"{\"key\":\"age\",\"operator\":\"eq\",\"value\":42}", 1},
+        {"{\"key\":\"manager.age\",\"operator\":\"eq\",\"value\":42}", 1},
+        {"{\"key\":\"age\",\"operator\":\"gt\",\"value\":42}", 1},
+        {"{\"key\":\"age\",\"operator\":\"gte\",\"value\":42}", 2},
+        {"{\"key\":\"age\",\"operator\":\"lt\",\"value\":42}", 1},
+        {"{\"key\":\"age\",\"operator\":\"lte\",\"value\":42}", 2},
+        {"{\"key\":\"name\",\"operator\":\"eq\",\"value\":\"Alice\"}", 1},
+        {"{\"key\":\"name\",\"operator\":\"ne\",\"value\":\"Bob\"}", 2},
+        {"{\"key\":\"active\",\"operator\":\"eq\",\"value\":true}", 2},
+        {"{\"key\":\"deleted\",\"operator\":\"eq\",\"value\":null}", 2},
+        {"{\"key\":\"tags\",\"operator\":\"eq\",\"value\":[\"red\",\"blue\"]}", 2},
+        {"{\"key\":\"meta\",\"operator\":\"eq\",\"value\":{\"rank\":1}}", 2},
+        {"{\"key\":\"missing\",\"operator\":\"eq\",\"value\":1}", 0},
+        {"{\"key\":\"missing\",\"operator\":\"ne\",\"value\":1}", 0},
+        {"{\"key\":\"age') OR 1=1 --\",\"operator\":\"eq\",\"value\":41}", 0},
+        {"[]", 3},
+        {"{\"key\":\"age\",\"operator\":\"eq\",\"value\":\"42\"}", 0},
+        {"[{\"key\":\"active\",\"operator\":\"eq\",\"value\":true},"
+         "{\"key\":\"manager.age\",\"operator\":\"gt\",\"value\":40}]", 1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cJSON *filters = cJSON_Parse(cases[i].json);
+        CHECK(zdb_filters_valid(filters));
+        cJSON *rows = zdb_query(mgr, "kv", "main", filters);
+        CHECK(rows && cJSON_GetArraySize(rows) == cases[i].expected);
+        cJSON_Delete(rows);
+        cJSON_Delete(filters);
     }
-    CHECK(zdb_put(mgr, "kv", "main", "many", "{\"many\":true}", -1,
-                  many_filters, 20));
-    CHECK(zdb_put(mgr, "kv", "main", "sixteen", "{\"many\":false}", -1,
-                  many_filters, 16));
-    ids = zdb_ids(mgr, "kv", "main", many_filters, 20, &n);
-    CHECK(ids != NULL && n == 1 && strcmp(ids[0], "many") == 0);
-    zdb_free_strings(ids);
 
+    const char *invalid[] = {
+        "{\"key\":\"age\",\"operator\":\"unknown\",\"value\":42}",
+        "{\"key\":\"age\",\"operator\":\"gt\",\"value\":\"42\"}",
+        "{\"operator\":\"eq\",\"value\":42}",
+        "{\"key\":\"manager..age\",\"operator\":\"eq\",\"value\":42}",
+        "42",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        cJSON *filters = cJSON_Parse(invalid[i]);
+        CHECK(!zdb_filters_valid(filters));
+        CHECK(zdb_query(mgr, "kv", "main", filters) == NULL);
+        cJSON_Delete(filters);
+    }
+
+    cJSON *nested = cJSON_Parse(
+        "{\"key\":\"manager.age\",\"operator\":\"eq\",\"value\":42}");
+    size_t count = 0;
+    char **ids = zdb_ids(mgr, "kv", "main", nested, &count);
+    CHECK(ids && count == 1 && strcmp(ids[0], "b") == 0);
+    zdb_free_strings(ids);
+    cJSON *all = zdb_all(mgr, "kv", "main", nested);
+    CHECK(all && cJSON_GetArraySize(all) == 1);
+    cJSON_Delete(all);
+    cJSON_Delete(nested);
+
+    CHECK(zdb_delete(mgr, "kv", "main", "b"));
+    cJSON *age = cJSON_Parse(
+        "{\"key\":\"age\",\"operator\":\"gte\",\"value\":42}");
+    ids = zdb_ids(mgr, "kv", "main", age, &count);
+    CHECK(ids && count == 1 && strcmp(ids[0], "c") == 0);
+    zdb_free_strings(ids);
+    cJSON_Delete(age);
+
+    char shard_path[1024];
+    char shard_key[33];
+    CHECK(zdb_shard_path(mgr, "kv", "main", shard_path, sizeof(shard_path),
+                         shard_key));
+    sqlite3 *db = NULL;
+    CHECK(sqlite3_open_v2(shard_path, &db, SQLITE_OPEN_READONLY, NULL) ==
+          SQLITE_OK);
+    sqlite3_stmt *table_check = NULL;
+    CHECK(sqlite3_prepare_v2(
+              db, "SELECT count(*) FROM sqlite_master"
+                  " WHERE type='table' AND name='DataFilter'",
+              -1, &table_check, NULL) == SQLITE_OK);
+    CHECK(sqlite3_step(table_check) == SQLITE_ROW &&
+          sqlite3_column_int(table_check, 0) == 0);
+    sqlite3_finalize(table_check);
+    sqlite3_close(db);
+
+    zdb_engine_close(mgr);
+    mgr = zdb_engine_open("tests/data/filters");
+    CHECK(mgr != NULL);
+    cJSON *persisted = cJSON_Parse(
+        "{\"key\":\"manager.age\",\"operator\":\"lt\",\"value\":40}");
+    cJSON *rows = zdb_query(mgr, "kv", "main", persisted);
+    CHECK(rows && cJSON_GetArraySize(rows) == 1);
+    cJSON_Delete(rows);
+    cJSON_Delete(persisted);
     zdb_engine_close(mgr);
 }
 
@@ -193,11 +235,11 @@ static void test_shard_layout_and_reopen(void)
     zdb_engine *mgr = zdb_engine_open("tests/data/layout");
     CHECK(mgr != NULL);
 
-    CHECK(zdb_put(mgr, "p1", "k1", "x", "{\"v\":1}", -1, NULL, 0));
-    CHECK(zdb_put(mgr, "p1", "k2", "x", "{\"v\":2}", -1, NULL, 0));
-    CHECK(zdb_put(mgr, "p2", "k1", "x", "{\"v\":3}", -1, NULL, 0));
-    CHECK(zdb_put(mgr, "ab", "c", "same", "{\"v\":4}", -1, NULL, 0));
-    CHECK(zdb_put(mgr, "a", "bc", "same", "{\"v\":5}", -1, NULL, 0));
+    CHECK(zdb_put(mgr, "p1", "k1", "x", "{\"v\":1}", -1));
+    CHECK(zdb_put(mgr, "p1", "k2", "x", "{\"v\":2}", -1));
+    CHECK(zdb_put(mgr, "p2", "k1", "x", "{\"v\":3}", -1));
+    CHECK(zdb_put(mgr, "ab", "c", "same", "{\"v\":4}", -1));
+    CHECK(zdb_put(mgr, "a", "bc", "same", "{\"v\":5}", -1));
 
     CHECK(count_shards("tests/data/layout") == 5);
     cJSON *left = zdb_get(mgr, "ab", "c", "same");
@@ -213,7 +255,7 @@ static void test_shard_layout_and_reopen(void)
     mgr = zdb_engine_open("tests/data/layout");
     CHECK(mgr != NULL);
     size_t n = 0;
-    char **ids = zdb_ids(mgr, "p2", "k1", NULL, 0, &n);
+    char **ids = zdb_ids(mgr, "p2", "k1", NULL, &n);
     CHECK(ids != NULL && n == 1);
     zdb_free_strings(ids);
 
@@ -231,7 +273,7 @@ static void test_cleanup_pass(void)
     zdb_engine *mgr = zdb_engine_open("tests/data/cleanup");
     CHECK(mgr != NULL);
 
-    CHECK(zdb_put(mgr, "tmp", "main", "gone", "{\"v\":1}", 1, NULL, 0));
+    CHECK(zdb_put(mgr, "tmp", "main", "gone", "{\"v\":1}", 1));
     CHECK(zdb_delete(mgr, "tmp", "main", "gone"));
 
     /* row is invisible but still present until cleanup + grace window */
@@ -241,7 +283,7 @@ static void test_cleanup_pass(void)
     CHECK(zdb_force_cleanup(mgr, "tmp", "main"));
 
     /* engine still functional after cleanup */
-    CHECK(zdb_put(mgr, "tmp", "main", "fresh", "{\"v\":9}", -1, NULL, 0));
+    CHECK(zdb_put(mgr, "tmp", "main", "fresh", "{\"v\":9}", -1));
     cJSON *got = zdb_get(mgr, "tmp", "main", "fresh");
     CHECK(got != NULL);
     cJSON_Delete(got);
@@ -267,7 +309,7 @@ static void test_concurrent_puts(void)
                 snprintf(id, sizeof(id), "w%d-%d", w, i);
                 char doc[64];
                 snprintf(doc, sizeof(doc), "{\"w\":%d,\"i\":%d}", w, i);
-                if (!zdb_put(mgr, "load", "test", id, doc, -1, NULL, 0)) {
+                if (!zdb_put(mgr, "load", "test", id, doc, -1)) {
                     _exit(1);
                 }
             }
@@ -282,7 +324,7 @@ static void test_concurrent_puts(void)
     }
 
     size_t n = 0;
-    char **ids = zdb_ids(mgr, "load", "test", NULL, 0, &n);
+    char **ids = zdb_ids(mgr, "load", "test", NULL, &n);
     CHECK(ids != NULL && n == (size_t)(writers * per_writer));
     zdb_free_strings(ids);
 

@@ -21,11 +21,11 @@
  *   create partition <db> <name> <create_mask> <update_mask> <read_mask> <delete_mask>
  *   delete partition <db> <name>
  *   get <db>/<partition>/<keyspace>/<id>
- *   put <db>/<partition>/<keyspace>/<id> <json | -> [--filter k=v]... [ttl_seconds]
+ *   put <db>/<partition>/<keyspace>/<id> <json | -> [ttl_seconds]
  *   rm <db>/<partition>/<keyspace>/<id>
- *   query <db>/<partition>/<keyspace> [--filter k=v]... [--field k=v]...
- *   ids <db>/<partition>/<keyspace> [--filter k=v]...
- *   all <db>/<partition>/<keyspace> [--filter k=v]...
+ *   query <db>/<partition>/<keyspace> [--filter <json>]...
+ *   ids <db>/<partition>/<keyspace> [--filter <json>]...
+ *   all <db>/<partition>/<keyspace> [--filter <json>]...
  *   get setting <name>
  *   set setting <name> <json | ->
  *   delete setting <name>
@@ -658,13 +658,11 @@ static void print_usage(void)
         "",
         "data (partitions/keyspaces are created automatically on put):",
         "  get <db>/<partition>/<keyspace>/<id>",
-        "  put <db>/<partition>/<keyspace>/<id> <json|->",
-        "      [--filter k=v]... [ttl]",
+        "  put <db>/<partition>/<keyspace>/<id> <json|-> [ttl]",
         "  rm <db>/<partition>/<keyspace>/<id>",
-        "  all <db>/<partition>/<keyspace> [--filter k=v]...",
-        "  ids <db>/<partition>/<keyspace> [--filter k=v]...",
-        "  query <db>/<partition>/<keyspace> [--filter k=v]...",
-        "        [--field k=v]...",
+        "  all <db>/<partition>/<keyspace> [--filter <json>]...",
+        "  ids <db>/<partition>/<keyspace> [--filter <json>]...",
+        "  query <db>/<partition>/<keyspace> [--filter <json>]...",
         "",
         "cluster (requires zestyd -n <peer_port>):",
         "  join node <addr> <port>     join an existing mesh via seed",
@@ -695,57 +693,54 @@ static bool parse_data_spec(const char *spec, char *path, size_t cap)
     return 1;
 }
 
-static void append_filters(char *path, size_t cap, const char **filters,
-                           size_t nfilters, const char **fields,
-                           size_t nfields)
+static char *build_filter_body(const char **filters, size_t count)
 {
-    /* snprintf returns the length the string *would* have had: clamp
-     * after every call or the next offset walks past the buffer */
-    size_t len = strlen(path);
-    for (size_t i = 0; i < nfilters; i++) {
-        size_t w = snprintf(path + len, cap - len, "%sfilter=%s",
-                            strchr(path, '?') ? "&" : "?", filters[i]);
-        if (w >= cap - len) {
-            return;
-        }
-        len += w;
+    if (count == 0) {
+        return NULL;
     }
-    for (size_t i = 0; i < nfields; i++) {
-        size_t w = snprintf(path + len, cap - len, "%sfield=%s",
-                            strchr(path, '?') ? "&" : "?", fields[i]);
-        if (w >= cap - len) {
-            return;
+    cJSON *root = cJSON_CreateObject();
+    cJSON *array = root ? cJSON_AddArrayToObject(root, "filters") : NULL;
+    for (size_t i = 0; array && i < count; i++) {
+        cJSON *filter = cJSON_Parse(filters[i]);
+        if (!cJSON_IsObject(filter)) {
+            cJSON_Delete(filter);
+            cJSON_Delete(root);
+            return NULL;
         }
-        len += w;
+        cJSON_AddItemToArray(array, filter);
     }
+    char *body = array ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    return body;
 }
 
-/* Collects repeated --filter/--field options starting at argv[*i]. */
-static void collect_options(int argc, char **argv, int *i,
-                            const char ***filters, size_t *nfilters,
-                            const char ***fields, size_t *nfields)
+/* Collects repeated structured --filter JSON objects. */
+static bool collect_filters(int argc, char **argv, int *index,
+                            const char ***filters, size_t *count)
 {
-    size_t fcap = 4, flcap = 4;
-    *filters = malloc(fcap * sizeof(char *));
-    *fields = malloc(flcap * sizeof(char *));
-    while (*i < argc) {
-        if (strcmp(argv[*i], "--filter") == 0 && *i + 1 < argc) {
-            if (*nfilters == fcap) {
-                fcap *= 2;
-                *filters = realloc(*filters, fcap * sizeof(char *));
-            }
-            (*filters)[(*nfilters)++] = argv[++*i];
-        } else if (strcmp(argv[*i], "--field") == 0 && *i + 1 < argc) {
-            if (*nfields == flcap) {
-                flcap *= 2;
-                *fields = realloc(*fields, flcap * sizeof(char *));
-            }
-            (*fields)[(*nfields)++] = argv[++*i];
-        } else {
-            break;
-        }
-        (*i)++;
+    size_t capacity = 4;
+    *filters = malloc(capacity * sizeof(char *));
+    if (!*filters) {
+        return false;
     }
+    while (*index < argc && strcmp(argv[*index], "--filter") == 0 &&
+           *index + 1 < argc) {
+        if (*count == capacity) {
+            capacity *= 2;
+            const char **grown = realloc((void *)*filters,
+                                         capacity * sizeof(char *));
+            if (!grown) {
+                free((void *)*filters);
+                *filters = NULL;
+                *count = 0;
+                return false;
+            }
+            *filters = grown;
+        }
+        (*filters)[(*count)++] = argv[*index + 1];
+        *index += 2;
+    }
+    return true;
 }
 
 static char *body_from_arg(const char *arg)
@@ -953,106 +948,54 @@ static int execute_command(int argc, char **argv)
             return run("GET", path, NULL);
         }
         if (strcmp(cmd, "put") == 0) {
-            /* optional --filter k=v pairs may precede the document */
-            const char **filters = NULL;
-            size_t nfilters = 0, fcap = 4;
-            filters = malloc(fcap * sizeof(char *));
-            while (argi < argc && strcmp(argv[argi], "--filter") == 0 &&
-                   argi + 1 < argc) {
-                if (nfilters == fcap) {
-                    fcap *= 2;
-                    filters = realloc(filters, fcap * sizeof(char *));
-                }
-                filters[nfilters++] = argv[++argi];
-                argi++;
-            }
-
             char *doc = body_from_arg(argi < argc ? argv[argi] : "-");
             if (!doc) {
                 out_line("zestyctl: no document supplied");
-                free(filters);
                 return 1;
             }
-            size_t len = strlen(path);
+            size_t length = strlen(path);
             if (argi + 1 < argc) {
-                size_t w = snprintf(path + len, sizeof(path) - len,
-                                    "?ttl=%s", argv[argi + 1]);
-                if (w >= sizeof(path) - len) {
-                    out_line("zestyctl: path too long");
+                size_t written = snprintf(path + length,
+                                          sizeof(path) - length, "?ttl=%s",
+                                          argv[argi + 1]);
+                if (written >= sizeof(path) - length) {
                     free(doc);
-                    free(filters);
                     return 1;
                 }
-                len += w;
             }
-            for (size_t i = 0; i < nfilters; i++) {
-                snprintf(path + len, sizeof(path) - len, "%sfilter=%s",
-                         strchr(path, '?') ? "&" : "?", filters[i]);
-                len = strlen(path);
-            }
-            int rc = run("PUT", path, doc);
+            int result = run("PUT", path, doc);
             free(doc);
-            free(filters);
-            return rc;
+            return result;
         }
         if (strcmp(cmd, "rm") == 0) {
             return run("DELETE", path, NULL);
         }
 
-        /* collection ops */
-        const char **filters = NULL, **fields = NULL;
-        size_t nfilters = 0, nfields = 0;
-        collect_options(argc, argv, &argi, &filters, &nfilters, &fields,
-                        &nfields);
-
-        /* append the operation segment: /data/db/partition/keyspace/<op> */
-        size_t len = strlen(path);
-        snprintf(path + len, sizeof(path) - len, "/%s", cmd);
-        append_filters(path, sizeof(path), filters, nfilters, fields,
-                       nfields);
-
-        int rc;
-        if (strcmp(cmd, "all") == 0) {
-            rc = run("GET", path, NULL);
-        } else if (strcmp(cmd, "ids") == 0) {
-            rc = run("GET", path, NULL);
-        } else {
-            char *body = NULL;
-            if (nfields > 0) {
-                cJSON *root = cJSON_CreateObject();
-                cJSON *field_object = root
-                                          ? cJSON_AddObjectToObject(root,
-                                                                   "fields")
-                                          : NULL;
-                for (size_t i = 0; field_object && i < nfields; i++) {
-                    const char *equals = strchr(fields[i], '=');
-                    if (!equals || equals == fields[i]) {
-                        continue;
-                    }
-                    size_t name_length = (size_t)(equals - fields[i]);
-                    char *name = malloc(name_length + 1);
-                    if (!name) {
-                        continue;
-                    }
-                    memcpy(name, fields[i], name_length);
-                    name[name_length] = '\0';
-                    cJSON_AddStringToObject(field_object, name, equals + 1);
-                    free(name);
-                }
-                body = root ? cJSON_PrintUnformatted(root) : NULL;
-                cJSON_Delete(root);
-                if (!body) {
-                    free(filters);
-                    free(fields);
-                    return 1;
-                }
-            }
-            rc = run("POST", path, body);
-            free(body);
+        const char **filters = NULL;
+        size_t filter_count = 0;
+        if (!collect_filters(argc, argv, &argi, &filters, &filter_count) ||
+            argi != argc) {
+            free((void *)filters);
+            return 1;
         }
-        free(filters);
-        free(fields);
-        return rc;
+        size_t length = strlen(path);
+        if (snprintf(path + length, sizeof(path) - length, "/%s", cmd) >=
+            (int)(sizeof(path) - length)) {
+            free((void *)filters);
+            return 1;
+        }
+        char *body = build_filter_body(filters, filter_count);
+        free((void *)filters);
+        if (filter_count > 0 && !body) {
+            out_line("zestyctl: each --filter must be a JSON object");
+            return 1;
+        }
+        const char *method = filter_count > 0 || strcmp(cmd, "query") == 0
+                                 ? "POST"
+                                 : "GET";
+        int result = run(method, path, body);
+        free(body);
+        return result;
     }
 
     /* ---- cluster (stage 4): handled above with the other joins ---- */

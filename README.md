@@ -8,8 +8,8 @@ across nodes.
 
 ## Features
 
-- **REST data API**: put/get/delete/all/ids/query with optional indexed
-  filters (`?filter=k=v`, repeatable) and TTLs (`?ttl=seconds`).
+- **REST data API**: put/get/delete/all/ids/query with typed JSON filters,
+  nested key paths, comparison operators, and TTLs (`?ttl=seconds`).
 - **Sharded storage**: shard file = SQLite db named from a framed digest of
   partition and keyspace; legacy concatenated-name shards migrate lazily;
   soft deletes; 60s cleanup pass
@@ -73,14 +73,15 @@ The Unix admin socket speaks HTTP without authentication and is what
     curl -u ignored:root -X POST localhost:8123/admin/databases \
          -d '{"name":"app","replication_factor":2}'
 
-    # write and read documents ("filters" index the doc for queries)
+    # write and query documents with typed, nested JSON filters
     curl -u ignored:root -X PUT \
-         'localhost:8123/data/app/main/kv/user-1?ttl=3600&filter=kind=user' \
-         -d '{"name":"Ada","kind":"user"}'
+         'localhost:8123/data/app/main/kv/user-1?ttl=3600' \
+         -d '{"name":"Ada","age":43,"manager":{"age":51}}'
     curl -u ignored:root \
          'localhost:8123/data/app/main/kv/user-1'
-    curl -u ignored:root \
-         'localhost:8123/data/app/main/kv/query?filter=kind=user'
+    curl -u ignored:root -X POST \
+         'localhost:8123/data/app/main/kv/query' \
+         -d '{"key":"manager.age","operator":"gt","value":42}'
 
 Or with the CLI (talks to the local admin socket):
 
@@ -88,9 +89,29 @@ Or with the CLI (talks to the local admin socket):
     bin/zestyctl create database app 1
     bin/zestyctl put app/main/kv/user-1        # reads JSON from stdin
     bin/zestyctl get app/main/kv/user-1
-    bin/zestyctl all app/main/kv --filter kind=user
+    bin/zestyctl all app/main/kv \
+      --filter '{"key":"age","operator":"gte","value":18}'
     bin/zestyctl list databases|groups|users|partitions|settings|nodes
     bin/zestyctl cluster
+
+## JSON filters
+
+Collection reads accept one filter object or a `filters` array in a POST body:
+
+```json
+{
+  "filters": [
+    {"key": "age", "operator": "gte", "value": 18},
+    {"key": "manager.age", "operator": "lt", "value": 65}
+  ]
+}
+```
+
+Keys use dot notation to traverse nested objects. Supported operators are
+`eq`, `ne`, `gt`, `gte`, `lt`, and `lte`; multiple filters use AND semantics.
+Values retain their JSON type, so `42`, `"42"`, `true`, and `null` are distinct.
+Use POST with `/all`, `/ids`, or `/query`; unfiltered GET requests remain valid.
+The CLI accepts the same objects with repeated `--filter '<json>'` arguments.
 
 ## Clustering
 
@@ -151,7 +172,10 @@ Design notes inherited from Switchblade:
 
 - Delete is a soft delete (`ttl = now - 5`); rows are physically removed
   only after a 2-hour grace window so returning nodes can catch up.
-- Filter queries use an md5("key=value") index table with AND semantics.
+- Filter queries use SQLite JSON functions directly against document values.
+  Filters have `key`, `operator`, and typed `value` fields; dotted keys traverse
+  nested objects, and multiple filters use AND semantics. Supported operators
+  are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`.
 - Shard files are copied between nodes only through `sqlite3_backup_*`
   while journal mode is DELETE / synchronous FULL, so transfers are
   always consistent.

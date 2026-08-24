@@ -36,7 +36,7 @@ typedef struct zdb_repl zdb_repl;
 
 /* Applies a replicated change document:
  *   {"op":"put","db":..,"partition":..,"keyspace":..,"id":..,
- *    "value":{..},"ttl_abs":-1|epoch,"ts":epoch,"filters":["k=v",..]}
+ *    "value":{..},"ttl_abs":-1|epoch,"ts":epoch,"origin":node_id}
  *   {"op":"delete",...same minus value/ttl...}
  * Returns true when the change is current locally afterwards.
  * ud is the user-data pointer passed to zdb_repl_set_handlers. */
@@ -44,7 +44,7 @@ typedef bool (*zdb_repl_apply_fn)(void *ud, const cJSON *change);
 
 /* Answers a quorum read request document:
  *   {"q":"get","db":..,"partition":..,"keyspace":..,"id":..}
- *   {"q":"all"|"query"|...,"filters":[..],"fields":[..]}
+ *   {"q":"all_ts"|"query_ts"|"ids",...,"filters":[{..},..]}
  * Returned JSON (malloc'd) shape:
  *   get:    {"row":{"id":..,"timestamp":..,"value":{..}}} or {"row":null}
  *   all/query: {"rows":[{"id":..,"timestamp":..,"value":{..}},..]}
@@ -91,15 +91,13 @@ cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
 /* Merged collection reads over live replicas; shapes match the local
  * engine calls (plain values / id strings). */
 cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
-                         const char *keyspace, const char **filters,
-                         size_t nfilters);
+                         const char *keyspace, const cJSON *filters);
 cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
                            const char *partition, const char *keyspace,
-                           const char **filters, size_t nfilters,
-                           const char **fields, size_t nfields);
+                           const cJSON *filters);
 char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
-                         const char *keyspace, const char **filters,
-                         size_t nfilters, size_t *count_out);
+                         const char *keyspace, const cJSON *filters,
+                         size_t *count_out);
 
 /* --- stage 6c: delta catch-up ---------------------------------------- */
 

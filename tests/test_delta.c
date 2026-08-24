@@ -74,7 +74,7 @@ static bool test_apply_change(void *ud, const cJSON *change)
                                 : -1;
         bool ok = zdb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
-                                  value_json, ttl_abs, ts, NULL, 0);
+                                  value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
@@ -125,7 +125,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
         }
     } else if (strcmp(jq->valuestring, "all_ts") == 0) {
         cJSON *rows = zdb_all_ts(n->engine, jpart->valuestring,
-                                 jks->valuestring, NULL, 0);
+                                 jks->valuestring, NULL);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
     } else {
@@ -224,8 +224,8 @@ static bool mesh_converged(void *ctxp)
 static bool rows_equal(zdb_engine *a, zdb_engine *b, const char *part,
                        const char *ks)
 {
-    cJSON *ra = zdb_all_ts(a, part, ks, NULL, 0);
-    cJSON *rb = zdb_all_ts(b, part, ks, NULL, 0);
+    cJSON *ra = zdb_all_ts(a, part, ks, NULL);
+    cJSON *rb = zdb_all_ts(b, part, ks, NULL);
     bool match = false;
     if (ra && rb &&
         cJSON_GetArraySize(ra) == cJSON_GetArraySize(rb)) {
@@ -333,7 +333,7 @@ int main(void)
     zdb_shard_invalidate(d.engine, "main", "kv");
 
     /* d now holds the base snapshot but not the deltas below */
-    cJSON *base = zdb_all_ts(d.engine, "main", "kv", NULL, 0);
+    cJSON *base = zdb_all_ts(d.engine, "main", "kv", NULL);
     CHECK(base && cJSON_GetArraySize(base) == 200);
     cJSON_Delete(base);
 
@@ -376,7 +376,7 @@ int main(void)
     }
     CHECK(converged);
 
-    cJSON *all = zdb_all_ts(d.engine, "main", "kv", NULL, 0);
+    cJSON *all = zdb_all_ts(d.engine, "main", "kv", NULL);
     CHECK(all && cJSON_GetArraySize(all) == 250);
     cJSON_Delete(all);
 
