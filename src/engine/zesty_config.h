@@ -85,6 +85,21 @@ bool zdb_user_set_groups(zdb_config *cfg, const char *name, uint64_t groups);
 bool zdb_user_get(zdb_config *cfg, const char *name, zdb_user_info *out);
 zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out);
 
+/* Stores a salted, iterated SHA-256 hash of `password` on the user record.
+ * Returns false when the user does not exist. */
+bool zdb_user_set_password(zdb_config *cfg, const char *name,
+                           const char *password);
+
+/* True when the stored password hash matches `password`. */
+bool zdb_user_verify_password(zdb_config *cfg, const char *name,
+                              const char *password);
+
+/* True when the user has a stored password. */
+bool zdb_user_has_password(zdb_config *cfg, const char *name);
+
+/* True when at least one user holds admin rights (group bit 1). */
+bool zdb_admin_exists(zdb_config *cfg);
+
 /* --- partitions ------------------------------------------------------- */
 
 typedef struct {

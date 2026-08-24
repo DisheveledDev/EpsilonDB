@@ -18,6 +18,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "admin/admin_console.h"
 #include "api/zesty_api.h"
 #include "engine/zesty_config.h"
 #include "httpd/zesty_http.h"
@@ -141,9 +142,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (!zdb_http_serve_static(srv, "/admin", admin_dir)) {
-        fprintf(stderr, "zestyd: failed to register admin static route\n");
+    if (!zdb_admin_console_register(srv)) {
+        fprintf(stderr, "zestyd: failed to register admin console\n");
     }
+    (void)admin_dir;
 
     if (!zdb_api_register(srv, engine, config)) {
         fprintf(stderr, "zestyd: failed to register API routes\n");

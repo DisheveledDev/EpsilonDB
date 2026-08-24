@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "../../vendor/cjson/cJSON.h"
+#include "../engine/random.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -23,6 +24,97 @@ static api_ctx g_ctx;   /* handlers receive no user pointer; single server */
 static zdb_cluster *g_cluster;   /* may be NULL: clustering disabled */
 static zdb_repl *g_repl;         /* may be NULL: replication disabled */
 static pthread_mutex_t g_data_put_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------------------------------------------------------ */
+/* admin console sessions                                              */
+
+#define ZDB_SESSION_CAPACITY 256
+#define ZDB_SESSION_TTL      43200   /* seconds: 12 hours */
+
+typedef struct {
+    char token[65];
+    char username[128];
+    uint64_t groups;
+    long long expires;
+    bool used;
+} zdb_session;
+
+static zdb_session g_sessions[ZDB_SESSION_CAPACITY];
+static pthread_mutex_t g_session_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static long long session_now(void)
+{
+    return (long long)time(NULL);
+}
+
+static bool session_lookup(const char *token, char username[128],
+                           uint64_t *groups)
+{
+    if (!token) {
+        return false;
+    }
+    long long now = session_now();
+    pthread_mutex_lock(&g_session_lock);
+    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
+        zdb_session *s = &g_sessions[i];
+        if (s->used && strcmp(s->token, token) == 0) {
+            if (s->expires <= now) {
+                s->used = false;
+                pthread_mutex_unlock(&g_session_lock);
+                return false;
+            }
+            snprintf(username, 128, "%s", s->username);
+            *groups = s->groups;
+            pthread_mutex_unlock(&g_session_lock);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_session_lock);
+    return false;
+}
+
+static void session_create(const char *username, uint64_t groups,
+                           char token_out[65])
+{
+    char token[65];
+    zdb_random_hex(token, 64);
+
+    pthread_mutex_lock(&g_session_lock);
+    zdb_session *slot = NULL;
+    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
+        if (!g_sessions[i].used || g_sessions[i].expires <= session_now()) {
+            slot = &g_sessions[i];
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &g_sessions[0];
+    }
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->token, sizeof(slot->token), "%s", token);
+    snprintf(slot->username, sizeof(slot->username), "%s", username);
+    slot->groups = groups;
+    slot->expires = session_now() + ZDB_SESSION_TTL;
+    slot->used = true;
+    pthread_mutex_unlock(&g_session_lock);
+
+    snprintf(token_out, 65, "%s", token);
+}
+
+static void session_destroy(const char *token)
+{
+    if (!token) {
+        return;
+    }
+    pthread_mutex_lock(&g_session_lock);
+    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
+        if (g_sessions[i].used && strcmp(g_sessions[i].token, token) == 0) {
+            g_sessions[i].used = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_session_lock);
+}
 
 void zdb_api_set_cluster(zdb_cluster *cluster)
 {
@@ -334,11 +426,16 @@ static uint64_t authenticate(const zdb_http_request *req,
     }
 
     if (g_ctx.config && token && *token) {
-        zdb_user_info user;
-        if (zdb_user_get(g_ctx.config, token, &user)) {
-            groups = user.groups;
+        char session_username[128];
+        if (session_lookup(token, session_username, &groups)) {
+            /* authenticated via an admin console session token */
         } else {
-            *ok = false;
+            zdb_user_info user;
+            if (zdb_user_get(g_ctx.config, token, &user)) {
+                groups = user.groups;
+            } else {
+                *ok = false;
+            }
         }
     } else {
         size_t nusers = 0;
@@ -1425,6 +1522,162 @@ static bool handle_status(const zdb_http_request *req,
 }
 
 /* ------------------------------------------------------------------ */
+/* admin console authentication                                        */
+
+static const char *bearer_token(const zdb_http_request *req, char out[256])
+{
+    const char *hdr = zdb_http_header(req, "Authorization");
+    if (!hdr) {
+        hdr = zdb_http_header(req, "authorization");
+    }
+    if (hdr) {
+        const char *value = strncmp(hdr, "Bearer ", 7) == 0 ? hdr + 7 : hdr;
+        if (snprintf(out, 256, "%s", value) < 256) {
+            return out;
+        }
+    }
+    return NULL;
+}
+
+static void respond_groups_json(zdb_http_response *res, int status,
+                                const char *token, const char *username,
+                                uint64_t groups)
+{
+    char group_bits[32];
+    snprintf(group_bits, sizeof(group_bits), "%llu",
+             (unsigned long long)groups);
+    cJSON *o = cJSON_CreateObject();
+    if (token) {
+        cJSON_AddStringToObject(o, "token", token);
+    }
+    cJSON_AddStringToObject(o, "username", username);
+    cJSON_AddRawToObject(o, "groups", group_bits);
+    respond_json(res, status, o);
+}
+
+static bool handle_console_state(const zdb_http_request *req,
+                                 zdb_http_response *res)
+{
+    bool setup_required = g_ctx.config && !zdb_admin_exists(g_ctx.config);
+    bool authenticated = false;
+    char username[128] = "";
+    uint64_t groups = 0;
+    char token[256];
+    const char *presented = bearer_token(req, token);
+    if (presented) {
+        authenticated = session_lookup(presented, username, &groups);
+    }
+    size_t peers = 0;
+    if (g_cluster) {
+        zdb_peer_info info[64];
+        peers = zdb_cluster_peers(g_cluster, info, 64);
+    }
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "setup_required", setup_required);
+    cJSON_AddBoolToObject(o, "authenticated", authenticated);
+    cJSON_AddStringToObject(o, "username", authenticated ? username : "");
+    cJSON_AddBoolToObject(o, "clustered", g_cluster != NULL);
+    cJSON_AddNumberToObject(o, "peers", (double)peers);
+    respond_json(res, 200, o);
+    return true;
+}
+
+static bool handle_admin_login(const zdb_http_request *req,
+                               zdb_http_response *res)
+{
+    if (strcmp(req->method, "POST") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    cJSON *body = NULL;
+    if (!body_json(req, &body) || !cJSON_IsObject(body)) {
+        respond_error(res, 400, "JSON object required");
+        cJSON_Delete(body);
+        return true;
+    }
+    const cJSON *username = cJSON_GetObjectItemCaseSensitive(body, "username");
+    const cJSON *password = cJSON_GetObjectItemCaseSensitive(body, "password");
+    if (!cJSON_IsString(username) || !cJSON_IsString(password) ||
+        !zdb_user_verify_password(g_ctx.config, username->valuestring,
+                                  password->valuestring)) {
+        cJSON_Delete(body);
+        respond_error(res, 401, "invalid credentials");
+        return true;
+    }
+    zdb_user_info user;
+    if (!zdb_user_get(g_ctx.config, username->valuestring, &user)) {
+        cJSON_Delete(body);
+        respond_error(res, 401, "invalid credentials");
+        return true;
+    }
+    char token[65];
+    session_create(user.name, user.groups, token);
+    cJSON_Delete(body);
+    respond_groups_json(res, 200, token, user.name, user.groups);
+    return true;
+}
+
+static bool handle_admin_setup(const zdb_http_request *req,
+                               zdb_http_response *res)
+{
+    if (strcmp(req->method, "POST") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    if (g_ctx.config && zdb_admin_exists(g_ctx.config)) {
+        respond_error(res, 409, "admin already configured");
+        return true;
+    }
+    cJSON *body = NULL;
+    if (!body_json(req, &body) || !cJSON_IsObject(body)) {
+        respond_error(res, 400, "JSON object required");
+        cJSON_Delete(body);
+        return true;
+    }
+    const cJSON *username = cJSON_GetObjectItemCaseSensitive(body, "username");
+    const cJSON *password = cJSON_GetObjectItemCaseSensitive(body, "password");
+    const char *name = cJSON_IsString(username) && username->valuestring &&
+                               *username->valuestring
+                           ? username->valuestring
+                           : "admin";
+    if (!cJSON_IsString(password) || !password->valuestring ||
+        strlen(password->valuestring) < 4 ||
+        strlen(password->valuestring) > 256) {
+        cJSON_Delete(body);
+        respond_error(res, 400, "password must be 4-256 characters");
+        return true;
+    }
+    if (!zdb_user_create(g_ctx.config, name, 1ULL)) {
+        cJSON_Delete(body);
+        respond_error(res, 409, "could not create admin user");
+        return true;
+    }
+    if (!zdb_user_set_password(g_ctx.config, name, password->valuestring)) {
+        cJSON_Delete(body);
+        respond_error(res, 500, "could not store password");
+        return true;
+    }
+    char token[65];
+    session_create(name, 1ULL, token);
+    cJSON_Delete(body);
+    respond_groups_json(res, 200, token, name, 1ULL);
+    return true;
+}
+
+static bool handle_admin_logout(const zdb_http_request *req,
+                                zdb_http_response *res)
+{
+    char token[256];
+    const char *presented = bearer_token(req, token);
+    if (presented) {
+        session_destroy(presented);
+    }
+    respond_json(res, 200, NULL);
+    res->body = zdb_http_body_printf(&res->body_len, "{\"ok\":true}");
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 
 bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
                       zdb_config *config)
@@ -1478,5 +1731,13 @@ bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
     ok &= zdb_http_add_handler(srv, "DELETE", "/admin/settings",
                                handle_settings);
     ok &= zdb_http_add_handler(srv, "GET", "/status", handle_status);
+    ok &= zdb_http_add_handler(srv, "GET", "/admin/console/state",
+                               handle_console_state);
+    ok &= zdb_http_add_handler(srv, "POST", "/admin/login",
+                               handle_admin_login);
+    ok &= zdb_http_add_handler(srv, "POST", "/admin/setup",
+                               handle_admin_setup);
+    ok &= zdb_http_add_handler(srv, "POST", "/admin/logout",
+                               handle_admin_logout);
     return ok;
 }

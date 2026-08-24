@@ -47,6 +47,14 @@ dependencies: SQLite and cJSON are vendored under `src/sqlite/` and
                     # replication, structure, snapshot, delta, rebalance,
                     # live join, chaos); takes a few minutes
     make clean      # removes bin/ and test artifacts
+    make STATIC=1   # Linux/glibc only: fully static executables
+
+SQLite and cJSON are already compiled into the executables, so the only
+external dependency is the C library. `make STATIC=1` links that too on
+Linux/glibc, producing standalone binaries that can be copied to any other
+machine with the same architecture. macOS does not ship a static system
+library, so `STATIC=1` is rejected there; macOS binaries are already
+self-contained apart from the OS-provided libSystem.
 
 ## Running
 
@@ -55,10 +63,23 @@ Start a single server:
     bin/zestyd -p 8123 -d ./data
 
 Options: `-p port` (HTTP, default 8123), `-b addr` (bind address),
-`-d dir` (data dir), `-a dir` (admin UI static dir), `-s path`
-(Unix admin socket, default `./zesty-admin.sock`). Add `-n port` to
-enable clustering (peer port) and `-A addr` to override the advertised
-address.
+`-d dir` (data dir), `-s path` (Unix admin socket, default
+`./zesty-admin.sock`). Add `-n port` to enable clustering (peer port) and
+`-A addr` to override the advertised address.
+
+## Admin console
+
+The embedded Bootstrap web console is served at `/admin` straight from the
+`zestyd` binary. On first run it shows a setup form that creates the `admin`
+user with a password; afterwards it presents a login form. The console then
+exposes the same operations as `zestyctl` (status, databases, groups, users,
+partitions, keyspaces, settings, data, and cluster) backed by the JSON API.
+
+Passwords are stored as salted, iterated SHA-256 hashes and authenticate via
+short-lived session tokens (`Authorization: Bearer <token>`). The console's
+own HTML/JS is embedded; only the Bootstrap stylesheet and script load from
+the jsDelivr CDN (the default Bootstrap theme). Use a TLS-terminating reverse
+proxy in front of the HTTP port in production.
 
 The Unix admin socket speaks HTTP without authentication and is what
 `zestyctl` uses by default (full local admin rights).

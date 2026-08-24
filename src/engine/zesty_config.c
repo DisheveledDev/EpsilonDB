@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "random.h"
+#include "sha256.h"
+
 /* Every config record is a JSON document stored in a dedicated __system__
  * keyspace, so list operations need no secondary filter records. */
 
@@ -452,6 +455,144 @@ zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out)
     cJSON_Delete(all);
     *count_out = n;
     return out;
+}
+
+/* --- passwords ---------------------------------------------------------- */
+
+#define ZDB_PASSWORD_ITERATIONS 100000
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool hex_decode(const char *hex, uint8_t *out, size_t out_len)
+{
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = hex_value(hex[i * 2]);
+        int lo = hex_value(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+/* Iterated salted SHA-256 (a simple, dependency-free key stretch). */
+static void hash_password(const char *salt_hex, const char *password,
+                          char out[65])
+{
+    uint8_t salt[16];
+    if (!hex_decode(salt_hex, salt, sizeof(salt))) {
+        memset(salt, 0, sizeof(salt));
+    }
+    size_t plen = strlen(password);
+    if (plen > 256) {
+        plen = 256;
+    }
+    uint8_t input[16 + 256];
+    memcpy(input, salt, sizeof(salt));
+    memcpy(input + sizeof(salt), password, plen);
+
+    uint8_t digest[32];
+    zdb_sha256(input, sizeof(salt) + plen, digest);
+    for (int i = 1; i < ZDB_PASSWORD_ITERATIONS; i++) {
+        zdb_sha256(digest, sizeof(digest), digest);
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0xf];
+    }
+    out[64] = '\0';
+}
+
+bool zdb_user_set_password(zdb_config *cfg, const char *name,
+                           const char *password)
+{
+    if (!cfg || !name || !password || !*password) {
+        return false;
+    }
+    zdb_user_info existing;
+    if (!zdb_user_get(cfg, name, &existing)) {
+        return false;
+    }
+    char salt_hex[33];
+    zdb_random_hex(salt_hex, 32);
+    char hash[65];
+    hash_password(salt_hex, password, hash);
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return false;
+    }
+    cJSON_AddStringToObject(obj, "type", "user");
+    cJSON_AddStringToObject(obj, "name", name);
+    set_json_u64(obj, "groups", existing.groups);
+    cJSON_AddStringToObject(obj, "salt", salt_hex);
+    cJSON_AddStringToObject(obj, "password_hash", hash);
+    bool ok = store(cfg, CFG_KEYSPACE_USERS, name, obj);
+    cJSON_Delete(obj);
+    return ok;
+}
+
+bool zdb_user_verify_password(zdb_config *cfg, const char *name,
+                              const char *password)
+{
+    if (!cfg || !name || !password) {
+        return false;
+    }
+    cJSON *obj = fetch(cfg, CFG_KEYSPACE_USERS, name);
+    if (!obj) {
+        return false;
+    }
+    const cJSON *salt = cJSON_GetObjectItemCaseSensitive(obj, "salt");
+    const cJSON *hash = cJSON_GetObjectItemCaseSensitive(obj, "password_hash");
+    bool ok = false;
+    if (cJSON_IsString(salt) && cJSON_IsString(hash) &&
+        strlen(salt->valuestring) == 32 &&
+        strlen(hash->valuestring) == 64) {
+        char expected[65];
+        hash_password(salt->valuestring, password, expected);
+        ok = strcmp(expected, hash->valuestring) == 0;
+    }
+    cJSON_Delete(obj);
+    return ok;
+}
+
+bool zdb_user_has_password(zdb_config *cfg, const char *name)
+{
+    if (!cfg || !name) {
+        return false;
+    }
+    cJSON *obj = fetch(cfg, CFG_KEYSPACE_USERS, name);
+    if (!obj) {
+        return false;
+    }
+    const cJSON *hash = cJSON_GetObjectItemCaseSensitive(obj, "password_hash");
+    bool has = cJSON_IsString(hash) && hash->valuestring &&
+               strlen(hash->valuestring) == 64;
+    cJSON_Delete(obj);
+    return has;
+}
+
+bool zdb_admin_exists(zdb_config *cfg)
+{
+    size_t count = 0;
+    zdb_user_info *users = zdb_user_list(cfg, &count);
+    bool exists = false;
+    for (size_t i = 0; users && i < count; i++) {
+        if (users[i].groups & 1ULL) {
+            exists = true;
+            break;
+        }
+    }
+    free(users);
+    return exists;
 }
 
 /* --- partitions --------------------------------------------------------- */
