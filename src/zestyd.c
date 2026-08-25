@@ -17,14 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "admin/admin_console.h"
 #include "api/zesty_api.h"
 #include "engine/zesty_config.h"
 #include "httpd/zesty_http.h"
 #include "socket/zesty_cluster.h"
+#include "zesty_log.h"
 
 #define DEFAULT_ADMIN_SOCK "zesty-admin.sock"
+#define DEFAULT_LOG_PATH   "/var/log/zestydb/zestydb.log"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -32,6 +35,76 @@ static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* banner                                                              */
+
+#define C_RESET  "\033[0m"
+#define C_BOLD   "\033[1m"
+#define C_GREEN  "\033[32m"
+#define C_YELLOW "\033[33m"
+
+static bool use_colour(void)
+{
+    return isatty(STDOUT_FILENO);
+}
+
+static void print_banner(void)
+{
+    const char *g = use_colour() ? C_GREEN : "";
+    const char *b = use_colour() ? C_BOLD : "";
+    const char *y = use_colour() ? C_YELLOW : "";
+    const char *r = use_colour() ? C_RESET : "";
+
+    printf("%s%s", b, g);
+    printf("   ███████╗███████╗███████╗████████╗██╗   ██╗██████╗ ██████╗\n");
+    printf("   ╚══███╔╝██╔════╝██╔════╝╚══██╔══╝╚██╗ ██╔╝██╔══██╗██╔══██╗\n");
+    printf("     ███╔╝ ███████╗███████╗   ██║    ╚████╔╝ ██║  ██║██████╔╝\n");
+    printf("    ███╔╝  ██╔════╝╚════██║   ██║     ╚██╔╝  ██║  ██║██╔══██╗\n");
+    printf("   ███████╗███████║███████║   ██║      ██║   ██████╔╝██████╔╝\n");
+    printf("   ╚══════╝╚══════╝╚══════╝   ╚═╝      ╚═╝   ╚═════╝ ╚═════╝\n");
+    printf("%s%s", y, r);
+    printf("        distributed key/value database server\n");
+    printf("%s", r);
+}
+
+static void print_usage(const char *prog)
+{
+    printf("ZestyDB - distributed key/value database server\n");
+    printf("\n");
+    printf("Usage: %s [options]\n", prog);
+    printf("\n");
+    printf("Network (HTTP client-facing port):\n");
+    printf("  -p, --port <port>       HTTP REST API port (default: 8123)\n");
+    printf("  -b, --bind <addr>       address to bind the HTTP port to\n");
+    printf("                          (default: 0.0.0.0, all interfaces)\n");
+    printf("  -s, --socket <path>     Unix admin socket for zestyctl (trusted,\n");
+    printf("                          no auth; default: ./zesty-admin.sock)\n");
+    printf("\n");
+    printf("Clustering (node-to-node mesh):\n");
+    printf("  -n, --peer-port <port>  enable clustering and bind this raw peer\n");
+    printf("                          port (default: clustering disabled); the\n");
+    printf("                          peer listener always binds 0.0.0.0\n");
+    printf("  -A, --advertise <addr>  address advertised to other nodes\n");
+    printf("                          (default: 127.0.0.1)\n");
+    printf("\n");
+    printf("Storage:\n");
+    printf("  -d, --data <dir>        data directory holding one SQLite file per\n");
+    printf("                          shard (default: ./data)\n");
+    printf("  -a, --admin <dir>       admin console directory (default: ./admin)\n");
+    printf("\n");
+    printf("Logging:\n");
+    printf("  -l, --log <file>        log file path\n");
+    printf("                          (default: /var/log/zestydb/zestydb.log;\n");
+    printf("                          falls back to console if not writable)\n");
+    printf("\n");
+    printf("Misc:\n");
+    printf("  -h, --help              show this help and exit\n");
+    printf("\n");
+    printf("TLS is terminated by a reverse proxy in front of the HTTP port.\n");
+    printf("Before any user exists, unauthenticated HTTP requests run with full\n");
+    printf("rights so the first admin can be created (or use the admin socket).\n");
 }
 
 int main(int argc, char **argv)
@@ -43,6 +116,7 @@ int main(int argc, char **argv)
     const char *admin_sock = DEFAULT_ADMIN_SOCK;
     int peer_port = 0;              /* 0 = clustering disabled */
     const char *advertise_addr = "127.0.0.1";
+    const char *log_path = DEFAULT_LOG_PATH;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) &&
@@ -66,59 +140,65 @@ int main(int argc, char **argv)
         } else if ((strcmp(argv[i], "-A") == 0 ||
                     strcmp(argv[i], "--advertise") == 0) && i + 1 < argc) {
             advertise_addr = argv[++i];
+        } else if ((strcmp(argv[i], "-l") == 0 ||
+                    strcmp(argv[i], "--log") == 0) && i + 1 < argc) {
+            log_path = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
-            printf("usage: %s [-p port] [-b addr] [-d data_dir]"
-                   " [-a admin_dir] [-s admin_socket] [-n peer_port]"
-                   " [-A advertise_addr]\n",
-                   argv[0]);
+            print_usage(argv[0]);
             return 0;
         }
     }
 
+    zdb_log_open(log_path);
+    print_banner();
+
     zdb_engine *engine = zdb_engine_open(data_dir);
     if (!engine) {
-        fprintf(stderr, "zestyd: failed to open data directory '%s'\n",
-                data_dir);
+        zdb_log("ERROR", "failed to open data directory '%s'", data_dir);
+        zdb_log_close();
         return 1;
     }
     zdb_config *config = zdb_config_open(engine);
     if (!config) {
-        fprintf(stderr, "zestyd: failed to open config store\n");
+        zdb_log("ERROR", "failed to open config store");
         zdb_engine_close(engine);
+        zdb_log_close();
         return 1;
     }
 
     /* validate ports before anything binds */
     if (port < 1 || port > 65535) {
-        fprintf(stderr, "zestyd: invalid port %d\n", port);
+        zdb_log("ERROR", "invalid port %d", port);
         zdb_config_close(config);
         zdb_engine_close(engine);
+        zdb_log_close();
         return 1;
     }
     if (peer_port < 0 || peer_port > 65535) {
-        fprintf(stderr, "zestyd: invalid peer port %d\n", peer_port);
+        zdb_log("ERROR", "invalid peer port %d", peer_port);
         zdb_config_close(config);
         zdb_engine_close(engine);
+        zdb_log_close();
         return 1;
     }
 
     zdb_cluster *cluster = NULL;
     zdb_repl *repl = NULL;
+    char node_id[ZDB_NODE_ID_MAX] = "";
     if (peer_port > 0) {
-        char node_id[ZDB_NODE_ID_MAX];
         cluster = zdb_cluster_start(config, advertise_addr, peer_port,
                                     node_id);
         if (!cluster) {
-            fprintf(stderr, "zestyd: failed to start cluster service on"
-                            " peer port %d\n", peer_port);
+            zdb_log("ERROR", "failed to start cluster service on peer port %d",
+                 peer_port);
             zdb_config_close(config);
             zdb_engine_close(engine);
+            zdb_log_close();
             return 1;
         }
-        printf("zestyd cluster node %s advertising %s:%d"
-               " (peer port %d)\n",
-               node_id, advertise_addr, peer_port, peer_port);
+        zdb_log("INFO", "cluster node %s advertising %s:%d (peer port %d)",
+             node_id, advertise_addr, peer_port, peer_port);
 
         /* re-enable mesh encryption from the persisted key (restart) */
         {
@@ -132,10 +212,11 @@ int main(int argc, char **argv)
         /* stage 5 replication on top of the mesh */
         repl = zdb_repl_start(cluster, config, data_dir);
         if (!repl) {
-            fprintf(stderr, "zestyd: failed to start replication service\n");
+            zdb_log("ERROR", "failed to start replication service");
             zdb_cluster_stop(cluster);
             zdb_config_close(config);
             zdb_engine_close(engine);
+            zdb_log_close();
             return 1;
         }
     }
@@ -144,25 +225,28 @@ int main(int argc, char **argv)
 
     zdb_http_server *srv = zdb_http_start(bind_addr, port);
     if (!srv) {
+        zdb_log("ERROR", "failed to bind HTTP port %d", port);
         zdb_repl_stop(repl);
         zdb_cluster_stop(cluster);
         zdb_config_close(config);
         zdb_engine_close(engine);
+        zdb_log_close();
         return 1;
     }
 
     if (!zdb_admin_console_register(srv)) {
-        fprintf(stderr, "zestyd: failed to register admin console\n");
+        zdb_log("WARN", "failed to register admin console");
     }
     (void)admin_dir;
 
     if (!zdb_api_register(srv, engine, config)) {
-        fprintf(stderr, "zestyd: failed to register API routes\n");
+        zdb_log("ERROR", "failed to register API routes");
         zdb_http_stop(srv);
         zdb_repl_stop(repl);
         zdb_cluster_stop(cluster);
         zdb_config_close(config);
         zdb_engine_close(engine);
+        zdb_log_close();
         return 1;
     }
 
@@ -171,27 +255,36 @@ int main(int argc, char **argv)
 
     /* local admin socket: zestyctl connects here, trusted, no auth */
     if (admin_sock && !zdb_http_start_admin(srv, admin_sock)) {
-        fprintf(stderr, "zestyd: warning: admin socket '%s' unavailable\n",
-                admin_sock);
+        zdb_log("WARN", "admin socket '%s' unavailable",
+             admin_sock);
     }
 
-    printf("zestyd listening on port %d, data in '%s', admin socket '%s'\n",
-           port, data_dir, admin_sock ? admin_sock : "disabled");
+    /* workload/performance analytics recorder */
+    zdb_api_analytics_start(config, node_id);
+
+    zdb_log("INFO", "listening on port %d, data in '%s', admin socket '%s'",
+         port, data_dir, admin_sock ? admin_sock : "disabled");
 
     /* The accept loop runs inside its own thread started by
      * zdb_http_start's design; wait here for shutdown. */
+    int tick = 0;
     while (!g_stop) {
+        if (++tick % 10 == 0) {
+            zdb_log_rotate_if_needed();
+        }
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
 
-    printf("zestyd shutting down\n");
+    zdb_log("INFO", "shutting down");
     zdb_http_stop(srv);
+    zdb_api_analytics_stop();
     zdb_api_set_cluster(NULL);
     zdb_api_set_repl(NULL);
     zdb_repl_stop(repl);
     zdb_cluster_stop(cluster);
     zdb_config_close(config);
     zdb_engine_close(engine);
+    zdb_log_close();
     return 0;
 }

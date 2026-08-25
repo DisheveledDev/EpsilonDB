@@ -36,4 +36,9 @@ void zdb_api_set_cluster(zdb_cluster *cluster);
  * quorum copies. */
 void zdb_api_set_repl(zdb_repl *repl);
 
+/* Starts (or stops) the workload/performance analytics recorder. `node_id`
+ * identifies this node's snapshot in the cluster-wide analytics store. */
+void zdb_api_analytics_start(zdb_config *cfg, const char *node_id);
+void zdb_api_analytics_stop(void);
+
 #endif

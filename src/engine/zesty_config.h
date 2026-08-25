@@ -109,6 +109,10 @@ typedef struct {
     uint64_t update_mask;
     uint64_t read_mask;
     uint64_t delete_mask;
+    long long cache_size;       /* SQLite cache_size; 0 = default */
+    char journal_mode[16];      /* DELETE | TRUNCATE | WAL */
+    long long vacuum_seconds;   /* 0 = never */
+    long long reindex_seconds;  /* 0 = never */
 } zdb_partition_info;
 
 bool zdb_partition_create(zdb_config *cfg, const char *database,
@@ -125,6 +129,17 @@ bool zdb_partition_get(zdb_config *cfg, const char *database,
                        const char *name, zdb_partition_info *out);
 zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
                                        size_t *count_out);
+
+/* Updates the SQLite tuning settings (cache size / journal mode / vacuum &
+ * reindex intervals) for a partition. Reopens any open shard connection for
+ * that partition so the new settings take effect immediately. */
+bool zdb_partition_set_settings(zdb_config *cfg, const char *database,
+                                const char *name,
+                                const zdb_shard_settings *settings);
+
+/* Registers the engine's shard-settings provider so newly opened shards
+ * pick up their partition's tuning. Call after zdb_config_open. */
+void zdb_config_register_settings(zdb_config *cfg);
 
 /* Transparent partition registration: creates the partition (with
  * allow-all masks) and records keyspace usage if they do not exist yet.

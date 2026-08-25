@@ -1,5 +1,6 @@
 #include "zesty_http.h"
 
+#include "../zesty_log.h"
 #include <arpa/inet.h>
 #include <sys/un.h>
 #include <ctype.h>
@@ -664,7 +665,7 @@ static void *accept_main(void *arg)
             if (errno == EINTR || errno == ECONNABORTED) {
                 continue;
             }
-            fprintf(stderr, "zdb: accept failed: %s\n", strerror(errno));
+            zdb_log("WARN", "accept failed: %s", strerror(errno));
             continue;
         }
 
@@ -746,13 +747,13 @@ bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
         return false;
     }
     if (strlen(sock_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "zdb: admin socket path too long: %s\n", sock_path);
+        zdb_log("ERROR", "admin socket path too long: %s", sock_path);
         return false;
     }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "zdb: admin socket() failed: %s\n", strerror(errno));
+        zdb_log("ERROR", "admin socket() failed: %s", strerror(errno));
         return false;
     }
 
@@ -762,7 +763,7 @@ bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
         listen(fd, ZDB_HTTP_BACKLOG) != 0) {
-        fprintf(stderr, "zdb: admin bind/listen on '%s' failed: %s\n",
+        zdb_log("ERROR", "admin bind/listen on '%s' failed: %s",
                 sock_path, strerror(errno));
         close(fd);
         return false;
@@ -813,7 +814,7 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
     }
     if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
         listen(srv->listen_fd, ZDB_HTTP_BACKLOG) != 0) {
-        fprintf(stderr, "zdb: http bind/listen on port %d failed: %s\n",
+        zdb_log("ERROR", "http bind/listen on port %d failed: %s",
                 port, strerror(errno));
         close(srv->listen_fd);
         pthread_cond_destroy(&srv->workers_done);
@@ -824,7 +825,7 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
     }
 
     if (!spawn_acceptor(srv, srv->listen_fd, false)) {
-        fprintf(stderr, "zdb: failed to start accept thread\n");
+        zdb_log("ERROR", "failed to start accept thread");
         close(srv->listen_fd);
         pthread_cond_destroy(&srv->workers_done);
         pthread_mutex_destroy(&srv->state_lock);

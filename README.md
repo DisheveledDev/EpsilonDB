@@ -67,6 +67,12 @@ Options: `-p port` (HTTP, default 8123), `-b addr` (bind address),
 `./zesty-admin.sock`). Add `-n port` to enable clustering (peer port) and
 `-A addr` to override the advertised address.
 
+The server writes a timestamped log to `/var/log/zestydb/zestydb.log`
+(create the directory first, or run with privileges to write there). Use
+`-l path` to override the log file; when the file cannot be opened the
+server falls back to logging on the console. The log is rotated once per
+day (renamed with a date suffix and gzip-compressed).
+
 ## Admin console
 
 The embedded Bootstrap web console is served at `/admin` straight from the

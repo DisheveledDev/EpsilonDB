@@ -425,7 +425,24 @@ static void chunk_invalidate(void)
     char cmd[1300];
     snprintf(srcp, sizeof(srcp), "%s/%s.sqlite", f.a.dir, key_other);
     snprintf(dstp, sizeof(dstp), "%s/%s.sqlite", f.a.dir, key_main);
-    snprintf(cmd, sizeof(cmd), "cp %s %s", srcp, dstp);
+
+    /* checkpoint the source shard so its committed rows are in the main
+     * file (WAL journaling defers them there until a checkpoint) */
+    {
+        sqlite3 *db = NULL;
+        if (sqlite3_open_v2(srcp, &db, SQLITE_OPEN_READWRITE, NULL) ==
+            SQLITE_OK) {
+            sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL,
+                         NULL);
+            sqlite3_close(db);
+        }
+    }
+
+    /* copy into a temp file and rename over the destination so the old
+     * connection's (now-unlinked) inode is replaced atomically, matching
+     * the snapshot receiver's rename semantics */
+    snprintf(cmd, sizeof(cmd), "cp %s %s.tmp && mv %s.tmp %s",
+             srcp, dstp, dstp, dstp);
     CHECK(system(cmd) == 0);
 
     CHECK(zdb_shard_invalidate(f.a.engine, "main", "kv"));

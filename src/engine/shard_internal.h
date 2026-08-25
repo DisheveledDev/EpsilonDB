@@ -10,7 +10,6 @@
 
 #define ZDB_STMT_CACHE_SIZE 8
 #define ZDB_VACUUM_THRESHOLD 10000
-
 typedef struct {
     char sql[192];
     sqlite3_stmt *stmt;
@@ -19,6 +18,8 @@ typedef struct {
 typedef struct zdb_shard {
     char *path;
     char key[33];              /* framed partition/keyspace digest */
+    char partition[256];       /* owning partition ("" until lazily known) */
+    char keyspace[128];
     sqlite3 *db;
     pthread_mutex_t lock;
     size_t refs;
@@ -28,11 +29,19 @@ typedef struct zdb_shard {
     int cache_count;
 
     long long expired_since_vacuum;
-    bool vacuum_pending;
+    zdb_shard_settings settings;
+    long long last_vacuum_ts;
+    long long last_reindex_ts;
 } zdb_shard;
 
-zdb_shard *zdb_shard_open(const char *path, const char *key);
+zdb_shard *zdb_shard_open(const char *path, const char *key,
+                          const char *partition, const char *keyspace,
+                          const zdb_shard_settings *settings);
 void zdb_shard_free(zdb_shard *sh);
+
+/* Closes and reopens the shard connection with new settings. Returns true
+ * on success (the shard keeps its old connection on failure). */
+bool zdb_shard_reopen(zdb_shard *sh, const zdb_shard_settings *settings);
 
 bool zdb_shard_put(zdb_shard *sh, const char *id, const char *json_value,
                    long long ttl_seconds);

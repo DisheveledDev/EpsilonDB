@@ -27,7 +27,9 @@ VENDOR_SRC = vendor/cjson/cJSON.c src/sqlite/sqlite3.c
 
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
              src/engine/zesty_crypto.c src/engine/shard.c \
-             src/engine/manager.c src/engine/zesty_config.c
+             src/engine/manager.c src/engine/zesty_config.c \
+             src/engine/zesty_analytics.c src/engine/zesty_benchmark.c \
+             src/zesty_log.c
 ENGINE_OBJ = $(ENGINE_SRC:.c=.o) $(VENDOR_SRC:.c=.o)
 ENGINE_LIB = bin/libzesty.a
 SERVER_BIN = bin/zestyd

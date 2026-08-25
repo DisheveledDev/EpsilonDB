@@ -122,6 +122,42 @@ static void set_json_u64(cJSON *obj, const char *field, uint64_t v)
     cJSON_AddStringToObject(obj, field, buf);
 }
 
+static long long json_i64(const cJSON *obj, const char *field)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, field);
+    if (cJSON_IsString(item) && item->valuestring) {
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(item->valuestring, &end, 10);
+        if (errno == 0 && end && *end == '\0') {
+            return value;
+        }
+    }
+    if (cJSON_IsNumber(item)) {
+        return (long long)item->valuedouble;
+    }
+    return 0;
+}
+
+static void set_json_i64(cJSON *obj, const char *field, long long v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    cJSON_AddStringToObject(obj, field, buf);
+}
+
+static void copy_settings(const cJSON *obj, zdb_shard_settings *out)
+{
+    out->cache_size = json_i64(obj, "cache_size");
+    copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
+              "journal_mode");
+    if (out->journal_mode[0] == '\0') {
+        snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+    }
+    out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
+    out->reindex_seconds = json_i64(obj, "reindex_seconds");
+}
+
 zdb_config *zdb_config_open(zdb_engine *engine)
 {
     if (!engine) {
@@ -624,6 +660,12 @@ bool zdb_partition_create(zdb_config *cfg, const char *database,
     set_json_u64(obj, "update_mask", update_mask);
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
+    zdb_shard_settings defaults;
+    zdb_shard_settings_default(&defaults);
+    set_json_i64(obj, "cache_size", defaults.cache_size);
+    cJSON_AddStringToObject(obj, "journal_mode", defaults.journal_mode);
+    set_json_i64(obj, "vacuum_seconds", defaults.vacuum_seconds);
+    set_json_i64(obj, "reindex_seconds", defaults.reindex_seconds);
     bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
     cJSON_Delete(obj);
     return ok;
@@ -665,6 +707,10 @@ bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
     set_json_u64(obj, "update_mask", update_mask);
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
+    set_json_i64(obj, "cache_size", existing.cache_size);
+    cJSON_AddStringToObject(obj, "journal_mode", existing.journal_mode);
+    set_json_i64(obj, "vacuum_seconds", existing.vacuum_seconds);
+    set_json_i64(obj, "reindex_seconds", existing.reindex_seconds);
     bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
     cJSON_Delete(obj);
     return ok;
@@ -688,8 +734,52 @@ bool zdb_partition_get(zdb_config *cfg, const char *database,
     out->update_mask = json_u64(obj, "update_mask");
     out->read_mask = json_u64(obj, "read_mask");
     out->delete_mask = json_u64(obj, "delete_mask");
+    out->cache_size = json_i64(obj, "cache_size");
+    copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
+              "journal_mode");
+    if (out->journal_mode[0] == '\0') {
+        snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+    }
+    out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
+    out->reindex_seconds = json_i64(obj, "reindex_seconds");
     cJSON_Delete(obj);
     return out->name[0] != '\0';
+}
+
+bool zdb_partition_set_settings(zdb_config *cfg, const char *database,
+                                const char *name,
+                                const zdb_shard_settings *settings)
+{
+    if (!cfg || !database || !name || !settings) {
+        return false;
+    }
+    zdb_partition_info existing;
+    if (!zdb_partition_get(cfg, database, name, &existing)) {
+        return false;
+    }
+    char id[384];
+    snprintf(id, sizeof(id), "%s/%s", database, name);
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        return false;
+    }
+    cJSON_AddStringToObject(obj, "type", "partition");
+    cJSON_AddStringToObject(obj, "database", database);
+    cJSON_AddStringToObject(obj, "name", name);
+    set_json_u64(obj, "create_mask", existing.create_mask);
+    set_json_u64(obj, "update_mask", existing.update_mask);
+    set_json_u64(obj, "read_mask", existing.read_mask);
+    set_json_u64(obj, "delete_mask", existing.delete_mask);
+    set_json_i64(obj, "cache_size", settings->cache_size);
+    cJSON_AddStringToObject(obj, "journal_mode", settings->journal_mode);
+    set_json_i64(obj, "vacuum_seconds", settings->vacuum_seconds);
+    set_json_i64(obj, "reindex_seconds", settings->reindex_seconds);
+    bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
+    cJSON_Delete(obj);
+    if (ok) {
+        zdb_engine_reload_partition(cfg->engine, name);
+    }
+    return ok;
 }
 
 /* Returns true if the partition already existed or was created now.
@@ -818,11 +908,52 @@ zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
         out[n].update_mask = json_u64(item, "update_mask");
         out[n].read_mask = json_u64(item, "read_mask");
         out[n].delete_mask = json_u64(item, "delete_mask");
+        out[n].cache_size = json_i64(item, "cache_size");
+        copy_name(out[n].journal_mode, sizeof(out[n].journal_mode), item,
+                  "journal_mode");
+        if (out[n].journal_mode[0] == '\0') {
+            snprintf(out[n].journal_mode, sizeof(out[n].journal_mode), "WAL");
+        }
+        out[n].vacuum_seconds = json_i64(item, "vacuum_seconds");
+        out[n].reindex_seconds = json_i64(item, "reindex_seconds");
         n++;
     }
     cJSON_Delete(all);
     *count_out = n;
     return out;
+}
+
+/* Resolves a partition's tuning by its shard identity (partition name only:
+ * shards are keyed by partition, not database). First matching record wins.
+ * The reserved __system__ partition always uses defaults: its config shards
+ * are what this very provider reads, so reading them here would recurse. */
+static void config_settings_provider(void *ctx, const char *partition,
+                                     zdb_shard_settings *out)
+{
+    if (strcmp(partition, ZDB_SYSTEM_DB) == 0) {
+        return;   /* keep the defaults already in `out` */
+    }
+    zdb_config *cfg = ctx;
+    cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS);
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, all) {
+        char name[256];
+        copy_name(name, sizeof(name), item, "name");
+        if (strcmp(name, partition) != 0) {
+            continue;
+        }
+        copy_settings(item, out);
+        break;
+    }
+    cJSON_Delete(all);
+}
+
+void zdb_config_register_settings(zdb_config *cfg)
+{
+    if (cfg) {
+        zdb_engine_set_settings_provider(cfg->engine,
+                                         config_settings_provider, cfg);
+    }
 }
 
 /* --- authorization ------------------------------------------------------ */

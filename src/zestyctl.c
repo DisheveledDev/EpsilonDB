@@ -667,6 +667,9 @@ static void print_usage(void)
         "cluster (requires zestyd -n <peer_port>):",
         "  join node <addr> <port> [secret]   join an existing mesh via seed",
         "  list nodes | cluster        membership, leader and ranges",
+        "",
+        "performance:",
+        "  bench [records] [replication_factor] [cache_size] [journal_mode]",
         NULL,
     };
     for (int i = 0; lines[i]; i++) {
@@ -797,6 +800,26 @@ static int execute_command(int argc, char **argv)
     /* ---- status ---- */
     if (strcmp(cmd, "status") == 0) {
         return run("GET", "/status", NULL);
+    }
+
+    /* ---- performance benchmark ---- */
+    if (strcmp(cmd, "bench") == 0) {
+        char body[512];
+        long records = argi < argc ? strtol(argv[argi], NULL, 10) : 100000;
+        if (records < 1) {
+            records = 100000;
+        }
+        long rf = argi + 1 < argc ? strtol(argv[argi + 1], NULL, 10) : 1;
+        if (rf < 1) {
+            rf = 1;
+        }
+        long cache = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
+        const char *journal = argi + 3 < argc ? argv[argi + 3] : "WAL";
+        snprintf(body, sizeof(body),
+                 "{\"records\":%ld,\"replication_factor\":%ld,"
+                 "\"cache_size\":%ld,\"journal_mode\":\"%s\"}",
+                 records, rf, cache, journal);
+        return run("POST", "/admin/benchmark", body);
     }
 
     /* ---- help / exit inside the shell ---- */

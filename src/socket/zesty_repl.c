@@ -32,6 +32,7 @@
 #include "../engine/md5.h"
 #include "../engine/zesty_engine.h"
 #include "../sqlite/sqlite3.h"
+#include "../zesty_log.h"
 #include "zstp_wire.h"
 #include "zesty_snap.h"
 
@@ -195,7 +196,7 @@ static bool cache_open(change_cache *cc, const char *data_dir)
                      "DROP TABLE PendingChanges;"
                      "ALTER TABLE PendingChangesV2 RENAME TO PendingChanges;",
                      NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "zdb: change cache init failed: %s\n",
+        zdb_log("ERROR", "change cache init failed: %s",
                 err ? err : "?");
         sqlite3_free(err);
         sqlite3_close(cc->db);
@@ -240,7 +241,7 @@ static void cache_append(change_cache *cc, const char *target,
         sqlite3_bind_text(stmt, 3, payload, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, epoch_now());
         if (sqlite3_step(stmt) != SQLITE_DONE) {
-            fprintf(stderr, "zdb: change cache insert failed: %s\n",
+            zdb_log("ERROR", "change cache insert failed: %s",
                     sqlite3_errmsg(cc->db));
         }
     }
@@ -580,8 +581,8 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
     }
 
     if (acknowledgements < required) {
-        fprintf(stderr,
-                "zdb: quorum lost writing '%s': %d/%d holders reached\n",
+        zdb_log("WARN",
+                "quorum lost writing '%s': %d/%d holders reached",
                 db, acknowledgements, required);
         free(payload);
         cJSON_Delete(change);
@@ -727,6 +728,26 @@ size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id)
     return count;
 }
 
+size_t zdb_repl_pending_total(zdb_repl *rp)
+{
+    if (!rp || !rp->cache.db) {
+        return 0;
+    }
+    pthread_mutex_lock(&rp->cache.lock);
+    sqlite3_stmt *stmt = NULL;
+    size_t count = 0;
+    if (sqlite3_prepare_v2(rp->cache.db,
+                           "SELECT COUNT(*) FROM PendingChanges",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = (size_t)sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    pthread_mutex_unlock(&rp->cache.lock);
+    return count;
+}
+
 size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id)
 {
     if (!rp || !node_id) {
@@ -808,8 +829,8 @@ static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
     }
     free_rows(rows, count);
     if (count && delivered == count) {
-        printf("zdb: replayed %zu cached changes to %s\n", delivered,
-               peer->id);
+        zdb_log("INFO", "replayed %zu cached changes to %s", delivered,
+                peer->id);
     }
 
     pthread_mutex_lock(&rp->replay_lock);
@@ -1775,8 +1796,8 @@ zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
     rp->syncing = false;
 
     if (!cache_open(&rp->cache, data_dir)) {
-        fprintf(stderr, "zdb: change cache unavailable; writes will not"
-                        " be cached for offline nodes\n");
+        zdb_log("WARN", "change cache unavailable; writes will not"
+                        " be cached for offline nodes");
     }
 
     /* install the per-cluster dispatcher before the maintenance thread

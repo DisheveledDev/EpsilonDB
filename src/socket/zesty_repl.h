@@ -117,6 +117,10 @@ void zdb_repl_set_syncing(zdb_repl *rp, bool syncing);
 /* Number of cached changes this node still owes `node_id`. */
 size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id);
 
+/* Total number of cached changes this node still owes across all peers
+ * (replication backlog). Used for cluster health/analytics reporting. */
+size_t zdb_repl_pending_total(zdb_repl *rp);
+
 /* Force-drain this node's cached changes destined for `node_id` right
  * now (blocking, single-flight). Returns the number of changes still
  * queued afterwards (0 = fully caught up). Safe to call from any thread;

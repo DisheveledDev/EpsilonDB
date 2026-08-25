@@ -11,6 +11,8 @@
 
 #include "../../vendor/cjson/cJSON.h"
 #include "../engine/random.h"
+#include "../engine/zesty_analytics.h"
+#include "../engine/zesty_benchmark.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -23,7 +25,16 @@ typedef struct {
 static api_ctx g_ctx;   /* handlers receive no user pointer; single server */
 static zdb_cluster *g_cluster;   /* may be NULL: clustering disabled */
 static zdb_repl *g_repl;         /* may be NULL: replication disabled */
+static zdb_analytics *g_analytics; /* may be NULL: analytics disabled */
 static pthread_mutex_t g_data_put_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Monotonic microseconds for latency measurement. */
+static long long api_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
 
 /* ------------------------------------------------------------------ */
 /* admin console sessions                                              */
@@ -248,6 +259,77 @@ void zdb_api_set_repl(zdb_repl *repl)
                                   repl ? api_replicate_config : NULL, repl);
     }
 }
+
+/* Writes one node's analytics snapshot into the __system__ store (and out
+ * to the cluster through the replication service when clustering is on). */
+static bool api_analytics_flush(void *ctx, const char *node_id,
+                                const char *json, long long ttl_abs)
+{
+    (void)ctx;
+    if (g_repl) {
+        cJSON *change = cJSON_CreateObject();
+        if (!change) {
+            return false;
+        }
+        cJSON_AddStringToObject(change, "op", "put");
+        cJSON_AddStringToObject(change, "db", ZDB_SYSTEM_DB);
+        cJSON_AddStringToObject(change, "partition", ZDB_SYSTEM_DB);
+        cJSON_AddStringToObject(change, "keyspace", ZDB_ANALYTICS_KEYSPACE);
+        cJSON_AddStringToObject(change, "id", node_id);
+        cJSON_AddNumberToObject(change, "ts", (double)time(NULL));
+        cJSON_AddNumberToObject(change, "ttl_abs", (double)ttl_abs);
+        cJSON *value = cJSON_Parse(json);
+        if (!value) {
+            cJSON_Delete(change);
+            return false;
+        }
+        cJSON_AddItemToObject(change, "value", value);
+        char *encoded = cJSON_PrintUnformatted(change);
+        cJSON_Delete(change);
+        if (!encoded) {
+            return false;
+        }
+        zdb_repl_status status = zdb_repl_write(g_repl, ZDB_SYSTEM_DB,
+                                                encoded);
+        free(encoded);
+        return status == ZDB_REPL_OK;
+    }
+    long long now = (long long)time(NULL);
+    long long ttl_rel = ttl_abs > now ? ttl_abs - now : 0;
+    return zdb_put(g_ctx.engine, ZDB_SYSTEM_DB, ZDB_ANALYTICS_KEYSPACE,
+                   node_id, json, ttl_rel);
+}
+
+/* Extra cluster metrics merged into each node's analytics snapshot. */
+static cJSON *api_analytics_cluster_metrics(void *ctx)
+{
+    (void)ctx;
+    cJSON *o = cJSON_CreateObject();
+    if (!o) {
+        return NULL;
+    }
+    cJSON_AddNumberToObject(o, "pending_changes",
+                            (double)(g_repl ? zdb_repl_pending_total(g_repl)
+                                            : 0));
+    return o;
+}
+
+void zdb_api_analytics_start(zdb_config *cfg, const char *node_id)
+{
+    if (!cfg || g_analytics) {
+        return;
+    }
+    g_analytics = zdb_analytics_start(cfg, node_id, api_analytics_flush, NULL);
+    zdb_analytics_set_cluster_metrics(g_analytics,
+                                      api_analytics_cluster_metrics, NULL);
+}
+
+void zdb_api_analytics_stop(void)
+{
+    zdb_analytics_stop(g_analytics);
+    g_analytics = NULL;
+}
+
 
 static bool api_replicate_config(void *ctx, const char *keyspace,
                                  const char *id, const char *json)
@@ -550,6 +632,7 @@ static bool handle_data_put(const zdb_http_request *req,
     }
     pthread_mutex_lock(&g_data_put_lock);
     cJSON *existing = zdb_get(g_ctx.engine, part, ks, id);
+    bool is_update = existing != NULL;
     zdb_permission permission = existing ? ZDB_PERM_UPDATE : ZDB_PERM_CREATE;
     cJSON_Delete(existing);
     if (!authorize_partition(g_ctx.config, db, part, groups, permission, res)) {
@@ -558,6 +641,7 @@ static bool handle_data_put(const zdb_http_request *req,
         return true;
     }
 
+    long long started = api_now_us();
     bool ok = false;
     if (g_repl) {
         long long ts = (long long)time(NULL);
@@ -597,6 +681,11 @@ static bool handle_data_put(const zdb_http_request *req,
     pthread_mutex_unlock(&g_data_put_lock);
     free(json);
 
+    if (g_analytics && ok) {
+        zdb_analytics_record_write(g_analytics, part, ks, is_update,
+                                   api_now_us() - started);
+    }
+
     if (!ok) {
         respond_error(res, 500, "storage failed");
         return true;
@@ -628,9 +717,14 @@ static bool handle_data_get(const zdb_http_request *req,
         return true;
     }
 
+    long long started = api_now_us();
     cJSON *doc = g_repl
                      ? zdb_repl_read_get(g_repl, db, part, ks, id)
                      : zdb_get(g_ctx.engine, part, ks, id);
+    long long elapsed = api_now_us() - started;
+    if (g_analytics) {
+        zdb_analytics_record_read(g_analytics, part, ks, elapsed);
+    }
     if (!doc) {
         respond_error(res, 404, "not found");
         return true;
@@ -660,6 +754,7 @@ static bool handle_data_delete(const zdb_http_request *req,
     }
 
     bool ok;
+    long long started = api_now_us();
     if (g_repl) {
         long long ts = (long long)time(NULL);
         cJSON *change = cJSON_CreateObject();
@@ -701,6 +796,10 @@ static bool handle_data_delete(const zdb_http_request *req,
         respond_error(res, 500, "delete failed");
         return true;
     }
+    if (g_analytics) {
+        zdb_analytics_record_delete(g_analytics, part, ks,
+                                    api_now_us() - started);
+    }
     res->status = 200;
     res->content_type = "application/json";
     res->body = zdb_http_body_printf(&res->body_len,
@@ -730,6 +829,7 @@ static size_t partition_keyspaces(const char *db, const char *partition,
 typedef struct {
     long long ts;
     cJSON *value;   /* borrowed */
+    const char *id; /* borrowed record key */
 } ts_value;
 
 static int cmp_ts_desc(const void *a, const void *b)
@@ -745,9 +845,60 @@ static int cmp_ts_desc(const void *a, const void *b)
     return 0;
 }
 
+/* Returns a new object with "id" as the first field followed by every
+ * field of `value` (except any existing "id", which the record key
+ * supersedes). Caller frees. */
+static cJSON *doc_with_id(const cJSON *value, const char *id)
+{
+    cJSON *doc = cJSON_CreateObject();
+    if (!doc) {
+        return NULL;
+    }
+    cJSON_AddStringToObject(doc, "id", id ? id : "");
+    if (cJSON_IsObject(value)) {
+        cJSON *field = NULL;
+        cJSON_ArrayForEach(field, value) {
+            if (strcmp(field->string, "id") == 0) {
+                continue;   /* record key takes the "id" column */
+            }
+            cJSON_AddItemToObject(doc, field->string,
+                                  cJSON_Duplicate(field, 1));
+        }
+    }
+    return doc;
+}
+
+/* Converts timestamp-tagged meta rows [{"id","timestamp","value"}, ...]
+ * into plain documents, each with the record key injected as a leading
+ * "id" field. Non-object values are dropped (they cannot carry a key). */
+static cJSON *flatten_meta_rows(cJSON *meta)
+{
+    cJSON *out = cJSON_CreateArray();
+    if (!out) {
+        return NULL;
+    }
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, meta) {
+        const cJSON *jid = cJSON_GetObjectItemCaseSensitive(row, "id");
+        cJSON *jval = cJSON_GetObjectItemCaseSensitive(row, "value");
+        if (!cJSON_IsObject(jval)) {
+            continue;
+        }
+        cJSON *doc = doc_with_id(
+            jval, cJSON_IsString(jid) && jid->valuestring
+                      ? jid->valuestring : "");
+        if (!doc) {
+            continue;
+        }
+        cJSON_AddItemToArray(out, doc);
+    }
+    return out;
+}
+
 /* Runs a query over every keyspace in a partition, merges the
- * timestamp-tagged rows and returns them newest-first as plain values.
- * Handles both the replicated and single-node paths. */
+ * timestamp-tagged rows and returns them newest-first with the record key
+ * injected as a leading "id" field. Handles both the replicated and
+ * single-node paths. */
 static cJSON *partition_wide_query(const char *db, const char *part,
                                    const cJSON *filters)
 {
@@ -785,11 +936,14 @@ static cJSON *partition_wide_query(const char *db, const char *part,
     cJSON_ArrayForEach(row, rows) {
         const cJSON *jts = cJSON_GetObjectItemCaseSensitive(row, "timestamp");
         cJSON *jval = cJSON_GetObjectItemCaseSensitive(row, "value");
+        const cJSON *jid = cJSON_GetObjectItemCaseSensitive(row, "id");
         if (!cJSON_IsObject(jval)) {
             continue;
         }
         values[n].ts = cJSON_IsNumber(jts) ? (long long)jts->valuedouble : 0;
         values[n].value = jval;
+        values[n].id = cJSON_IsString(jid) && jid->valuestring
+                           ? jid->valuestring : NULL;
         n++;
     }
     qsort(values, n, sizeof(*values), cmp_ts_desc);
@@ -801,7 +955,10 @@ static cJSON *partition_wide_query(const char *db, const char *part,
         return NULL;
     }
     for (size_t i = 0; i < n; i++) {
-        cJSON_AddItemToArray(out, cJSON_Duplicate(values[i].value, 1));
+        cJSON *doc = doc_with_id(values[i].value, values[i].id);
+        if (doc) {
+            cJSON_AddItemToArray(out, doc);
+        }
     }
     free(values);
     cJSON_Delete(rows);
@@ -810,6 +967,33 @@ static cJSON *partition_wide_query(const char *db, const char *part,
 
 /* Collection reads accept structured JSON filters in POST bodies and
  * unfiltered GET requests for convenience. */
+static size_t collect_filter_keys(const cJSON *filters, const char **keys,
+                                  size_t cap)
+{
+    size_t n = 0;
+    if (cJSON_IsArray(filters)) {
+        const cJSON *f = NULL;
+        cJSON_ArrayForEach(f, filters) {
+            if (n >= cap) {
+                break;
+            }
+            if (!cJSON_IsObject(f)) {
+                continue;
+            }
+            const cJSON *k = cJSON_GetObjectItemCaseSensitive(f, "key");
+            if (cJSON_IsString(k) && k->valuestring) {
+                keys[n++] = k->valuestring;
+            }
+        }
+    } else if (cJSON_IsObject(filters)) {
+        const cJSON *k = cJSON_GetObjectItemCaseSensitive(filters, "key");
+        if (n < cap && cJSON_IsString(k) && k->valuestring) {
+            keys[n++] = k->valuestring;
+        }
+    }
+    return n;
+}
+
 static bool handle_data_collect(const zdb_http_request *req,
                                 zdb_http_response *res)
 {
@@ -893,6 +1077,9 @@ static bool handle_data_collect(const zdb_http_request *req,
         return true;
     }
 
+    const char *filter_keys[64];
+    size_t nkeys = collect_filter_keys(filters, filter_keys, 64);
+    long long started = api_now_us();
     if (strcmp(operation, "ids") == 0) {
         size_t count = 0;
         char **ids = g_repl
@@ -910,19 +1097,22 @@ static bool handle_data_collect(const zdb_http_request *req,
         respond_json(res, 200,
                      documents ? documents : cJSON_CreateArray());
     } else {
-        cJSON *documents;
-        if (g_repl) {
-            documents = strcmp(operation, "all") == 0
-                            ? zdb_repl_read_all(g_repl, db, part, ks, filters)
-                            : zdb_repl_read_query(g_repl, db, part, ks,
-                                                  filters);
-        } else {
-            documents = strcmp(operation, "all") == 0
-                            ? zdb_all(g_ctx.engine, part, ks, filters)
-                            : zdb_query(g_ctx.engine, part, ks, filters);
+        /* all and query share identical engine semantics (a filter may be
+         * empty); both return the record key as a leading "id" field. */
+        cJSON *meta = g_repl
+                          ? zdb_repl_read_query_meta(g_repl, db, part, ks,
+                                                     filters)
+                          : zdb_query_ts(g_ctx.engine, part, ks, filters);
+        cJSON *documents = meta ? flatten_meta_rows(meta) : NULL;
+        if (meta) {
+            cJSON_Delete(meta);
         }
         respond_json(res, 200,
                      documents ? documents : cJSON_CreateArray());
+    }
+    if (g_analytics) {
+        zdb_analytics_record_query(g_analytics, part, ks, filter_keys, nkeys,
+                                   api_now_us() - started);
     }
     cJSON_Delete(body);
     return true;
@@ -1146,6 +1336,46 @@ static bool handle_admin_users(const zdb_http_request *req,
     return true;
 }
 
+/* Parses optional shard-tuning fields from a partition request body. Returns
+ * true when at least one tuning field was present. */
+static bool partition_settings_from_json(const cJSON *body,
+                                        zdb_shard_settings *out)
+{
+    zdb_shard_settings_default(out);
+    bool present = false;
+    const cJSON *cs = cJSON_GetObjectItemCaseSensitive(body, "cache_size");
+    if (cJSON_IsNumber(cs)) {
+        out->cache_size = (long long)cs->valuedouble;
+        present = true;
+    }
+    const cJSON *jm = cJSON_GetObjectItemCaseSensitive(body, "journal_mode");
+    if (cJSON_IsString(jm) && jm->valuestring) {
+        snprintf(out->journal_mode, sizeof(out->journal_mode), "%s",
+                 jm->valuestring);
+        present = true;
+    }
+    const cJSON *vs = cJSON_GetObjectItemCaseSensitive(body, "vacuum_seconds");
+    if (cJSON_IsNumber(vs)) {
+        out->vacuum_seconds = (long long)vs->valuedouble;
+        present = true;
+    }
+    const cJSON *rs = cJSON_GetObjectItemCaseSensitive(body, "reindex_seconds");
+    if (cJSON_IsNumber(rs)) {
+        out->reindex_seconds = (long long)rs->valuedouble;
+        present = true;
+    }
+    return present;
+}
+
+static void partition_add_settings_json(cJSON *o,
+                                        const zdb_partition_info *p)
+{
+    cJSON_AddNumberToObject(o, "cache_size", (double)p->cache_size);
+    cJSON_AddStringToObject(o, "journal_mode", p->journal_mode);
+    cJSON_AddNumberToObject(o, "vacuum_seconds", (double)p->vacuum_seconds);
+    cJSON_AddNumberToObject(o, "reindex_seconds", (double)p->reindex_seconds);
+}
+
 static bool handle_admin_partitions(const zdb_http_request *req,
                                     zdb_http_response *res)
 {
@@ -1185,6 +1415,7 @@ static bool handle_admin_partitions(const zdb_http_request *req,
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].delete_mask);
                     cJSON_AddStringToObject(o, "delete_mask", b);
+                    partition_add_settings_json(o, &parts[i]);
                     cJSON_AddItemToArray(arr2, o);
                 }
                 free(parts);
@@ -1211,6 +1442,7 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].delete_mask);
             cJSON_AddStringToObject(o, "delete_mask", b);
+            partition_add_settings_json(o, &list[i]);
             cJSON_AddItemToArray(arr, o);
         }
         free(list);
@@ -1252,6 +1484,14 @@ static bool handle_admin_partitions(const zdb_http_request *req,
         bool ok = zdb_partition_create(g_ctx.config, database->valuestring,
                                        name->valuestring, create_mask,
                                        update_mask, read_mask, delete_mask);
+        if (ok) {
+            zdb_shard_settings settings;
+            if (partition_settings_from_json(body, &settings)) {
+                zdb_partition_set_settings(g_ctx.config,
+                                           database->valuestring,
+                                           name->valuestring, &settings);
+            }
+        }
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 409, "create failed (duplicate?)");
@@ -1297,6 +1537,14 @@ static bool handle_admin_partitions(const zdb_http_request *req,
                                           name->valuestring, create_mask,
                                           update_mask, read_mask,
                                           delete_mask);
+        if (ok) {
+            zdb_shard_settings settings;
+            if (partition_settings_from_json(body, &settings)) {
+                zdb_partition_set_settings(g_ctx.config,
+                                           database->valuestring,
+                                           name->valuestring, &settings);
+            }
+        }
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 404, "partition not found");
@@ -1379,6 +1627,64 @@ static bool handle_admin_keyspaces(const zdb_http_request *req,
     }
     free(list);
     respond_json(res, 200, arr);
+    return true;
+}
+
+/* GET /admin/analytics: aggregated cluster-wide workload/performance. */
+static bool handle_admin_analytics(const zdb_http_request *req,
+                                   zdb_http_response *res)
+{
+    if (strcmp(req->method, "GET") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    if (!require_admin_auth(req, res)) {
+        return true;
+    }
+    cJSON *report = zdb_analytics_report(g_analytics);
+    respond_json(res, 200, report ? report : cJSON_CreateObject());
+    return true;
+}
+
+/* POST /admin/benchmark: run a throwaway workload benchmark. */
+static bool handle_admin_benchmark(const zdb_http_request *req,
+                                   zdb_http_response *res)
+{
+    if (strcmp(req->method, "POST") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    if (!require_admin_auth(req, res)) {
+        return true;
+    }
+    cJSON *body = NULL;
+    if (req->body_len > 0 && !body_json(req, &body)) {
+        respond_error(res, 400, "body must be valid JSON");
+        return true;
+    }
+    int replication_factor = 1;
+    long long cache_size = 0;
+    const char *journal_mode = "WAL";
+    int partitions = 10;
+    int records = 100000;
+    if (body && cJSON_IsObject(body)) {
+        const cJSON *j;
+        j = cJSON_GetObjectItemCaseSensitive(body, "replication_factor");
+        if (cJSON_IsNumber(j)) replication_factor = (int)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(body, "cache_size");
+        if (cJSON_IsNumber(j)) cache_size = (long long)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(body, "journal_mode");
+        if (cJSON_IsString(j) && j->valuestring) journal_mode = j->valuestring;
+        j = cJSON_GetObjectItemCaseSensitive(body, "partitions");
+        if (cJSON_IsNumber(j)) partitions = (int)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(body, "records");
+        if (cJSON_IsNumber(j)) records = (int)j->valuedouble;
+    }
+    cJSON_Delete(body);
+    cJSON *report = zdb_benchmark_run(g_ctx.config, replication_factor,
+                                      cache_size, journal_mode, partitions,
+                                      records);
+    respond_json(res, 200, report ? report : cJSON_CreateObject());
     return true;
 }
 
@@ -2061,6 +2367,7 @@ bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
     g_ctx.config = config;
     zdb_config_set_replicator(config, g_repl ? api_replicate_config : NULL,
                               g_repl);
+    zdb_config_register_settings(config);
 
     bool ok = true;
     ok &= zdb_http_add_handler(srv, "PUT", "/data/", handle_data_put);
@@ -2090,6 +2397,10 @@ bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
                                handle_admin_partitions);
     ok &= zdb_http_add_handler(srv, "GET", "/admin/keyspaces",
                                handle_admin_keyspaces);
+    ok &= zdb_http_add_handler(srv, "GET", "/admin/analytics",
+                               handle_admin_analytics);
+    ok &= zdb_http_add_handler(srv, "POST", "/admin/benchmark",
+                               handle_admin_benchmark);
     ok &= zdb_http_add_handler(srv, "GET", "/admin/cluster",
                                handle_admin_cluster);
     ok &= zdb_http_add_handler(srv, "POST", "/admin/join",

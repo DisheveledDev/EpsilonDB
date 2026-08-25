@@ -1,6 +1,7 @@
 #include "shard_internal.h"
 
 #include <inttypes.h>
+#include "../zesty_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,7 @@ static int64_t now_epoch(void)
 
 static void log_sqlite(zdb_shard *sh, const char *context)
 {
-    fprintf(stderr, "zdb: shard %s: %s: %s\n", sh->key, context,
+    zdb_log("ERROR", "shard %s: %s: %s", sh->key, context,
             sqlite3_errmsg(sh->db));
 }
 
@@ -178,7 +179,86 @@ static const char *sql_operator(const char *operator_name)
     return "<=";
 }
 
-zdb_shard *zdb_shard_open(const char *path, const char *key)
+void zdb_shard_settings_default(zdb_shard_settings *out)
+{
+    if (!out) {
+        return;
+    }
+    out->cache_size = 0;          /* unset => SQLite default (-2000 KB) */
+    snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+    out->vacuum_seconds = 21600;  /* 6 hours */
+    out->reindex_seconds = 3600;  /* 1 hour */
+}
+
+/* Applies journal_mode + synchronous + cache_size to an open connection. */
+static int configure_connection(sqlite3 *db, const char *key,
+                                const zdb_shard_settings *s)
+{
+    char sql[256];
+    char *err = NULL;
+    const char *mode = (s && s->journal_mode[0]) ? s->journal_mode : "WAL";
+    if (strcmp(mode, "DELETE") != 0 && strcmp(mode, "TRUNCATE") != 0 &&
+        strcmp(mode, "WAL") != 0) {
+        mode = "WAL";
+    }
+    snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;"
+                               "PRAGMA synchronous=FULL;", mode);
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        zdb_log("ERROR", "shard %s: journal pragma failed: %s", key,
+                err ? err : "?");
+        sqlite3_free(err);
+        return -1;
+    }
+    if (s && s->cache_size != 0) {
+        snprintf(sql, sizeof(sql), "PRAGMA cache_size=%lld;",
+                 (long long)s->cache_size);
+        if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+            zdb_log("ERROR", "shard %s: cache_size pragma failed: %s", key,
+                    err ? err : "?");
+            sqlite3_free(err);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Runs the idempotent schema setup on an open connection. */
+static int setup_schema(sqlite3 *db, const char *key)
+{
+    char *err = NULL;
+    if (sqlite3_exec(db,
+                     "CREATE TABLE IF NOT EXISTS Data ("
+                     " id TEXT PRIMARY KEY,"
+                     " value BLOB,"
+                     " ttl INTEGER,"
+                     " timestamp INT,"
+                     " origin TEXT"
+                     ");"
+                     "CREATE INDEX IF NOT EXISTS idx_ttl ON Data (ttl);"
+                     "DROP TABLE IF EXISTS DataFilter;",
+                     NULL, NULL, &err) != SQLITE_OK) {
+        zdb_log("ERROR", "shard %s: schema failed: %s", key,
+                err ? err : "?");
+        sqlite3_free(err);
+        return -1;
+    }
+    const char *migrations[] = {
+        "ALTER TABLE Data DROP COLUMN model;",
+        "ALTER TABLE Data DROP COLUMN version;",
+        "ALTER TABLE Data ADD COLUMN origin TEXT;",
+    };
+    for (size_t i = 0; i < sizeof(migrations) / sizeof(migrations[0]); i++) {
+        err = NULL;
+        if (sqlite3_exec(db, migrations[i], NULL, NULL, &err) != SQLITE_OK) {
+            sqlite3_free(err);
+        }
+    }
+    return 0;
+}
+
+zdb_shard *zdb_shard_open(const char *path, const char *key,
+                          const char *partition, const char *keyspace,
+                          const zdb_shard_settings *settings)
 {
     zdb_shard *sh = calloc(1, sizeof(*sh));
     if (!sh) {
@@ -186,7 +266,16 @@ zdb_shard *zdb_shard_open(const char *path, const char *key)
     }
     sh->path = strdup(path);
     snprintf(sh->key, sizeof(sh->key), "%s", key);
+    snprintf(sh->partition, sizeof(sh->partition), "%s",
+             partition ? partition : "");
+    snprintf(sh->keyspace, sizeof(sh->keyspace), "%s",
+             keyspace ? keyspace : "");
     pthread_mutex_init(&sh->lock, NULL);
+    if (settings) {
+        sh->settings = *settings;
+    } else {
+        zdb_shard_settings_default(&sh->settings);
+    }
 
     int rc = sqlite3_open_v2(path, &sh->db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
@@ -204,52 +293,57 @@ zdb_shard *zdb_shard_open(const char *path, const char *key)
     }
 
     sqlite3_busy_timeout(sh->db, ZDB_BUSY_TIMEOUT_MS);
-    char *err = NULL;
-    if (sqlite3_exec(sh->db, "PRAGMA journal_mode=DELETE;"
-                             "PRAGMA synchronous=FULL;",
-                     NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "zdb: shard %s: pragma failed: %s\n", sh->key,
-                err ? err : "?");
-        sqlite3_free(err);
+    if (configure_connection(sh->db, sh->key, &sh->settings) != 0 ||
+        setup_schema(sh->db, sh->key) != 0) {
         zdb_shard_free(sh);
         return NULL;
     }
 
-    err = NULL;
-    if (sqlite3_exec(sh->db,
-                     "CREATE TABLE IF NOT EXISTS Data ("
-                     " id TEXT PRIMARY KEY,"
-                     " value BLOB,"
-                     " ttl INTEGER,"
-                     " timestamp INT,"
-                     " model TEXT,"
-                     " version INTEGER,"
-                     " origin TEXT"
-                     ");"
-                     "CREATE INDEX IF NOT EXISTS idx_ttl ON Data (ttl);"
-                     "DROP TABLE IF EXISTS DataFilter;",
-                     NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "zdb: shard %s: schema failed: %s\n", sh->key,
-                err ? err : "?");
-        sqlite3_free(err);
-        zdb_shard_free(sh);
-        return NULL;
-    }
-
-    const char *migrations[] = {
-        "ALTER TABLE Data ADD COLUMN model TEXT;",
-        "ALTER TABLE Data ADD COLUMN version INTEGER;",
-        "ALTER TABLE Data ADD COLUMN origin TEXT;",
-    };
-    for (size_t i = 0; i < sizeof(migrations) / sizeof(migrations[0]); i++) {
-        err = NULL;
-        if (sqlite3_exec(sh->db, migrations[i], NULL, NULL, &err) !=
-            SQLITE_OK) {
-            sqlite3_free(err);
-        }
-    }
-
+    sh->last_vacuum_ts = now_epoch();
+    sh->last_reindex_ts = now_epoch();
     return sh;
+}
+
+/* Reopens an existing shard connection with new settings. */
+bool zdb_shard_reopen(zdb_shard *sh, const zdb_shard_settings *settings)
+{
+    if (!sh || !settings) {
+        return false;
+    }
+    pthread_mutex_lock(&sh->lock);
+    for (int i = 0; i < sh->cache_count; i++) {
+        sqlite3_finalize(sh->cache[i].stmt);
+    }
+    sh->cache_count = 0;
+
+    sqlite3 *fresh = NULL;
+    if (sqlite3_open_v2(sh->path, &fresh,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                            SQLITE_OPEN_FULLMUTEX,
+                        NULL) != SQLITE_OK) {
+        if (fresh) {
+            sqlite3_close(fresh);
+        }
+        pthread_mutex_unlock(&sh->lock);
+        return false;
+    }
+    sqlite3_busy_timeout(fresh, ZDB_BUSY_TIMEOUT_MS);
+    if (configure_connection(fresh, sh->key, settings) != 0 ||
+        setup_schema(fresh, sh->key) != 0) {
+        sqlite3_close(fresh);
+        pthread_mutex_unlock(&sh->lock);
+        return false;
+    }
+    sqlite3 *old = sh->db;
+    sh->db = fresh;
+    sh->settings = *settings;
+    sh->last_vacuum_ts = now_epoch();
+    sh->last_reindex_ts = now_epoch();
+    if (old) {
+        sqlite3_close_v2(old);
+    }
+    pthread_mutex_unlock(&sh->lock);
+    return true;
 }
 
 void zdb_shard_free(zdb_shard *sh)
@@ -281,8 +375,8 @@ static bool do_put_locked(zdb_shard *sh, const char *id,
 {
     sqlite3_stmt *stmt = stmt_for(
         sh, "INSERT OR REPLACE INTO Data"
-            " (id, value, ttl, timestamp, model, version, origin)"
-            " VALUES (?, ?, ?, ?, NULL, NULL, ?)");
+            " (id, value, ttl, timestamp, origin)"
+            " VALUES (?, ?, ?, ?, ?)");
     if (!stmt) {
         return false;
     }
@@ -373,10 +467,10 @@ bool zdb_shard_replica_delete(zdb_shard *sh, const char *id,
     }
 
     sqlite3_stmt *stmt = stmt_for(
-        sh, "INSERT INTO Data (id,value,ttl,timestamp,model,version,origin)"
-            " VALUES (?,NULL,?,?,NULL,NULL,?)"
+        sh, "INSERT INTO Data (id,value,ttl,timestamp,origin)"
+            " VALUES (?,NULL,?,?,?)"
             " ON CONFLICT(id) DO UPDATE SET value=NULL,ttl=excluded.ttl,"
-            " timestamp=excluded.timestamp,model=NULL,version=NULL,"
+            " timestamp=excluded.timestamp,"
             " origin=excluded.origin");
     bool ok = false;
     if (stmt) {
@@ -418,9 +512,9 @@ cJSON *zdb_shard_get_ts(zdb_shard *sh, const char *id,
             if (json && len > 0) {
                 result = cJSON_ParseWithLength(json, (size_t)len);
                 if (!result) {
-                    fprintf(stderr,
-                            "zdb: shard %s: stored value for '%s' is not"
-                            " valid JSON\n",
+                    zdb_log("WARN",
+                            "shard %s: stored value for '%s' is not"
+                            " valid JSON",
                             sh->key, id);
                 }
             }
@@ -452,9 +546,9 @@ cJSON *zdb_shard_get(zdb_shard *sh, const char *id)
             if (json && len > 0) {
                 result = cJSON_ParseWithLength(json, (size_t)len);
                 if (!result) {
-                    fprintf(stderr,
-                            "zdb: shard %s: stored value for '%s' is not"
-                            " valid JSON\n",
+                    zdb_log("WARN",
+                            "shard %s: stored value for '%s' is not"
+                            " valid JSON",
                             sh->key, id);
                 }
             }
@@ -723,7 +817,7 @@ bool zdb_shard_cleanup(zdb_shard *sh)
     char *err = NULL;
 
     if (sqlite3_exec(sh->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "zdb: shard %s: cleanup begin failed: %s\n", sh->key,
+        zdb_log("ERROR", "shard %s: cleanup begin failed: %s", sh->key,
                 err ? err : "?");
         sqlite3_free(err);
         pthread_mutex_unlock(&sh->lock);
@@ -752,18 +846,27 @@ bool zdb_shard_cleanup(zdb_shard *sh)
     }
     sqlite3_free(err);
 
-    if (ok && !sh->vacuum_pending &&
-        sh->expired_since_vacuum >= ZDB_VACUUM_THRESHOLD) {
-        sh->vacuum_pending = true;
-    }
-
-    if (ok && sh->vacuum_pending) {
+    /* time-based maintenance, gated on the per-partition intervals */
+    int64_t now = now_epoch();
+    if (ok && sh->settings.vacuum_seconds > 0 &&
+        now - sh->last_vacuum_ts >= sh->settings.vacuum_seconds) {
         err = NULL;
         if (sqlite3_exec(sh->db, "VACUUM", NULL, NULL, &err) == SQLITE_OK) {
-            sh->vacuum_pending = false;
+            sh->last_vacuum_ts = now;
             sh->expired_since_vacuum = 0;
         } else {
-            fprintf(stderr, "zdb: shard %s: vacuum failed: %s\n", sh->key,
+            zdb_log("ERROR", "shard %s: vacuum failed: %s", sh->key,
+                    err ? err : "?");
+            sqlite3_free(err);
+        }
+    }
+    if (ok && sh->settings.reindex_seconds > 0 &&
+        now - sh->last_reindex_ts >= sh->settings.reindex_seconds) {
+        err = NULL;
+        if (sqlite3_exec(sh->db, "REINDEX", NULL, NULL, &err) == SQLITE_OK) {
+            sh->last_reindex_ts = now;
+        } else {
+            zdb_log("ERROR", "shard %s: reindex failed: %s", sh->key,
                     err ? err : "?");
             sqlite3_free(err);
         }

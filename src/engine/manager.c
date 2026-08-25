@@ -1,6 +1,7 @@
 #include "shard_internal.h"
 
 #include <dirent.h>
+#include "../zesty_log.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,9 @@ struct zdb_shard_manager {
     char *path;
     pthread_mutex_t lock;              /* guards buckets + bucket counts */
     struct shard_link *buckets[ZDB_SHARD_BUCKETS];
+
+    zdb_shard_settings_fn settings_fn;
+    void *settings_ctx;
 
     pthread_t cleanup_thread;
     bool cleanup_running;
@@ -147,6 +151,42 @@ static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
     return migrated;
 }
 
+void zdb_engine_set_settings_provider(zdb_engine *mgr,
+                                      zdb_shard_settings_fn fn, void *ctx)
+{
+    if (!mgr) {
+        return;
+    }
+    pthread_mutex_lock(&mgr->lock);
+    mgr->settings_fn = fn;
+    mgr->settings_ctx = ctx;
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static void resolve_settings(zdb_engine *mgr, const char *partition,
+                             zdb_shard_settings *out)
+{
+    zdb_shard_settings_default(out);
+    zdb_shard_settings_fn fn;
+    void *ctx;
+    pthread_mutex_lock(&mgr->lock);
+    fn = mgr->settings_fn;
+    ctx = mgr->settings_ctx;
+    pthread_mutex_unlock(&mgr->lock);
+    if (fn) {
+        fn(ctx, partition, out);
+    }
+}
+
+static bool settings_differ(const zdb_shard_settings *a,
+                            const zdb_shard_settings *b)
+{
+    return a->cache_size != b->cache_size ||
+           strcmp(a->journal_mode, b->journal_mode) != 0 ||
+           a->vacuum_seconds != b->vacuum_seconds ||
+           a->reindex_seconds != b->reindex_seconds;
+}
+
 static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
                             const char *keyspace)
 {
@@ -156,28 +196,49 @@ static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
         return NULL;
     }
 
+    zdb_shard_settings desired;
+    resolve_settings(mgr, partition, &desired);
+
     pthread_mutex_lock(&mgr->lock);
     zdb_shard *sh = find_locked(mgr, key);
     if (sh) {
         sh->refs++;
     }
     pthread_mutex_unlock(&mgr->lock);
-    if (sh) {
-        return sh;
+
+    if (!sh) {
+        size_t len = strlen(mgr->path) + 1 + 32 + sizeof(".sqlite");
+        char *path = malloc(len);
+        if (!path) {
+            return NULL;
+        }
+        snprintf(path, len, "%s/%s.sqlite", mgr->path, key);
+        zdb_shard *opened =
+            zdb_shard_open(path, key, partition, keyspace, &desired);
+        free(path);
+        if (!opened) {
+            return NULL;
+        }
+        return insert_shard(mgr, opened, true);
     }
 
-    size_t len = strlen(mgr->path) + 1 + 32 + sizeof(".sqlite");
-    char *path = malloc(len);
-    if (!path) {
-        return NULL;
+    /* Cached handle: adopt the (now known) partition name and reopen when
+     * the settings have changed since the handle was opened (e.g. a startup
+     * scan opened it with defaults before the config layer was attached). */
+    bool reopen = false;
+    pthread_mutex_lock(&sh->lock);
+    if (sh->partition[0] == '\0') {
+        snprintf(sh->partition, sizeof(sh->partition), "%s", partition);
+        snprintf(sh->keyspace, sizeof(sh->keyspace), "%s", keyspace);
     }
-    snprintf(path, len, "%s/%s.sqlite", mgr->path, key);
-    zdb_shard *opened = zdb_shard_open(path, key);
-    free(path);
-    if (!opened) {
-        return NULL;
+    if (settings_differ(&sh->settings, &desired)) {
+        reopen = true;
     }
-    return insert_shard(mgr, opened, true);
+    pthread_mutex_unlock(&sh->lock);
+    if (reopen) {
+        zdb_shard_reopen(sh, &desired);
+    }
+    return sh;
 }
 
 static void shard_release(zdb_engine *mgr, zdb_shard *sh)
@@ -268,7 +329,7 @@ zdb_engine *zdb_engine_open(const char *path)
     pthread_cond_init(&mgr->wakeup_cond, NULL);
 
     if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr, "zdb: cannot create data directory '%s': %s\n", path,
+        zdb_log("ERROR", "cannot create data directory '%s': %s", path,
                 strerror(errno));
         zdb_engine_close(mgr);
         return NULL;
@@ -276,7 +337,7 @@ zdb_engine *zdb_engine_open(const char *path)
 
     DIR *dir = opendir(path);
     if (!dir) {
-        fprintf(stderr, "zdb: cannot open data directory '%s': %s\n", path,
+        zdb_log("ERROR", "cannot open data directory '%s': %s", path,
                 strerror(errno));
         zdb_engine_close(mgr);
         return NULL;
@@ -298,11 +359,11 @@ zdb_engine *zdb_engine_open(const char *path)
             continue;
         }
         snprintf(full, plen, "%s/%s", path, entry->d_name);
-        zdb_shard *sh = zdb_shard_open(full, key);
+        zdb_shard *sh = zdb_shard_open(full, key, "", "", NULL);
         free(full);
         if (!sh) {
-            fprintf(stderr,
-                    "zdb: warning: failed to open existing shard '%s'\n",
+            zdb_log("WARN",
+                    "failed to open existing shard '%s'",
                     entry->d_name);
             continue;
         }
@@ -317,7 +378,7 @@ zdb_engine *zdb_engine_open(const char *path)
     mgr->cleanup_running = true;
     if (pthread_create(&mgr->cleanup_thread, NULL, cleanup_thread_main,
                        mgr) != 0) {
-        fprintf(stderr, "zdb: failed to start cleanup thread\n");
+        zdb_log("ERROR", "failed to start cleanup thread");
         mgr->cleanup_running = false;
         zdb_engine_close(mgr);
         return NULL;
@@ -410,6 +471,8 @@ bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
     char side[1060];
     snprintf(side, sizeof(side), "%s-wal", path);
     unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    unlink(side);
     snprintf(side, sizeof(side), "%s-journal", path);
     unlink(side);
     if (rc != 0 && errno == ENOENT) {
@@ -473,62 +536,68 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
     }
     char key[33];
     shard_key(partition, keyspace, key);
-
-    /* open the replacement handle first, outside the manager lock:
-     * SQLite may block on busy timeouts */
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s.sqlite", mgr->path, key);
-    zdb_shard *fresh = zdb_shard_open(path, key);
+    zdb_shard_settings settings;
+    resolve_settings(mgr, partition, &settings);
 
+    /* Close the old connection first (checkpointing its WAL) and drop any
+     * stale sidecars so a WAL left behind by the replaced file cannot be
+     * replayed against the new database. Hold sh->lock across the swap so a
+     * concurrent accessor never sees a half-replaced handle. */
+    zdb_shard *sh = NULL;
+    pthread_mutex_lock(&mgr->lock);
+    sh = find_locked(mgr, key);
+    if (sh) {
+        pthread_mutex_lock(&sh->lock);
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (sh) {
+        for (int i = 0; i < sh->cache_count; i++) {
+            sqlite3_finalize(sh->cache[i].stmt);
+        }
+        sh->cache_count = 0;
+        if (sh->db) {
+            sqlite3_close_v2(sh->db);
+            sh->db = NULL;
+        }
+    }
+
+    char side[1060];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    unlink(side);
+
+    zdb_shard *fresh = zdb_shard_open(path, key, partition, keyspace,
+                                      &settings);
     bool ok = false;
     if (fresh) {
         pthread_mutex_lock(&fresh->lock);
         int rc = sqlite3_exec(fresh->db, "PRAGMA integrity_check;", NULL,
                               NULL, NULL);
         pthread_mutex_unlock(&fresh->lock);
-        if (rc == SQLITE_OK) {
-            ok = true;
-        } else {
-            zdb_shard_free(fresh);
+        ok = rc == SQLITE_OK;
+    }
+
+    if (sh) {
+        if (ok && fresh) {
+            sh->db = fresh->db;
+            sh->expired_since_vacuum = 0;
+            sh->last_vacuum_ts = (long long)time(NULL);
+            sh->last_reindex_ts = (long long)time(NULL);
+            free(fresh->path);
+            pthread_mutex_destroy(&fresh->lock);
+            free(fresh);
             fresh = NULL;
         }
-    }
-
-    /* swap the new connection in under mgr->lock so a concurrent
-     * shard_for() either misses (reopens from disk later) or sees the
-     * replaced handle */
-    sqlite3 *old_db = NULL;
-    pthread_mutex_lock(&mgr->lock);
-    zdb_shard *sh = find_locked(mgr, key);
-    if (sh && fresh) {
-        pthread_mutex_lock(&sh->lock);
-        for (int i = 0; i < sh->cache_count; i++) {
-            sqlite3_finalize(sh->cache[i].stmt);
-        }
-        old_db = sh->db;
-        sh->db = fresh->db;
-        sh->cache_count = 0;
-        memset(sh->cache, 0, sizeof(sh->cache));
-        sh->expired_since_vacuum = 0;
-        sh->vacuum_pending = false;
+        /* on failure sh->db stays NULL: the file was replaced and there is
+         * nothing to fall back to */
         pthread_mutex_unlock(&sh->lock);
-        /* adopt the live connection; free the temporary shell */
-        free(fresh->path);
-        pthread_mutex_destroy(&fresh->lock);
-        free(fresh);
-        fresh = NULL;
     }
-    pthread_mutex_unlock(&mgr->lock);
-
     if (fresh) {
-        /* swap did not happen (no cached handle or integrity failure):
-         * discard the replacement */
         zdb_shard_free(fresh);
-    }
-    if (old_db) {
-        /* close_v2 is safe with outstanding prepared statements: the
-         * connection is destroyed once the last statement releases */
-        sqlite3_close_v2(old_db);
     }
     return ok;
 }
@@ -545,6 +614,33 @@ bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
     zdb_shard *sh = find_locked(mgr, key);
     pthread_mutex_unlock(&mgr->lock);
     return sh != NULL;
+}
+
+int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition)
+{
+    if (!mgr || !partition || !*partition) {
+        return 0;
+    }
+    int reloaded = 0;
+    pthread_mutex_lock(&mgr->lock);
+    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+        for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
+            zdb_shard *sh = l->shard;
+            pthread_mutex_lock(&sh->lock);
+            bool match = strcmp(sh->partition, partition) == 0;
+            pthread_mutex_unlock(&sh->lock);
+            if (!match) {
+                continue;
+            }
+            zdb_shard_settings settings;
+            resolve_settings(mgr, partition, &settings);
+            if (zdb_shard_reopen(sh, &settings)) {
+                reloaded++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mgr->lock);
+    return reloaded;
 }
 
 bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
