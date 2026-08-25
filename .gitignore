@@ -8,3 +8,4 @@ zestyd
 tests/data/join_live/
 tests/data/chaos/
 tests/data/console_live/
+bin/data
