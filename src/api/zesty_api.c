@@ -1664,7 +1664,7 @@ static bool handle_admin_benchmark(const zdb_http_request *req,
     }
     int replication_factor = 1;
     long long cache_size = 0;
-    const char *journal_mode = "WAL";
+    const char *journal_mode = "TRUNCATE";
     int partitions = 10;
     int records = 100000;
     if (body && cJSON_IsObject(body)) {

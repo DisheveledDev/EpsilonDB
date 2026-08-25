@@ -814,7 +814,7 @@ static int execute_command(int argc, char **argv)
             rf = 1;
         }
         long cache = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
-        const char *journal = argi + 3 < argc ? argv[argi + 3] : "WAL";
+        const char *journal = argi + 3 < argc ? argv[argi + 3] : "TRUNCATE";
         snprintf(body, sizeof(body),
                  "{\"records\":%ld,\"replication_factor\":%ld,"
                  "\"cache_size\":%ld,\"journal_mode\":\"%s\"}",

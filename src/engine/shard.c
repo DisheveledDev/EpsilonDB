@@ -185,21 +185,24 @@ void zdb_shard_settings_default(zdb_shard_settings *out)
         return;
     }
     out->cache_size = 0;          /* unset => SQLite default (-2000 KB) */
-    snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+    snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
     out->vacuum_seconds = 21600;  /* 6 hours */
     out->reindex_seconds = 3600;  /* 1 hour */
 }
 
-/* Applies journal_mode + synchronous + cache_size to an open connection. */
+/* Applies journal_mode + synchronous + cache_size to an open connection.
+ * cache_size is a positive kibibyte count, expressed to SQLite via the
+ * negative-value convention (abs(N) * 1024 bytes). */
 static int configure_connection(sqlite3 *db, const char *key,
                                 const zdb_shard_settings *s)
 {
     char sql[256];
     char *err = NULL;
-    const char *mode = (s && s->journal_mode[0]) ? s->journal_mode : "WAL";
+    const char *mode = (s && s->journal_mode[0]) ? s->journal_mode
+                                                 : "TRUNCATE";
     if (strcmp(mode, "DELETE") != 0 && strcmp(mode, "TRUNCATE") != 0 &&
         strcmp(mode, "WAL") != 0) {
-        mode = "WAL";
+        mode = "TRUNCATE";
     }
     snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;"
                                "PRAGMA synchronous=FULL;", mode);
@@ -209,8 +212,8 @@ static int configure_connection(sqlite3 *db, const char *key,
         sqlite3_free(err);
         return -1;
     }
-    if (s && s->cache_size != 0) {
-        snprintf(sql, sizeof(sql), "PRAGMA cache_size=%lld;",
+    if (s && s->cache_size > 0) {
+        snprintf(sql, sizeof(sql), "PRAGMA cache_size=-%lld;",
                  (long long)s->cache_size);
         if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
             zdb_log("ERROR", "shard %s: cache_size pragma failed: %s", key,

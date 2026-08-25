@@ -152,7 +152,7 @@ static void copy_settings(const cJSON *obj, zdb_shard_settings *out)
     copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
               "journal_mode");
     if (out->journal_mode[0] == '\0') {
-        snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+        snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
     }
     out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
     out->reindex_seconds = json_i64(obj, "reindex_seconds");
@@ -738,7 +738,7 @@ bool zdb_partition_get(zdb_config *cfg, const char *database,
     copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
               "journal_mode");
     if (out->journal_mode[0] == '\0') {
-        snprintf(out->journal_mode, sizeof(out->journal_mode), "WAL");
+        snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
     }
     out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
     out->reindex_seconds = json_i64(obj, "reindex_seconds");
@@ -912,7 +912,7 @@ zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
         copy_name(out[n].journal_mode, sizeof(out[n].journal_mode), item,
                   "journal_mode");
         if (out[n].journal_mode[0] == '\0') {
-            snprintf(out[n].journal_mode, sizeof(out[n].journal_mode), "WAL");
+            snprintf(out[n].journal_mode, sizeof(out[n].journal_mode), "TRUNCATE");
         }
         out[n].vacuum_seconds = json_i64(item, "vacuum_seconds");
         out[n].reindex_seconds = json_i64(item, "reindex_seconds");

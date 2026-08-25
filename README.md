@@ -6,15 +6,50 @@ shard, a REST API for clients, an admin API plus `zestyctl` CLI for
 operations, and a peer-to-peer mesh that replicates and rebalances shards
 across nodes.
 
+ZestyDB is a **multi-master, scale-out** key/value store: every node is a
+full peer that can accept writes and answer any query. Data is sharded
+across a hash space that grows with the cluster, so adding a node adds
+storage *and* query processing power. It deploys as a single self-contained
+binary, needs no external services, and ships with built-in workload
+analytics, slow-query profiling, and a performance benchmark so you can
+watch it perform as you grow it.
+
+## Why ZestyDB
+
+- **Multi-master** — no single writer, no single point of failure. Any node
+  accepts writes; they fan out to replicas and commit when a quorum of
+  holders acknowledges. A node that drops offline is no problem: its peers
+  cache the changes it missed and replay them when it returns.
+- **Scale-out by adding nodes** — shards are spread across contiguous hash
+  ranges assigned to nodes. Every node you join brings more disk, more
+  cache, and more query CPU; the hash space simply rebalances to include it.
+- **Write leveling** — each `(partition, keyspace)` maps to its own shard
+  placed by hash, so unrelated workloads land on different nodes instead of
+  hammering one box.
+- **Queries spread across nodes and shards** — a partition/keyspace read
+  only touches the shards that hold it, and quorum reads fan out to all
+  replica holders in parallel. Bigger clusters answer bigger workloads.
+- **Any node answers any query** — reads can be served locally, proxied to
+  the owner, or resolved by quorum comparison across replicas.
+- **Trivial to deploy** — a single C11/POSIX binary with SQLite and cJSON
+  compiled in. `make STATIC=1` produces a standalone executable you can copy
+  onto any same-architecture machine.
+- **Built-in observability** — per-node reads/writes/queries, hot-shard
+  detection, slowest operations, and replication backlog are recorded,
+  synced around the cluster, and rendered as a chart.js dashboard in the
+  admin console. A one-command benchmark profiles writes, gets, filtered
+  queries, updates and deletes.
+
 ## Features
 
 - **REST data API**: put/get/delete/all/ids/query with typed JSON filters,
   nested key paths, comparison operators, and TTLs (`?ttl=seconds`).
-- **Sharded storage**: shard file = SQLite db named from a framed digest of
-  partition and keyspace; legacy concatenated-name shards migrate lazily;
-  soft deletes; 60s cleanup pass
-  with a 2h grace window (lets offline nodes replay missed changes);
-  automatic VACUUM after 10k expirations.
+- **Sharded storage**: one SQLite database per shard, named from a framed
+  digest of partition and keyspace; legacy concatenated-name shards migrate
+  lazily; soft deletes; a 60s cleanup pass with a 2h grace window (lets
+  offline nodes replay missed changes). Per-partition tuning: SQLite cache
+  size, journal mode (DELETE/TRUNCATE/WAL, default TRUNCATE), and
+  VACUUM/REINDEX intervals, applied on shard open and on update.
 - **Clustering**: permanent TCP mesh between peers (ZSTP protocol),
   heartbeat-based membership, deterministic leader election
   (lexicographically smallest online node id), contiguous hash-range
@@ -29,12 +64,56 @@ across nodes.
 - **Online rebalancing**: joining nodes receive shard snapshots via the
   SQLite online backup API, replay cached deltas, then report compliance;
   when every node complies the leader promotes the new structure and old
-  owners garbage-collect redundant shards one at a time.
+  owners garbage-collect redundant shards one at a time. Only one node
+  joins at a time (leader-held global rebalance lock).
+- **Workload analytics**: every node records reads, writes, updates and
+  deletes per shard plus latency, flushes a single snapshot into the system
+  store every 10s (30-minute TTL, self-cleaning), and the whole cluster view
+  is available from any node. Slow operations are keyed by
+  partition/keyspace (and filter key for queries) - filter *values* are
+  never recorded.
+- **Performance benchmark**: `zestyctl bench` or the admin console creates a
+  throwaway database and 10 partitions, times writes/gets/filtered
+  queries/updates/deletes, reports ops/sec, and deletes it all afterwards.
 - **Auth**: Bearer token or `authorization` key; the token is the
   username. Per-partition create/update/read/delete group bitmasks
   (mask 0 = allow all groups). Before the first user exists,
   unauthenticated requests have full rights so the first admin can be
   created.
+
+## High-performance, scale-out model
+
+ZestyDB treats every node as an equal. There is no primary/replica split
+and no hot master: the cluster elects a leader only to coordinate
+rebalancing, never to gate ordinary reads and writes.
+
+**Write path.** A write to any node is applied locally, fanned out to the
+other replica holders, and acknowledged only once a quorum
+(`rf/2+1`) confirms it. Because each `(partition, keyspace)` shard is placed
+on a different slice of the hash space, writes across your workload spread
+evenly over the nodes rather than concentrating on one - that is the write
+leveling that lets larger clusters absorb more write throughput.
+
+**Read path.** With a replication factor of 1 a read is served directly from
+the node that owns the shard (or proxied there). With `rf > 1`, reads fan
+out to every replica holder and records are returned only where a quorum
+agrees, so a stale or partitioned node can never hand back a wrong answer.
+Collection queries stay within the shards that actually hold the matching
+data, so query work is spread across nodes *and* across shards.
+
+**Scale.** Because the hash space is re-partitioned on every membership
+change, adding a node both expands total capacity and adds another set of
+CPU cores for query execution. Rebalancing is online and transactional:
+snapshots move via the SQLite backup API while the cluster keeps serving,
+deltas written during the move are replayed, and the new layout is promoted
+atomically. A bigger cluster is a more performant cluster, which is exactly
+what you want on cloud hardware where you can grow CPU, disk and network
+together.
+
+**Resilience.** Multi-master means an offline node doesn't stop the system:
+writes keep committing on the surviving quorum, cached changes are replayed
+when the node returns, and if the leader itself disappears the remaining
+nodes elect a new one and carry on.
 
 ## Build
 
@@ -79,7 +158,16 @@ The embedded Bootstrap web console is served at `/admin` straight from the
 `zestyd` binary. On first run it shows a setup form that creates the `admin`
 user with a password; afterwards it presents a login form. The console then
 exposes the same operations as `zestyctl` (status, databases, groups, users,
-partitions, keyspaces, settings, data, and cluster) backed by the JSON API.
+partitions, keyspaces, settings, data, analytics, benchmark, and cluster)
+backed by the JSON API.
+
+The **Analytics** tab gives you the live cluster picture: summary cards for
+nodes, reads, writes, updates, deletes, average read/write latency and
+replication backlog; a chart.js bar chart of reads/writes per shard (hot
+spots); a top-10 slowest-operations chart colour-coded by kind (read, write,
+delete, query); and tabular breakdowns. The **Benchmark** tab runs the
+performance test from the browser with your chosen record count, replication
+factor, cache size and journal mode.
 
 Passwords are stored as salted, iterated SHA-256 hashes and authenticate via
 short-lived session tokens (`Authorization: Bearer <token>`). The console's
@@ -89,6 +177,21 @@ proxy in front of the HTTP port in production.
 
 The Unix admin socket speaks HTTP without authentication and is what
 `zestyctl` uses by default (full local admin rights).
+
+## Monitoring
+
+Workload and performance data is collected on every node and replicated
+through the system store, so any node can show the whole cluster's metrics:
+
+- `GET /admin/analytics` (or the Analytics tab) aggregates per-node
+  snapshots into reads/writes/updates/deletes per partition/keyspace,
+  slowest operations with latency, and the pending-replication backlog.
+- `zestyctl bench [records] [rf] [cache_size] [journal_mode]` runs the
+  throwaway benchmark and prints writes/s, gets/s, queries/s, updates/s
+  and deletes/s.
+
+Snapshots are refreshed every 10 seconds and carry a 30-minute TTL, so a
+departed node simply ages out of the picture.
 
 ## Quick start
 
@@ -120,6 +223,7 @@ Or with the CLI (talks to the local admin socket):
       --filter '{"key":"age","operator":"gte","value":18}'
     bin/zestyctl list databases|groups|users|partitions|settings|nodes
     bin/zestyctl cluster
+    bin/zestyctl bench 100000 1 2048 TRUNCATE
 
 ## JSON filters
 
@@ -187,7 +291,8 @@ Failure semantics:
 
 Directory map:
 
-    src/engine/    shard manager, SQLite shards, TTL cleanup, config store
+    src/engine/    shard manager, SQLite shards, TTL cleanup, config store,
+                   analytics, benchmark
     src/socket/    ZSTP wire codec, cluster mesh, replication, snapshots
     src/httpd/     minimal HTTP/1.1 server (keep-alive, routes, static files)
     src/api/       REST handlers (data ops, sync protocol, admin ops)
@@ -204,13 +309,13 @@ Design notes inherited from Switchblade:
   nested objects, and multiple filters use AND semantics. Supported operators
   are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`.
 - Shard files are copied between nodes only through `sqlite3_backup_*`
-  while journal mode is DELETE / synchronous FULL, so transfers are
-  always consistent.
+  while `synchronous=FULL`, so transfers are always consistent regardless of
+  the configured journal mode.
 
 ## Status
 
 Stages 0-7 complete: engine, config store, HTTP/CLI, clustering,
 replication + quorum reads, live/target rebalancing (snapshot transfer,
 delta catch-up, promotion + GC, end-to-end join wiring), multi-node
-chaos/failure testing. See `AGENTS.md` for the detailed stage history
-and gotchas.
+chaos/failure testing, workload analytics, and performance benchmarking.
+See `AGENTS.md` for the detailed stage history and gotchas.

@@ -81,7 +81,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         records_per_partition = 100000;
     }
     if (!journal_mode || !*journal_mode) {
-        journal_mode = "WAL";
+        journal_mode = "TRUNCATE";
     }
 
     zdb_engine *engine = zdb_config_engine(cfg);

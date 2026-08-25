@@ -621,6 +621,9 @@ int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition)
     if (!mgr || !partition || !*partition) {
         return 0;
     }
+    zdb_shard_settings settings;
+    resolve_settings(mgr, partition, &settings);
+
     int reloaded = 0;
     pthread_mutex_lock(&mgr->lock);
     for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
@@ -632,8 +635,6 @@ int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition)
             if (!match) {
                 continue;
             }
-            zdb_shard_settings settings;
-            resolve_settings(mgr, partition, &settings);
             if (zdb_shard_reopen(sh, &settings)) {
                 reloaded++;
             }
