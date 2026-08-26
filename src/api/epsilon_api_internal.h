@@ -45,6 +45,15 @@ bool split_data_path(const char *path, char db[128], char part[256],
                      char ks[128], char id[512]);
 bool require_admin_auth(const edb_http_request *req, edb_http_response *res);
 
+/* --- failed-credential throttling (epsilon_api.c) ------------------- */
+/* True when the source has failed authentication too many times and is
+ * locked out. Trusted/local sockets are never throttled. */
+bool edb_auth_throttled(const char *ip);
+/* Records a failed credential check for the source. */
+void edb_auth_throttle_fail(const char *ip);
+/* Clears the source's failure counter (call on successful auth). */
+void edb_auth_throttle_reset(const char *ip);
+
 /* --- route handlers (defined across the split files) ---------------- */
 
 /* epsilon_api_data.c: data CRUD */

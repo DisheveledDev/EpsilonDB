@@ -396,19 +396,115 @@ bool query_param(const edb_http_request *req, const char *name,
 /* ------------------------------------------------------------------ */
 /* authentication                                                      */
 
+/* Failed-credential throttling. Keyed by source address: after
+ * EDB_AUTH_MAX_FAILS failed credential checks (wrong/missing password,
+ * unknown user), the source is locked out for EDB_AUTH_LOCKOUT_SECS so an
+ * open HTTP port cannot be brute-forced. The local admin socket never
+ * reaches this code (trusted requests return before any check). */
+#define EDB_AUTH_MAX_FAILS     8
+#define EDB_AUTH_LOCKOUT_SECS  30
+#define EDB_AUTH_ATTEMPT_SLOTS 64
+
+typedef struct {
+    char ip[64];
+    int fails;
+    long long locked_until;
+} edb_auth_attempt;
+
+static edb_auth_attempt g_auth_attempts[EDB_AUTH_ATTEMPT_SLOTS];
+static pthread_mutex_t g_auth_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static edb_auth_attempt *auth_slot(const char *ip)
+{
+    edb_auth_attempt *free_slot = NULL;
+    long long now = (long long)time(NULL);
+    for (int i = 0; i < EDB_AUTH_ATTEMPT_SLOTS; i++) {
+        edb_auth_attempt *a = &g_auth_attempts[i];
+        if (a->ip[0] && strcmp(a->ip, ip) == 0) {
+            return a;
+        }
+        if (!free_slot && (!a->ip[0] || a->locked_until <= now)) {
+            free_slot = a;
+        }
+    }
+    return free_slot;
+}
+
+bool edb_auth_throttled(const char *ip)
+{
+    if (!ip || !*ip) {
+        return false;
+    }
+    pthread_mutex_lock(&g_auth_lock);
+    edb_auth_attempt *a = auth_slot(ip);
+    bool throttled = a && a->fails >= EDB_AUTH_MAX_FAILS &&
+                     a->locked_until > (long long)time(NULL);
+    pthread_mutex_unlock(&g_auth_lock);
+    return throttled;
+}
+
+void edb_auth_throttle_fail(const char *ip)
+{
+    if (!ip || !*ip) {
+        return;
+    }
+    pthread_mutex_lock(&g_auth_lock);
+    edb_auth_attempt *a = auth_slot(ip);
+    if (a) {
+        long long now = (long long)time(NULL);
+        if (a->ip[0] == '\0') {
+            snprintf(a->ip, sizeof(a->ip), "%s", ip);
+        }
+        if (a->locked_until > now && a->fails >= EDB_AUTH_MAX_FAILS) {
+            a->locked_until = now + EDB_AUTH_LOCKOUT_SECS;   /* extend */
+        } else {
+            if (a->locked_until <= now) {
+                a->fails = 0;
+            }
+            a->fails++;
+            if (a->fails >= EDB_AUTH_MAX_FAILS) {
+                a->locked_until = now + EDB_AUTH_LOCKOUT_SECS;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_auth_lock);
+}
+
+void edb_auth_throttle_reset(const char *ip)
+{
+    if (!ip || !*ip) {
+        return;
+    }
+    pthread_mutex_lock(&g_auth_lock);
+    for (int i = 0; i < EDB_AUTH_ATTEMPT_SLOTS; i++) {
+        if (strcmp(g_auth_attempts[i].ip, ip) == 0) {
+            g_auth_attempts[i].ip[0] = '\0';
+            g_auth_attempts[i].fails = 0;
+            g_auth_attempts[i].locked_until = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_auth_lock);
+}
+
 /* Resolves the caller's group bitmask from the request. Accepts either an
  * "Authorization: Bearer <user>" header or an "authorization" JSON key in
  * the body / an "authorization" query param carrying the user name.
  * Returns the group mask; sets *ok. Unknown/absent users yield mask with
  * ok=false unless the special user "anonymous" exists. */
 uint64_t authenticate(const edb_http_request *req,
-                             const edb_http_request *unused, bool *ok)
+                      const edb_http_request *unused, bool *ok)
 {
     (void)unused;
     *ok = true;
 
     if (req->trusted) {
         return ~0ULL;
+    }
+
+    if (edb_auth_throttled(req->peer_ip)) {
+        *ok = false;
+        return 0;
     }
 
     uint64_t groups = 0;
@@ -433,7 +529,23 @@ uint64_t authenticate(const edb_http_request *req,
         query_param(req, "authorization", token_buf, sizeof(token_buf))) {
         token = token_buf;
     }
-    if (!token && req->body) {
+
+    /* A username authenticates with a password: "X-Epsilon-Password"
+     * header or a "password" key in a JSON body. */
+    char password_buf[1024] = "";
+    const char *password = NULL;
+    const char *pw_hdr = edb_http_header(req, "X-Epsilon-Password");
+    if (pw_hdr && *pw_hdr &&
+        snprintf(password_buf, sizeof(password_buf), "%s", pw_hdr) <
+            (int)sizeof(password_buf)) {
+        password = password_buf;
+    }
+
+    /* Only fall back to the body when the header/query did not already
+     * provide both credentials, so authenticated writes with JSON bodies
+     * are not parsed twice. */
+    if ((!password || !token) && req->body &&
+        (req->body[0] || req->body_len > 0)) {
         cJSON *body = NULL;
         if (body_json(req, &body)) {
             const cJSON *authorization =
@@ -442,6 +554,15 @@ uint64_t authenticate(const edb_http_request *req,
                 snprintf(token_buf, sizeof(token_buf), "%s",
                          authorization->valuestring) < (int)sizeof(token_buf)) {
                 token = token_buf;
+            }
+            if (!password) {
+                const cJSON *pw =
+                    cJSON_GetObjectItemCaseSensitive(body, "password");
+                if (cJSON_IsString(pw) && pw->valuestring && *pw->valuestring &&
+                    snprintf(password_buf, sizeof(password_buf), "%s",
+                             pw->valuestring) < (int)sizeof(password_buf)) {
+                    password = password_buf;
+                }
             }
             cJSON_Delete(body);
         }
@@ -452,11 +573,25 @@ uint64_t authenticate(const edb_http_request *req,
         if (session_lookup(token, session_username, &groups)) {
             /* authenticated via an admin console session token */
         } else {
-            edb_user_info user;
-            if (edb_user_get(g_ctx.config, token, &user)) {
-                groups = user.groups;
-            } else {
+            /* The bearer value is a username: it only authenticates with
+             * the matching password. Passwordless users cannot log in over
+             * the untrusted HTTP port at all; without this check anyone
+             * who knows a username could impersonate the user. */
+            bool verified = password && *password &&
+                            edb_user_has_password(g_ctx.config, token) &&
+                            edb_user_verify_password(g_ctx.config, token,
+                                                     password);
+            if (!verified) {
+                edb_auth_throttle_fail(req->peer_ip);
                 *ok = false;
+            } else {
+                edb_auth_throttle_reset(req->peer_ip);
+                edb_user_info user;
+                if (edb_user_get(g_ctx.config, token, &user)) {
+                    groups = user.groups;
+                } else {
+                    *ok = false;
+                }
             }
         }
     } else {

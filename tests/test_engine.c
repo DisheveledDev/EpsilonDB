@@ -333,6 +333,40 @@ static void test_concurrent_puts(void)
 
 #include <sys/wait.h>
 
+static void test_shard_size_and_defaults(void)
+{
+    /* maintenance defaults: vacuum weekly, reindex daily, cache auto */
+    edb_shard_settings dflt;
+    edb_shard_settings_default(&dflt);
+    CHECK(dflt.vacuum_seconds == 604800);
+    CHECK(dflt.reindex_seconds == 86400);
+    CHECK(dflt.cache_size == 0);
+
+    rm_rf("tests/data/size");
+    edb_engine *mgr = edb_engine_open("tests/data/size");
+    CHECK(mgr != NULL);
+
+    /* missing shard reports 0 bytes */
+    CHECK(edb_engine_shard_size(mgr, "nope", "nope") == 0);
+
+    /* a fresh shard grows once data lands */
+    CHECK(edb_put(mgr, "sz", "main", "a", "{\"v\":1}", -1));
+    long long small = edb_engine_shard_size(mgr, "sz", "main");
+    CHECK(small > 0);
+
+    /* more data pushes the file bigger */
+    char big[8192];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    char doc[9000];
+    snprintf(doc, sizeof(doc), "{\"blob\":\"%s\"}", big);
+    CHECK(edb_put(mgr, "sz", "main", "b", doc, -1));
+    long long grown = edb_engine_shard_size(mgr, "sz", "main");
+    CHECK(grown > small);
+
+    edb_engine_close(mgr);
+}
+
 int main(void)
 {
     test_put_get_delete();
@@ -341,6 +375,7 @@ int main(void)
     test_shard_layout_and_reopen();
     test_cleanup_pass();
     test_concurrent_puts();
+    test_shard_size_and_defaults();
 
     printf("%d tests, %d failures\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

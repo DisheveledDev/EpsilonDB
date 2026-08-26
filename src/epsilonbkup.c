@@ -837,7 +837,7 @@ static int cmd_restore(int argc, char **argv)
 
 static void print_usage(void)
 {
-    printf("usage: epsilonbkup [-h host] [-p port] [-u user] "
+    printf("usage: epsilonbkup [-h host] [-p port] [-u user [-P password]] "
            "<backup|restore> [args]\n");
     printf("  backup [-o out.zip] [-k]      download all shards into a zip\n");
     printf("  restore <backup.zip>          lock the cluster, wipe shards,\n");
@@ -874,6 +874,11 @@ int argi = 1;
                     strcmp(argv[argi], "--user") == 0) && argi + 1 < argc) {
             g_user = argv[argi + 1];
             argi += 2;
+        } else if ((strcmp(argv[argi], "-P") == 0 ||
+                    strcmp(argv[argi], "--password") == 0) &&
+                   argi + 1 < argc) {
+            g_password = argv[argi + 1];
+            argi += 2;
         } else if (strcmp(argv[argi], "-q") == 0) {
             g_quiet = true;
             argi++;
@@ -885,6 +890,15 @@ int argi = 1;
     if (argi >= argc) {
         print_usage();
         return 2;
+    }
+    /* remote user auth requires a password (the server rejects
+     * passwordless users over HTTP) */
+    if (g_host && g_user && *g_user && g_password[0] == '\0') {
+        fprintf(stderr,
+                "epsilonbkup: user '%s' needs a password over HTTP "
+                "(pass -P <password>)\n",
+                g_user);
+        return 1;
     }
     const char *cmd = argv[argi++];
 

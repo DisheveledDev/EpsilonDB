@@ -25,6 +25,7 @@ typedef struct {
     char *body;               /* NUL-terminated, may be empty */
     size_t body_len;
     void *user;               /* handler-private state */
+    char peer_ip[64];         /* client address ("" if unavailable) */
     bool trusted;             /* arrived on the local admin socket: skip
                                * authentication, treat as admin */
 } edb_http_request;

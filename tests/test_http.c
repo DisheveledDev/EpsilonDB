@@ -29,9 +29,21 @@ static int tests_failed = 0;
     } while (0)
 
 static int g_port = 0;
+static const char *g_password = "test-pass-123";
+
+static int http_request_pw(const char *method, const char *path,
+                           const char *auth, const char *password,
+                           const char *body, char **body_out);
 
 static int http_request(const char *method, const char *path,
                         const char *auth, const char *body, char **body_out)
+{
+    return http_request_pw(method, path, auth, g_password, body, body_out);
+}
+
+static int http_request_pw(const char *method, const char *path,
+                           const char *auth, const char *password,
+                           const char *body, char **body_out)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -48,19 +60,24 @@ static int http_request(const char *method, const char *path,
 
     char head[2048];
     char auth_hdr[600] = "";
+    char pw_hdr[600] = "";
     if (auth) {
         snprintf(auth_hdr, sizeof(auth_hdr),
                  "Authorization: Bearer %s\r\n", auth);
     }
+    if (password && *password) {
+        snprintf(pw_hdr, sizeof(pw_hdr),
+                 "X-Epsilon-Password: %s\r\n", password);
+    }
     int n = snprintf(head, sizeof(head),
                      "%s %s HTTP/1.1\r\n"
                      "Host: localhost\r\n"
-                     "%s"
+                     "%s%s"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
                      method, path,
-                     auth_hdr,
+                     auth_hdr, pw_hdr,
                      body ? strlen(body) : 0);
     size_t sent = 0;
     while (sent < (size_t)n) {
@@ -153,12 +170,14 @@ int main(int argc, char **argv)
     uint64_t readers = 1ULL << 1;
 
     s = http_request("POST", "/admin/users", NULL,
-                     "{\"name\":\"root\",\"groups\":1}", NULL);   /* bit1 */
+                     "{\"name\":\"root\",\"groups\":1,\"password\":\"test-pass-123\"}",
+                     NULL);   /* bit1 */
     CHECK(s == 201);
     /* from here on the store is bootstrapped: unauthenticated requests
      * have no groups, so the test must authenticate as root */
     s = http_request("POST", "/admin/users", "root",
-                     "{\"name\":\"viewer\",\"groups\":2}", NULL); /* bit2 */
+                     "{\"name\":\"viewer\",\"groups\":2,\"password\":\"test-pass-123\"}",
+                     NULL); /* bit2 */
     CHECK(s == 201);
 
     char pjson[512];
@@ -195,6 +214,15 @@ int main(int argc, char **argv)
 
     /* unknown user rejected outright */
     s = http_request("GET", "/data/app/cache/main/w1", "ghost", NULL, &body);
+    CHECK(s == 401);
+
+    /* a username without a password is rejected (no impersonation) */
+    s = http_request_pw("GET", "/data/app/cache/main/w1", "root", "",
+                        NULL, &body);
+    CHECK(s == 401);
+    /* a wrong password is rejected */
+    s = http_request_pw("GET", "/data/app/cache/main/w1", "root",
+                        "wrong-pass", NULL, &body);
     CHECK(s == 401);
 
     /* missing document */
@@ -300,6 +328,13 @@ int main(int argc, char **argv)
     s = http_request("DELETE", "/admin/users/shortlived", "root", NULL,
                      NULL);
     CHECK(s == 200);
+
+    /* passwordless users cannot authenticate over HTTP at all */
+    s = http_request("POST", "/admin/users", "root",
+                     "{\"name\":\"nopass\",\"groups\":1}", NULL);
+    CHECK(s == 201);
+    s = http_request_pw("GET", "/admin/users", "nopass", "", NULL, &body);
+    CHECK(s == 401);
 
     char pj[512];
     snprintf(pj, sizeof(pj),

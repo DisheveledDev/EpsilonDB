@@ -48,8 +48,9 @@ watch it perform as you grow it.
   digest of partition and keyspace; legacy concatenated-name shards migrate
   lazily; soft deletes; a 60s cleanup pass with a 2h grace window (lets
   offline nodes replay missed changes). Per-partition tuning: SQLite cache
-  size, journal mode (DELETE/TRUNCATE/WAL, default TRUNCATE), and
-  VACUUM/REINDEX intervals, applied on shard open and on update.
+  size (0 = automatic, scaled from the shard's on-disk size), journal mode
+  (DELETE/TRUNCATE/WAL, default TRUNCATE), and VACUUM/REINDEX intervals
+  (default weekly/daily), applied on shard open and on update.
 - **Clustering**: permanent TCP mesh between peers (ESTP protocol),
   heartbeat-based membership, deterministic leader election
   (lexicographically smallest online node id), contiguous hash-range
@@ -82,11 +83,13 @@ watch it perform as you grow it.
   queries/updates/deletes, reports ops/sec, and deletes it all afterwards.
   Partitions are spread across worker threads (one per partition by
   default), so every shard is read/written independently and concurrently.
-- **Auth**: Bearer token or `authorization` key; the token is the
-  username. Per-partition create/update/read/delete group bitmasks
-  (mask 0 = allow all groups). Before the first user exists,
-  unauthenticated requests have full rights so the first admin can be
-  created.
+- **Auth**: a username via Bearer token or `authorization` key, plus its
+  password (`X-Epsilon-Password` header or `password` body key) — a bare
+  username is rejected and passwordless users cannot log in over the HTTP
+  port. Failed attempts are throttled per source address. Per-partition
+  create/update/read/delete group bitmasks (mask 0 = allow all groups).
+  Before the first user exists, unauthenticated requests have full rights
+  so the first admin can be created.
 
 ## High-performance, scale-out model
 
@@ -257,8 +260,8 @@ they take effect.
 file and restores it. It talks to one node over HTTP and to the cluster
 mesh for the data itself:
 
-    bin/epsilonbkup -h <host> -p <port> -u <user> backup -o backup.zip
-    bin/epsilonbkup -h <host> -p <port> -u <user> restore backup.zip
+    bin/epsilonbkup -h <host> -p <port> -u <user> -P <password> backup -o backup.zip
+    bin/epsilonbkup -h <host> -p <port> -u <user> -P <password> restore backup.zip
 
 Backup downloads every data shard as a transactionally consistent SQLite
 snapshot (the same online-backup path used for rebalancing), skips the
@@ -292,10 +295,11 @@ partitions, keyspaces, settings, data, analytics, benchmark, and cluster)
 backed by the JSON API.
 
 The **Analytics** tab gives you the live cluster picture: summary cards for
-nodes, reads, writes, updates, deletes, average read/write latency and
-replication backlog; a chart.js bar chart of reads/writes per shard (hot
-spots); a top-10 slowest-operations chart colour-coded by kind (read, write,
-delete, query); and tabular breakdowns. The **Benchmark** tab runs the
+nodes, reads, writes, updates, deletes, average read/write latency, total
+data size and replication backlog; a chart.js bar chart of reads/writes per
+shard (hot spots); a top-10 slowest-operations chart colour-coded by kind
+(read, write, delete, query); a top-10 largest-shards chart with per-shard
+on-disk sizes; and tabular breakdowns. The **Benchmark** tab runs the
 performance test from the browser with your chosen record count, replication
 factor, cache size and journal mode.
 
@@ -315,10 +319,11 @@ through the system store, so any node can show the whole cluster's metrics:
 
 - `GET /admin/analytics` (or the Analytics tab) aggregates per-node
   snapshots into reads/writes/updates/deletes per partition/keyspace,
-  slowest operations with latency, and the pending-replication backlog.
+  on-disk size per shard (plus a top-10 `largest_shards` list), slowest
+  operations with latency, and the pending-replication backlog.
 - `epsilonbench [records] [rf] [cache_size] [journal_mode] [threads]`
   runs the throwaway benchmark (against a running server, over the local
-  admin socket or `-h/-p/-u` for a remote node; `--json` dumps the raw
+  admin socket or `-h/-p/-u/-P` for a remote node; `--json` dumps the raw
   report) and prints writes/s, gets/s, queries/s, updates/s and deletes/s.
   The optional trailing `threads` argument controls how many worker
   threads the partitions are spread across (0 = one thread per
@@ -330,22 +335,24 @@ departed node simply ages out of the picture.
 
 ## Quick start
 
-    # bootstrap the first admin (works pre-bootstrap over plain HTTP)
+    # bootstrap the first admin (works pre-bootstrap over plain HTTP;
+    # give it a password so remote clients can authenticate)
     curl -X POST localhost:8123/admin/users \
-         -d '{"name":"root","groups":1}'
+         -d '{"name":"root","groups":1,"password":"change-me"}'
 
     # create a database with replication factor 2
-    curl -u ignored:root -X POST localhost:8123/admin/databases \
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
+         -X POST localhost:8123/admin/databases \
          -d '{"name":"app","replication_factor":2}'
 
     # write and query documents with typed, nested JSON filters
-    curl -u ignored:root -X PUT \
-         'localhost:8123/data/app/main/kv/user-1?ttl=3600' \
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
+         -X PUT 'localhost:8123/data/app/main/kv/user-1?ttl=3600' \
          -d '{"name":"Ada","age":43,"manager":{"age":51}}'
-    curl -u ignored:root \
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
          'localhost:8123/data/app/main/kv/user-1'
-    curl -u ignored:root -X POST \
-         'localhost:8123/data/app/main/kv/query' \
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
+         -X POST 'localhost:8123/data/app/main/kv/query' \
          -d '{"key":"manager.age","operator":"gt","value":42}'
 
 Or with the CLI (talks to the local admin socket):

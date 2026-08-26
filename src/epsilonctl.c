@@ -2,11 +2,13 @@
  *
  * Connects to a node's HTTP endpoint and issues admin/data requests.
  *
- * Usage: epsilonctl [-s socket] | [-h host] [-p port] [-u user] <command> [args...]
+ * Usage: epsilonctl [-s socket] | [-h host] [-p port] [-u user [-P password]]
+ *        <command> [args...]
  *
  * By default epsilonctl connects to the server's local admin socket (no
  * authentication; treated as admin). Pass -h/-p to talk to a remote node's
- * HTTP port instead, in which case -u is required for privileged commands.
+ * HTTP port instead, in which case -u and a password (-P, or a prompt) are
+ * required for privileged commands.
  *
  * Commands:
  *   status
@@ -71,9 +73,40 @@
 const char *g_host = NULL;      /* set => TCP HTTP mode */
 int g_port = 8123;
 const char *g_user = "";
+const char *g_password = "";
 const char *g_sockpath = DEFAULT_ADMIN_SOCK;
 volatile sig_atomic_t g_exit_requested = false;
 bool g_quiet_stderr = false;   /* suppress chatter in console mode */
+
+/* Prompts for a hidden password on the controlling terminal. Returns a
+ * pointer to a static buffer, or NULL when stdin is not a terminal. */
+const char *prompt_password(const char *user)
+{
+    if (!isatty(STDIN_FILENO)) {
+        return NULL;
+    }
+    static char pw[256];
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        return NULL;
+    }
+    newt = oldt;
+    newt.c_lflag &= (tcflag_t)~ECHO;
+    fprintf(stderr, "password for %s: ", user ? user : "");
+    fflush(stderr);
+    int ok = tcsetattr(STDIN_FILENO, TCSAFLUSH, &newt) == 0 &&
+             fgets(pw, sizeof(pw), stdin) != NULL;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    if (!ok) {
+        pw[0] = '\0';
+    }
+    size_t len = strlen(pw);
+    while (len > 0 && (pw[len - 1] == '\n' || pw[len - 1] == '\r')) {
+        pw[--len] = '\0';
+    }
+    fprintf(stderr, "\n");
+    return ok ? pw : NULL;
+}
 
 /* ------------------------------------------------------------------ */
 /* HTTP plumbing                                                       */
@@ -157,11 +190,12 @@ int http_request(const char *method, const char *path,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
                      "Authorization: Bearer %s\r\n"
+                     "X-Epsilon-Password: %s\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
                      method, path, g_host ? g_host : "local", g_port, g_user,
-                     body ? strlen(body) : 0);
+                     g_password, body ? strlen(body) : 0);
     if (n < 0) {
         close(fd);
         return -1;
@@ -175,11 +209,12 @@ int http_request(const char *method, const char *path,
              "%s %s HTTP/1.1\r\n"
              "Host: %s:%d\r\n"
              "Authorization: Bearer %s\r\n"
+             "X-Epsilon-Password: %s\r\n"
              "Content-Length: %zu\r\n"
              "Connection: close\r\n"
              "\r\n",
              method, path, g_host ? g_host : "local", g_port, g_user,
-             body ? strlen(body) : 0);
+             g_password, body ? strlen(body) : 0);
 
     size_t sent = 0;
     while (sent < (size_t)n) {
@@ -267,7 +302,7 @@ int run(const char *method, const char *path, const char *body)
 void print_usage(void)
 {
     static const char *lines[] = {
-        "usage: epsilonctl [-s socket] | [-h host -p port -u user]",
+        "usage: epsilonctl [-s socket] | [-h host -p port -u user [-P password]]",
         "                <command> [args...]",
         "",
         "server:",
@@ -738,11 +773,31 @@ int main(int argc, char **argv)
                     strcmp(argv[argi], "--user") == 0) &&
                    argi + 1 < argc) {
             g_user = argv[++argi];
+        } else if ((strcmp(argv[argi], "-P") == 0 ||
+                    strcmp(argv[argi], "--password") == 0) &&
+                   argi + 1 < argc) {
+            g_password = argv[++argi];
         } else {
             print_usage();
             return 1;
         }
         argi++;
+    }
+
+    /* remote user auth requires a password: prompt when possible,
+     * otherwise refuse to run (the server rejects passwordless users) */
+    if (g_host && g_user && *g_user && g_password[0] == '\0' &&
+        !g_quiet_stderr) {
+        const char *pw = prompt_password(g_user);
+        if (pw) {
+            g_password = pw;
+        } else {
+            fprintf(stderr,
+                    "epsilonctl: user '%s' needs a password over HTTP "
+                    "(pass -P <password>)\n",
+                    g_user);
+            return 1;
+        }
     }
 
     if (argi >= argc) {

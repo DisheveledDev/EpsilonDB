@@ -81,8 +81,10 @@ void edb_analytics_record_query(edb_analytics *a, const char *partition,
 
 /* Aggregates every node's latest snapshot into a report object:
  *   { "nodes": [..], "shards": [ {partition,keyspace,reads,writes,updates,
- *     deletes,read_us,write_us}, .. ], "slow": [ {kind,partition,keyspace,
- *     filter,count,total_us,max_us}, .. ], "cluster": {pending_changes} }
+ *     deletes,read_us,write_us,size_bytes}, .. ], "slow": [ {kind,partition,
+ *     keyspace,filter,count,total_us,max_us}, .. ],
+ *     "largest_shards": [ {partition,keyspace,size_bytes}, .. (top 10) ],
+ *     "cluster": {pending_changes} }
  * Caller frees with cJSON_Delete. */
 cJSON *edb_analytics_report(edb_analytics *a);
 

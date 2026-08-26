@@ -14,6 +14,7 @@
 extern const char *g_host;      /* set => TCP HTTP mode */
 extern int g_port;
 extern const char *g_user;
+extern const char *g_password;  /* password for remote (-h) user auth */
 extern const char *g_sockpath;
 extern volatile sig_atomic_t g_exit_requested;
 extern bool g_quiet_stderr;     /* suppress chatter in console mode */

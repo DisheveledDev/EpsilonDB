@@ -1,6 +1,7 @@
 #include "shard_internal.h"
 
 #include <inttypes.h>
+#include <sys/stat.h>
 #include "../epsilon_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,16 +185,55 @@ void edb_shard_settings_default(edb_shard_settings *out)
     if (!out) {
         return;
     }
-    out->cache_size = 0;          /* unset => SQLite default (-2000 KB) */
+    out->cache_size = 0;          /* 0 = auto: scaled from the shard size */
     snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
-    out->vacuum_seconds = 21600;  /* 6 hours */
-    out->reindex_seconds = 3600;  /* 1 hour */
+    out->vacuum_seconds = 604800;  /* weekly */
+    out->reindex_seconds = 86400;  /* daily */
+}
+
+/* Automatic page-cache floors and caps: never below the SQLite default
+ * (2 MB) and never above 256 MB so a single large shard cannot pin an
+ * unbounded amount of memory. */
+#define EDB_CACHE_AUTO_MIN_KB 2048
+#define EDB_CACHE_AUTO_MAX_KB 262144
+
+/* Effective page-cache size (KiB) for a shard connection: the configured
+ * value when set (negative = SQLite default, no pragma), otherwise 10% of
+ * the on-disk shard size so bigger shards get proportionally bigger
+ * caches. The file may not exist yet on first open; the floor applies. */
+static long long effective_cache_kb(const char *path,
+                                    const edb_shard_settings *s)
+{
+    if (!s) {
+        return 0;
+    }
+    if (s->cache_size > 0) {
+        return s->cache_size;
+    }
+    if (s->cache_size < 0) {
+        return 0;
+    }
+    long long kb = EDB_CACHE_AUTO_MIN_KB;
+    if (path) {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0) {
+            long long want = (long long)st.st_size / 10 / 1024;
+            if (want > kb) {
+                kb = want;
+            }
+            if (kb > EDB_CACHE_AUTO_MAX_KB) {
+                kb = EDB_CACHE_AUTO_MAX_KB;
+            }
+        }
+    }
+    return kb;
 }
 
 /* Applies journal_mode + synchronous + cache_size to an open connection.
  * cache_size is a positive kibibyte count, expressed to SQLite via the
  * negative-value convention (abs(N) * 1024 bytes). */
 static int configure_connection(sqlite3 *db, const char *key,
+                                const char *path,
                                 const edb_shard_settings *s)
 {
     char sql[256];
@@ -212,9 +252,10 @@ static int configure_connection(sqlite3 *db, const char *key,
         sqlite3_free(err);
         return -1;
     }
-    if (s && s->cache_size > 0) {
+    long long cache_kb = effective_cache_kb(path, s);
+    if (cache_kb > 0) {
         snprintf(sql, sizeof(sql), "PRAGMA cache_size=-%lld;",
-                 (long long)s->cache_size);
+                 (long long)cache_kb);
         if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
             edb_log("ERROR", "shard %s: cache_size pragma failed: %s", key,
                     err ? err : "?");
@@ -296,7 +337,7 @@ edb_shard *edb_shard_open(const char *path, const char *key,
     }
 
     sqlite3_busy_timeout(sh->db, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(sh->db, sh->key, &sh->settings) != 0 ||
+    if (configure_connection(sh->db, sh->key, path, &sh->settings) != 0 ||
         setup_schema(sh->db, sh->key) != 0) {
         edb_shard_free(sh);
         return NULL;
@@ -331,7 +372,7 @@ bool edb_shard_reopen(edb_shard *sh, const edb_shard_settings *settings)
         return false;
     }
     sqlite3_busy_timeout(fresh, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(fresh, sh->key, settings) != 0 ||
+    if (configure_connection(fresh, sh->key, sh->path, settings) != 0 ||
         setup_schema(fresh, sh->key) != 0) {
         sqlite3_close(fresh);
         pthread_mutex_unlock(&sh->lock);

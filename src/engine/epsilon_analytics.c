@@ -15,6 +15,7 @@ typedef struct {
     uint64_t deletes;
     uint64_t read_us;
     uint64_t write_us;
+    uint64_t size_bytes;
 } shard_stat;
 
 typedef struct {
@@ -255,6 +256,11 @@ static cJSON *snapshot_json(edb_analytics *a)
     cJSON *shards = cJSON_AddArrayToObject(doc, "shards");
     for (size_t i = 0; i < a->nshards; i++) {
         shard_stat *s = &a->shards[i];
+        if (a->engine) {
+            long long bytes = edb_engine_shard_size(a->engine, s->partition,
+                                                    s->keyspace);
+            s->size_bytes = bytes > 0 ? (uint64_t)bytes : 0;
+        }
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "partition", s->partition);
         cJSON_AddStringToObject(o, "keyspace", s->keyspace);
@@ -264,6 +270,7 @@ static cJSON *snapshot_json(edb_analytics *a)
         cJSON_AddNumberToObject(o, "deletes", (double)s->deletes);
         cJSON_AddNumberToObject(o, "read_us", (double)s->read_us);
         cJSON_AddNumberToObject(o, "write_us", (double)s->write_us);
+        cJSON_AddNumberToObject(o, "size_bytes", (double)s->size_bytes);
         cJSON_AddItemToArray(shards, o);
     }
 
@@ -395,6 +402,7 @@ typedef struct {
     char partition[256];
     char keyspace[128];
     uint64_t reads, writes, updates, deletes, read_us, write_us;
+    uint64_t size_bytes;
 } report_shard;
 
 typedef struct {
@@ -464,6 +472,20 @@ static report_slow *agg_slow(report_slow **listp, size_t *n, size_t *cap,
     return s;
 }
 
+/* Descending on-disk size; ties keep stable order (not required). */
+static int cmp_shard_size_desc(const void *pa, const void *pb)
+{
+    const report_shard *const *a = pa;
+    const report_shard *const *b = pb;
+    if ((*b)->size_bytes > (*a)->size_bytes) {
+        return 1;
+    }
+    if ((*b)->size_bytes < (*a)->size_bytes) {
+        return -1;
+    }
+    return 0;
+}
+
 cJSON *edb_analytics_report(edb_analytics *a)
 {
     cJSON *out = cJSON_CreateObject();
@@ -520,6 +542,12 @@ cJSON *edb_analytics_report(edb_analytics *a)
                     cJSON_GetObjectItemCaseSensitive(s, "read_us"));
                 r->write_us += (uint64_t)cJSON_GetNumberValue(
                     cJSON_GetObjectItemCaseSensitive(s, "write_us"));
+                /* replicas may differ slightly; report the largest copy */
+                uint64_t size = (uint64_t)cJSON_GetNumberValue(
+                    cJSON_GetObjectItemCaseSensitive(s, "size_bytes"));
+                if (size > r->size_bytes) {
+                    r->size_bytes = size;
+                }
             }
             const cJSON *jslow = cJSON_GetObjectItemCaseSensitive(snap, "slow");
             cJSON_ArrayForEach(s, jslow) {
@@ -573,7 +601,31 @@ cJSON *edb_analytics_report(edb_analytics *a)
         cJSON_AddNumberToObject(o, "deletes", (double)shards[i].deletes);
         cJSON_AddNumberToObject(o, "read_us", (double)shards[i].read_us);
         cJSON_AddNumberToObject(o, "write_us", (double)shards[i].write_us);
+        cJSON_AddNumberToObject(o, "size_bytes", (double)shards[i].size_bytes);
         cJSON_AddItemToArray(shards_json, o);
+    }
+
+    /* top 10 largest shards by on-disk size, descending */
+    cJSON *largest = cJSON_AddArrayToObject(out, "largest_shards");
+    if (nshards > 0) {
+        const report_shard **sorted =
+            malloc(nshards * sizeof(*sorted));
+        if (sorted) {
+            for (size_t i = 0; i < nshards; i++) {
+                sorted[i] = &shards[i];
+            }
+            qsort(sorted, nshards, sizeof(*sorted), cmp_shard_size_desc);
+            size_t top = nshards < 10 ? nshards : 10;
+            for (size_t i = 0; i < top; i++) {
+                cJSON *o = cJSON_CreateObject();
+                cJSON_AddStringToObject(o, "partition", sorted[i]->partition);
+                cJSON_AddStringToObject(o, "keyspace", sorted[i]->keyspace);
+                cJSON_AddNumberToObject(o, "size_bytes",
+                                        (double)sorted[i]->size_bytes);
+                cJSON_AddItemToArray(largest, o);
+            }
+            free(sorted);
+        }
     }
     for (size_t i = 0; i < nslow; i++) {
         cJSON *o = cJSON_CreateObject();

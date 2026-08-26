@@ -27,6 +27,7 @@
 #endif
 
 static int tests_run = 0;
+static const char *g_password = "join-pass-123";
 static int tests_failed = 0;
 
 #define CHECK(cond)                                                       \
@@ -65,10 +66,12 @@ static int http_request(int port, const char *method, const char *path,
                      "%s %s HTTP/1.1\r\n"
                      "Host: localhost\r\n"
                      "%s"
+                     "X-Epsilon-Password: %s\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
-                     method, path, auth_hdr, body ? strlen(body) : 0);
+                     method, path, auth_hdr, g_password,
+                     body ? strlen(body) : 0);
     size_t sent = 0;
     while (sent < (size_t)n) {
         ssize_t w = send(fd, head + sent, (size_t)n - sent, 0);
@@ -149,7 +152,8 @@ int main(int argc, char **argv)
     /* bootstrap the admin user (pre-bootstrap unauthenticated requests
      * run with full rights) */
     int s = http_request(seed_http, "POST", "/admin/users", NULL,
-                         "{\"name\":\"root\",\"groups\":1}", NULL);
+                         "{\"name\":\"root\",\"groups\":1,"
+                         "\"password\":\"join-pass-123\"}", NULL);
     CHECK(s == 200 || s == 201);
 
     /* replication factor 1: writes succeed with a single node */

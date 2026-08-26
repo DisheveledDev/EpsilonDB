@@ -61,6 +61,7 @@ typedef struct conn_ctx {
     edb_http_server *srv;
     int fd;
     bool trusted;
+    char peer_ip[64];          /* client address, "" if unavailable */
     struct conn_ctx *next;
 } conn_ctx;
 
@@ -555,6 +556,7 @@ static void *conn_main(void *arg)
             break;
         }
         req.trusted = ctx->trusted;
+        snprintf(req.peer_ip, sizeof(req.peer_ip), "%s", ctx->peer_ip);
 
         edb_http_response res = { .status = 500 };
         res.content_type = "application/json";
@@ -679,6 +681,25 @@ static void *accept_main(void *arg)
         ctx->srv = srv;
         ctx->fd = fd;
         ctx->trusted = job.trusted;
+
+        /* record the client address (for per-source auth throttling) */
+        struct sockaddr_storage paddr;
+        socklen_t paddr_len = sizeof(paddr);
+        if (getpeername(fd, (struct sockaddr *)&paddr, &paddr_len) == 0) {
+            char ipbuf[64];
+            if (paddr.ss_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&paddr;
+                if (inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf))) {
+                    snprintf(ctx->peer_ip, sizeof(ctx->peer_ip), "%s", ipbuf);
+                }
+            } else if (paddr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&paddr;
+                if (inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf,
+                              sizeof(ipbuf))) {
+                    snprintf(ctx->peer_ip, sizeof(ctx->peer_ip), "%s", ipbuf);
+                }
+            }
+        }
 
         pthread_mutex_lock(&srv->state_lock);
         if (!srv->running || srv->nworkers >= EDB_HTTP_MAX_WORKERS) {

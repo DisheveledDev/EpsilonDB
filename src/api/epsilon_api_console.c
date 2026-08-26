@@ -167,6 +167,10 @@ bool handle_admin_login(const edb_http_request *req,
         respond_error(res, 405, "method not allowed");
         return true;
     }
+    if (!req->trusted && edb_auth_throttled(req->peer_ip)) {
+        respond_error(res, 401, "too many failed attempts");
+        return true;
+    }
     cJSON *body = NULL;
     if (!body_json(req, &body) || !cJSON_IsObject(body)) {
         respond_error(res, 400, "JSON object required");
@@ -179,6 +183,9 @@ bool handle_admin_login(const edb_http_request *req,
         !edb_user_verify_password(g_ctx.config, username->valuestring,
                                   password->valuestring)) {
         cJSON_Delete(body);
+        if (!req->trusted) {
+            edb_auth_throttle_fail(req->peer_ip);
+        }
         respond_error(res, 401, "invalid credentials");
         return true;
     }
@@ -187,6 +194,9 @@ bool handle_admin_login(const edb_http_request *req,
         cJSON_Delete(body);
         respond_error(res, 401, "invalid credentials");
         return true;
+    }
+    if (!req->trusted) {
+        edb_auth_throttle_reset(req->peer_ip);
     }
     char token[65];
     session_create(user.name, user.groups, token);

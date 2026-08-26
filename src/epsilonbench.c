@@ -5,7 +5,7 @@
  * by default (trusted, no auth); use -h/-p/-u for a remote node.
  *
  * Usage:
- *   epsilonbench [-s socket] [-h host -p port -u user] [--json]
+ *   epsilonbench [-s socket] [-h host -p port -u user [-P password]] [--json]
  *                [records] [replication_factor] [cache_size]
  *                [journal_mode] [threads]
  */
@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "../vendor/cjson/cJSON.h"
@@ -30,6 +31,7 @@
 static const char *g_host = NULL;
 static int g_port = 8123;
 static const char *g_user = "";
+static const char *g_password = "";
 static const char *g_sockpath = DEFAULT_ADMIN_SOCK;
 static bool g_json = false;
 static bool g_quiet = false;
@@ -144,12 +146,13 @@ static char *http_request_raw(const char *method, const char *path,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
                      "Authorization: Bearer %s\r\n"
+                     "X-Epsilon-Password: %s\r\n"
                      "Content-Type: application/json\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
                      method, path, g_host ? g_host : "local", g_port, g_user,
-                     body ? body_len : 0);
+                     g_password, body ? body_len : 0);
     if (n < 0) {
         close(fd);
         return NULL;
@@ -163,12 +166,13 @@ static char *http_request_raw(const char *method, const char *path,
              "%s %s HTTP/1.1\r\n"
              "Host: %s:%d\r\n"
              "Authorization: Bearer %s\r\n"
+             "X-Epsilon-Password: %s\r\n"
              "Content-Type: application/json\r\n"
              "Content-Length: %zu\r\n"
              "Connection: close\r\n"
              "\r\n",
              method, path, g_host ? g_host : "local", g_port, g_user,
-             body ? body_len : 0);
+             g_password, body ? body_len : 0);
     if (send_all(fd, head, (size_t)n) != 0) {
         free(head);
         close(fd);
@@ -351,8 +355,8 @@ static int render_report(const cJSON *report)
 
 static void print_usage(void)
 {
-    printf("usage: epsilonbench [-s socket] | [-h host -p port -u user] "
-           "[--json]\n");
+    printf("usage: epsilonbench [-s socket] | [-h host -p port -u user "
+           "[-P password]] [--json]\n");
     printf("                      [records] [replication_factor] "
            "[cache_size]\n");
     printf("                      [journal_mode] [threads]\n");
@@ -360,6 +364,36 @@ static void print_usage(void)
     printf("  epsilond and prints ops/sec per phase. Defaults to the local\n");
     printf("  admin socket; -h/-p/-u switch to a remote node. --json dumps\n");
     printf("  the raw report object.\n");
+}
+
+/* Prompts for a hidden password on the controlling terminal, or NULL when
+ * stdin is not a terminal. */
+static const char *prompt_password(const char *user)
+{
+    if (!isatty(STDIN_FILENO)) {
+        return NULL;
+    }
+    static char pw[256];
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+        return NULL;
+    }
+    newt = oldt;
+    newt.c_lflag &= (tcflag_t)~ECHO;
+    fprintf(stderr, "password for %s: ", user ? user : "");
+    fflush(stderr);
+    int ok = tcsetattr(STDIN_FILENO, TCSAFLUSH, &newt) == 0 &&
+             fgets(pw, sizeof(pw), stdin) != NULL;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    if (!ok) {
+        pw[0] = '\0';
+    }
+    size_t len = strlen(pw);
+    while (len > 0 && (pw[len - 1] == '\n' || pw[len - 1] == '\r')) {
+        pw[--len] = '\0';
+    }
+    fprintf(stderr, "\n");
+    return ok ? pw : NULL;
 }
 
 int main(int argc, char **argv)
@@ -393,6 +427,11 @@ int main(int argc, char **argv)
                     strcmp(argv[argi], "--user") == 0) && argi + 1 < argc) {
             g_user = argv[argi + 1];
             argi += 2;
+        } else if ((strcmp(argv[argi], "-P") == 0 ||
+                    strcmp(argv[argi], "--password") == 0) &&
+                   argi + 1 < argc) {
+            g_password = argv[argi + 1];
+            argi += 2;
         } else if (strcmp(argv[argi], "--json") == 0) {
             g_json = true;
             argi++;
@@ -406,6 +445,21 @@ int main(int argc, char **argv)
         } else {
             print_usage();
             return 2;
+        }
+    }
+
+    /* remote user auth requires a password: prompt when possible, else
+     * refuse (the server rejects passwordless users) */
+    if (g_host && g_user && *g_user && g_password[0] == '\0' && !g_quiet) {
+        const char *pw = prompt_password(g_user);
+        if (pw) {
+            g_password = pw;
+        } else {
+            fprintf(stderr,
+                    "epsilonbench: user '%s' needs a password over HTTP "
+                    "(pass -P <password>)\n",
+                    g_user);
+            return 1;
         }
     }
 

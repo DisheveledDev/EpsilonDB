@@ -473,6 +473,30 @@ size_t edb_engine_shard_keys(edb_engine *mgr, char (*keys)[33], size_t cap)
     return n;
 }
 
+long long edb_engine_shard_size(edb_engine *mgr, const char *partition,
+                                const char *keyspace)
+{
+    if (!mgr || !partition || !keyspace) {
+        return 0;
+    }
+    char path[1024];
+    if (!edb_shard_path(mgr, partition, keyspace, path, sizeof(path), NULL)) {
+        return 0;
+    }
+    struct stat st;
+    long long total = 0;
+    if (stat(path, &st) == 0 && st.st_size > 0) {
+        total += (long long)st.st_size;
+    }
+    /* WAL-mode data may live in the -wal sidecar; count it too */
+    char side[1060];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    if (stat(side, &st) == 0 && st.st_size > 0) {
+        total += (long long)st.st_size;
+    }
+    return total;
+}
+
 bool edb_shard_gc(edb_engine *mgr, const char key[33])
 {
     if (!mgr || !key || strlen(key) != 32) {

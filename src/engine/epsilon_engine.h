@@ -76,6 +76,11 @@ bool edb_shard_validate(edb_engine *mgr, const char *partition,
  * the store root. Returns the number written. */
 size_t edb_engine_shard_keys(edb_engine *mgr, char (*keys)[33], size_t cap);
 
+/* On-disk size in bytes of the shard file for partition/keyspace
+ * (including any -wal sidecar), or 0 when the file does not exist. */
+long long edb_engine_shard_size(edb_engine *mgr, const char *partition,
+                                const char *keyspace);
+
 /* Removes the shard file identified by a 32-char md5 key (and its cached
  * handle, if open) from disk. Returns true when the file is gone. Used
  * to GC redundant shards after a rebalance moves them to another node. */
@@ -154,7 +159,8 @@ void edb_free_strings(char **strings);
 /* --- per-partition SQLite tuning -------------------------------------- */
 
 typedef struct {
-    long long cache_size;      /* PRAGMA cache_size (negative = KB); 0 = SQLite default */
+    long long cache_size;      /* KiB; >0 = explicit, 0 = auto (scaled from
+                                  shard size), <0 = SQLite default */
     char journal_mode[16];     /* "DELETE" | "TRUNCATE" | "WAL" */
     long long vacuum_seconds;  /* re-VACUUM interval; 0 = never */
     long long reindex_seconds; /* re-REINDEX interval; 0 = never */

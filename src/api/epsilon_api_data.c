@@ -31,7 +31,7 @@ bool handle_data_put(const edb_http_request *req,
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
     if (!auth_ok) {
-        respond_error(res, 401, "unknown user");
+        respond_error(res, 401, "unauthorized");
         return true;
     }
 
@@ -139,7 +139,7 @@ bool handle_data_get(const edb_http_request *req,
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
     if (!auth_ok) {
-        respond_error(res, 401, "unknown user");
+        respond_error(res, 401, "unauthorized");
         return true;
     }
     if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_READ,
@@ -179,7 +179,7 @@ bool handle_data_delete(const edb_http_request *req,
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
     if (!auth_ok) {
-        respond_error(res, 401, "unknown user");
+        respond_error(res, 401, "unauthorized");
         return true;
     }
     if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_DELETE,
@@ -484,7 +484,7 @@ bool handle_data_collect(const edb_http_request *req,
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
     if (!auth_ok) {
-        respond_error(res, 401, "unknown user");
+        respond_error(res, 401, "unauthorized");
         return true;
     }
     if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_READ,

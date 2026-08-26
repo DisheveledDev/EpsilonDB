@@ -28,6 +28,7 @@
 const char *g_host = NULL;
 int g_port = 8123;
 const char *g_user = "";
+const char *g_password = "";
 const char *g_sockpath = DEFAULT_ADMIN_SOCK;
 bool g_quiet = false;
 
@@ -140,11 +141,12 @@ char *http_request_raw(const char *method, const char *path,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
                      "Authorization: Bearer %s\r\n"
+                     "X-Epsilon-Password: %s\r\n"
                      "Content-Length: %zu\r\n"
                      "Connection: close\r\n"
                      "\r\n",
                      method, path, g_host ? g_host : "local", g_port, g_user,
-                     body ? body_len : 0);
+                     g_password, body ? body_len : 0);
     if (n < 0) {
         close(fd);
         return NULL;
@@ -158,11 +160,12 @@ char *http_request_raw(const char *method, const char *path,
              "%s %s HTTP/1.1\r\n"
              "Host: %s:%d\r\n"
              "Authorization: Bearer %s\r\n"
+             "X-Epsilon-Password: %s\r\n"
              "Content-Length: %zu\r\n"
              "Connection: close\r\n"
              "\r\n",
              method, path, g_host ? g_host : "local", g_port, g_user,
-             body ? body_len : 0);
+             g_password, body ? body_len : 0);
     if (send_all(fd, head, (size_t)n) != 0) {
         free(head);
         close(fd);

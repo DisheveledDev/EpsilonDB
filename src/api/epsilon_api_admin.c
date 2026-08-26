@@ -21,7 +21,7 @@ bool require_admin_auth(const edb_http_request *req,
     bool auth_ok = false;
     uint64_t groups = authenticate(req, req, &auth_ok);
     if (!auth_ok) {
-        respond_error(res, 401, "unknown user");
+        respond_error(res, 401, "unauthorized");
         return false;
     }
     if (!(groups & 1ULL) && groups != ~0ULL) {
