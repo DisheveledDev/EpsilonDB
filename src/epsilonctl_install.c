@@ -52,6 +52,10 @@ static int ask_int(const char *prompt, int deflt)
         if (!fgets(line, sizeof(line), stdin)) {
             return deflt;
         }
+        /* empty line: keep the default */
+        if (line[0] == '\n' || line[0] == '\r' || line[0] == '\0') {
+            return deflt;
+        }
         char *end = NULL;
         long v = strtol(line, &end, 10);
         if (end != line && (v >= 1 && v <= 65535)) {
@@ -255,6 +259,127 @@ static void default_data_dir(char *out, size_t cap, const char *here)
 #endif
 }
 
+/* Parses flag/value pairs (["-p","8123","-b","0.0.0.0",...]) into the
+ * install parameters. Values that are not present are left untouched. */
+static void parse_args(char **argv, int argc, char *bind, int *port,
+                       int *peer_port, char *advertise, char *data_dir,
+                       char *log_path)
+{
+    for (int i = 0; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0) {
+            *port = atoi(argv[i + 1]);
+        } else if (strcmp(argv[i], "-b") == 0) {
+            snprintf(bind, 64, "%s", argv[i + 1]);
+        } else if (strcmp(argv[i], "-n") == 0) {
+            *peer_port = atoi(argv[i + 1]);
+        } else if (strcmp(argv[i], "-A") == 0) {
+            snprintf(advertise, 64, "%s", argv[i + 1]);
+        } else if (strcmp(argv[i], "-d") == 0) {
+            snprintf(data_dir, 1024, "%s", argv[i + 1]);
+        } else if (strcmp(argv[i], "-l") == 0) {
+            snprintf(log_path, 1024, "%s", argv[i + 1]);
+        }
+    }
+}
+
+/* Reads the currently installed service configuration so a re-run of
+ * install/setup can keep it instead of resetting to factory defaults.
+ * Fills the parameters found; returns true when a service exists. */
+static bool read_existing_config(char *bind, int *port, int *peer_port,
+                                 char *advertise, char *data_dir,
+                                 char *log_path)
+{
+#ifdef __APPLE__
+    char path[1024];
+    snprintf(path, sizeof(path),
+             "%s/Library/LaunchAgents/com.epsilondb.server.plist",
+             getenv("HOME") ? getenv("HOME") : ".");
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[8192];
+    size_t total = 0;
+    size_t n;
+    while (total < sizeof(buf) - 1 &&
+           (n = fread(buf + total, 1, sizeof(buf) - total - 1, fp)) > 0) {
+        total += n;
+    }
+    fclose(fp);
+    buf[total] = '\0';
+    char *in = strstr(buf, "<key>ProgramArguments</key>");
+    char *arr = in ? strstr(in, "<array>") : NULL;
+    char *end = in ? strstr(in, "</array>") : NULL;
+    if (!arr || !end || end < arr) {
+        return false;
+    }
+    char *tokens[64];
+    int ntok = 0;
+    char *p = arr;
+    while (p < end && ntok < 64) {
+        char *open = strstr(p, "<string>");
+        if (!open || open >= end) {
+            break;
+        }
+        char *close = strstr(open, "</string>");
+        if (!close || close >= end) {
+            break;
+        }
+        char *val = open + 8;
+        *close = '\0';
+        tokens[ntok++] = val;
+        p = close + 9;
+    }
+    /* tokens[0] is the binary path; the rest are flag/value pairs */
+    if (ntok < 2) {
+        return false;
+    }
+    parse_args(tokens + 1, ntok - 1, bind, port, peer_port, advertise,
+               data_dir, log_path);
+    return true;
+#else
+    const char *path = "/etc/systemd/system/epsilon.service";
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[8192];
+    size_t total = 0;
+    size_t n;
+    while (total < sizeof(buf) - 1 &&
+           (n = fread(buf + total, 1, sizeof(buf) - total - 1, fp)) > 0) {
+        total += n;
+    }
+    fclose(fp);
+    buf[total] = '\0';
+    char *start = strstr(buf, "ExecStart=");
+    char *end = strstr(buf, "\n[Install]");
+    if (!start) {
+        return false;
+    }
+    char *stop = end ? end : buf + total;
+    char *tokens[64];
+    int ntok = 0;
+    char *p = start + 10;   /* after "ExecStart=" */
+    char *save = NULL;
+    char *tok = strtok_r(p, " \t\n", &save);
+    while (tok && ntok < 64 && tok < stop) {
+        if (tok >= stop) {
+            break;
+        }
+        tokens[ntok++] = tok;
+        tok = strtok_r(NULL, " \t\n", &save);
+    }
+    if (ntok < 2) {
+        return false;
+    }
+    parse_args(tokens + 1, ntok - 1, bind, port, peer_port, advertise,
+               data_dir, log_path);
+    return true;
+#endif
+}
+
+
 #ifdef __APPLE__
 /* Creates (or recreates) the local launchd service unit. `here` is the
  * working directory for the service and `binpath` the absolute path of
@@ -449,29 +574,40 @@ int cmd_install(int argc, char **argv)
     char log_path[1024];
     char here[1024];
 
-    printf("\nEpsilonDB setup\n");
-    printf("---------------\n");
-    printf("This configures a local service. Answer the questions below;\n");
-    printf("defaults are shown in [brackets].\n\n");
-
-    ask_addr("HTTP bind address", bind, sizeof(bind), "127.0.0.1");
-    port = ask_int("HTTP port", 8123);
-    peer_port = ask_int("Cluster peer port (0 = single node)", 0);
-    if (peer_port > 0) {
-        ask_addr("Advertised address (reachable by other nodes)",
-                 advertise, sizeof(advertise), bind);
-    } else {
-        snprintf(advertise, sizeof(advertise), "%s", bind);
-    }
     if (getcwd(here, sizeof(here))) {
         default_data_dir(data_dir, sizeof(data_dir), here);
     } else {
         default_data_dir(data_dir, sizeof(data_dir), ".");
     }
+    snprintf(log_path, sizeof(log_path), "/var/log/epsilondb/epsilondb.log");
+
+    /* an existing service means this is an upgrade: keep its settings as
+     * the defaults so pressing Enter preserves the current configuration */
+    bool existing = read_existing_config(bind, &port, &peer_port, advertise,
+                                         data_dir, log_path);
+
+    printf("\nEpsilonDB setup\n");
+    printf("---------------\n");
+    printf("This configures a local service. Answer the questions below;\n");
+    printf("defaults are shown in [brackets].\n");
+    if (existing) {
+        printf("An existing service was found: its settings are the defaults,\n");
+        printf("so pressing Enter keeps the current configuration.\n");
+    }
+    printf("\n");
+
+    ask_addr("HTTP bind address", bind, sizeof(bind), bind);
+    port = ask_int("HTTP port", port);
+    peer_port = ask_int("Cluster peer port (0 = single node)", peer_port);
+    if (peer_port > 0) {
+        ask_addr("Advertised address (reachable by other nodes)",
+                 advertise, sizeof(advertise), advertise);
+    } else {
+        snprintf(advertise, sizeof(advertise), "%s", bind);
+    }
     if (!ask_yes_no("Use the data directory", true)) {
         ask_addr("Data directory", data_dir, sizeof(data_dir), data_dir);
     }
-    snprintf(log_path, sizeof(log_path), "/var/log/epsilondb/epsilondb.log");
     if (!ask_yes_no("Use the default log path", true)) {
         ask_addr("Log file path", log_path, sizeof(log_path), log_path);
     }
@@ -561,12 +697,16 @@ int cmd_setup(int argc, char **argv)
     }
     snprintf(log_path, sizeof(log_path), "/var/log/epsilondb/epsilondb.log");
 
-    ask_addr("HTTP bind address", bind, sizeof(bind), "127.0.0.1");
-    port = ask_int("HTTP port", 8123);
-    peer_port = ask_int("Cluster peer port (0 = single node)", 0);
+    /* re-run: keep the existing service's settings as the defaults */
+    read_existing_config(bind, &port, &peer_port, advertise, data_dir,
+                         log_path);
+
+    ask_addr("HTTP bind address", bind, sizeof(bind), bind);
+    port = ask_int("HTTP port", port);
+    peer_port = ask_int("Cluster peer port (0 = single node)", peer_port);
     if (peer_port > 0) {
         ask_addr("Advertised address (reachable by other nodes)",
-                 advertise, sizeof(advertise), bind);
+                 advertise, sizeof(advertise), advertise);
     } else {
         snprintf(advertise, sizeof(advertise), "%s", bind);
     }
