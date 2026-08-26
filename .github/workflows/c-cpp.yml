@@ -3,12 +3,14 @@ name: C/C++ CI
 on:
   push:
     tags: [ "*" ]
+  create:
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: github.ref_type == 'tag'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
