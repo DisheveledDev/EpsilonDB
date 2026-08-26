@@ -18,6 +18,7 @@
 #include "socket/epsilon_cluster.h"
 #include "socket/epsilon_snap.h"
 #include "epsilon_banner.h"
+#include "api/version.h"
 #include "epsilonbkup_internal.h"
 
 #define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
@@ -850,7 +851,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < EDB_BANNER_LINES; i++) {
         printf("%s\n", edb_banner[i]);
     }
-    printf("        backup and restore tool\n\n");
+    printf("        backup and restore tool, version %s\n\n", sw_version);
 int argi = 1;
     while (argi < argc && argv[argi][0] == '-' &&
            strcmp(argv[argi], "-") != 0) {

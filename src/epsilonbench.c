@@ -25,6 +25,7 @@
 
 #include "../vendor/cjson/cJSON.h"
 #include "epsilon_banner.h"
+#include "api/version.h"
 
 #define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
 
@@ -402,7 +403,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < EDB_BANNER_LINES; i++) {
         printf("%s\n", edb_banner[i]);
     }
-    printf("        performance benchmark client\n\n");
+    printf("        performance benchmark client, version %s\n\n",
+           sw_version);
 
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' &&

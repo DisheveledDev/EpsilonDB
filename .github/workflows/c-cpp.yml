@@ -2,10 +2,7 @@ name: C/C++ CI
 
 on:
   push:
-    branches: [ "main" ]
     tags: [ "v*" ]
-  pull_request:
-    branches: [ "main" ]
 
 permissions:
   contents: write
@@ -41,19 +38,17 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: make
-      run: make
-    - name: make check
-      run: make check
     - name: derive version
       id: version
+      run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+    - name: stamp version
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        if [ "${{ github.ref_type }}" = "tag" ]; then
-          VERSION="${GITHUB_REF_NAME#v}"
-        else
-          VERSION="$(git describe --tags --always 2>/dev/null || echo dev)"
-        fi
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        perl -pi -e 's/"0\.0\.0"/"$ENV{VERSION}"/' src/api/version.h
+        grep 'sw_version' src/api/version.h
+    - name: make
+      run: make
     - name: package binaries
       run: |
         mkdir -p dist
@@ -64,7 +59,6 @@ jobs:
         ARCH: ${{ matrix.arch }}
         VERSION: ${{ steps.version.outputs.version }}
     - name: upload to release
-      if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
         files: dist/EpsilonDB_*.zip

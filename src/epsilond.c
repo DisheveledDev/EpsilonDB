@@ -23,6 +23,7 @@
 #include "api/epsilon_api.h"
 #include "engine/epsilon_config.h"
 #include "epsilon_banner.h"
+#include "api/version.h"
 #include "httpd/epsilon_http.h"
 #include "socket/epsilon_cluster.h"
 #include "epsilon_log.h"
@@ -63,7 +64,8 @@ static void print_banner(void)
         printf("%s\n", edb_banner[i]);
     }
     printf("%s%s", y, r);
-    printf("        distributed key/value database server\n");
+    printf("        distributed key/value database server, version %s\n",
+           sw_version);
     printf("%s", r);
 }
 

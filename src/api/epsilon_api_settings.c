@@ -3,6 +3,7 @@
  */
 
 #include "epsilon_api_internal.h"
+#include "version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,7 +110,7 @@ bool handle_status(const edb_http_request *req,
     (void)req;
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "service", "epsilondb");
-    cJSON_AddStringToObject(o, "version", "0.1.0");
+    cJSON_AddStringToObject(o, "version", sw_version);
     cJSON_AddBoolToObject(o, "clustered", g_cluster != NULL);
     respond_json(res, 200, o);
     return true;

@@ -193,6 +193,12 @@ machine with the same architecture. macOS does not ship a static system
 library, so `STATIC=1` is rejected there; macOS binaries are already
 self-contained apart from the OS-provided libSystem.
 
+The version shown by `epsilond`'s banner and the `/status` endpoint comes
+from `src/api/version.h` (`sw_version`). Local builds report the `0.0.0`
+dev placeholder; the release workflow (`.github/workflows/c-cpp.yml`)
+rewrites it with the git tag before building, so tagged binaries report
+the exact release version.
+
 ## Running
 
 Start a single server:

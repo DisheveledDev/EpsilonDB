@@ -71,7 +71,7 @@ API_SRC = src/api/epsilon_api.c src/api/epsilon_api_data.c \
 $(SERVER_BIN): src/epsilond.c $(API_SRC) src/httpd/epsilon_http.c \
                $(CLUSTER_SRC) $(REPL_SRC) \
                src/socket/epsilon_snap.c src/admin/admin_console.o \
-               $(ENGINE_LIB)
+               src/api/version.h $(ENGINE_LIB)
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/epsilond.c $(API_SRC) \
 		src/httpd/epsilon_http.c $(CLUSTER_SRC) \
@@ -88,12 +88,13 @@ $(CLI_BIN): $(CTL_SRC) vendor/cjson/cJSON.c
 	$(CC) $(CFLAGS) -o $@ $(CTL_SRC) vendor/cjson/cJSON.c \
 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
 
-$(BENCH_BIN): src/epsilonbench.c vendor/cjson/cJSON.c
+$(BENCH_BIN): src/epsilonbench.c src/api/version.h vendor/cjson/cJSON.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/epsilonbench.c vendor/cjson/cJSON.c \
 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
 
-$(BACKUP_BIN): src/epsilonbkup.c src/epsilonbkup_http.c $(ENGINE_LIB)
+$(BACKUP_BIN): src/epsilonbkup.c src/epsilonbkup_http.c src/api/version.h \
+               $(ENGINE_LIB)
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/epsilonbkup.c src/epsilonbkup_http.c \
 		$(CLUSTER_SRC) src/socket/epsilon_snap.c \
