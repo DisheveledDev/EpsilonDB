@@ -453,11 +453,3 @@ Design notes inherited from Switchblade:
 - Shard files are copied between nodes only through `sqlite3_backup_*`
   while `synchronous=FULL`, so transfers are always consistent regardless of
   the configured journal mode.
-
-## Status
-
-Stages 0-7 complete: engine, config store, HTTP/CLI, clustering,
-replication + quorum reads, live/target rebalancing (snapshot transfer,
-delta catch-up, promotion + GC, end-to-end join wiring), multi-node
-chaos/failure testing, workload analytics, and performance benchmarking.
-See `AGENTS.md` for the detailed stage history and gotchas.
