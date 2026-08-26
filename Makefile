@@ -31,6 +31,7 @@ ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
              src/engine/epsilon_config_entities.c \
              src/engine/epsilon_config_partitions.c \
              src/engine/epsilon_analytics.c src/engine/epsilon_benchmark.c \
+             src/engine/epsilon_procstat.c \
              src/epsilon_log.c
 ENGINE_OBJ = $(ENGINE_SRC:.c=.o) $(VENDOR_SRC:.c=.o)
 ENGINE_LIB = bin/libepsilon.a

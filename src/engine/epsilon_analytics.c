@@ -1,5 +1,5 @@
 #include "epsilon_analytics.h"
-
+#include "epsilon_procstat.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +47,11 @@ struct edb_analytics {
 
     pthread_t thread;
     bool running;
+
+    /* previous resource sample, so CPU% is a delta rather than a
+     * meaningless instantaneous reading. Guarded by `lock`. */
+    edb_proc_sample last_sample;
+    bool have_sample;
 };
 
 static long long epoch_sec(void)
@@ -252,6 +257,19 @@ static cJSON *snapshot_json(edb_analytics *a)
     }
     cJSON_AddStringToObject(doc, "node", a->node_id);
     cJSON_AddNumberToObject(doc, "ts", (double)epoch_sec());
+
+    /* per-node resource use, so an admin can judge cluster load and
+     * remaining headroom. CPU% is measured against the previous sample. */
+    edb_proc_sample sample;
+    if (edb_proc_sample_now(&sample)) {
+        double cpu_pct = a->have_sample
+                             ? edb_proc_cpu_percent(&a->last_sample, &sample)
+                             : 0.0;
+        cJSON_AddNumberToObject(doc, "mem_bytes", (double)sample.rss_bytes);
+        cJSON_AddNumberToObject(doc, "cpu_pct", cpu_pct);
+        a->last_sample = sample;
+        a->have_sample = true;
+    }
 
     cJSON *shards = cJSON_AddArrayToObject(doc, "shards");
     for (size_t i = 0; i < a->nshards; i++) {
@@ -473,8 +491,15 @@ static report_slow *agg_slow(report_slow **listp, size_t *n, size_t *cap,
 }
 
 /* Descending on-disk size; ties keep stable order (not required). */
-static int cmp_shard_size_desc(const void *pa, const void *pb)
+/* cJSON_GetNumberValue() yields NaN for a missing or non-numeric field,
+ * which would serialise back out as null; treat those as zero. */
+static double num_or_zero(const cJSON *obj, const char *field)
 {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, field);
+    return cJSON_IsNumber(item) ? item->valuedouble : 0.0;
+}
+
+static int cmp_shard_size_desc(const void *pa, const void *pb){
     const report_shard *const *a = pa;
     const report_shard *const *b = pb;
     if ((*b)->size_bytes > (*a)->size_bytes) {
@@ -512,7 +537,17 @@ cJSON *edb_analytics_report(edb_analytics *a)
             }
             const cJSON *jnode = cJSON_GetObjectItemCaseSensitive(snap, "node");
             if (cJSON_IsString(jnode) && jnode->valuestring) {
-                cJSON_AddItemToArray(nodes, cJSON_CreateString(jnode->valuestring));
+                /* nodes[] carries per-node resource use so the analytics
+                 * screen can show cluster load and remaining capacity. */
+                cJSON *node_obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(node_obj, "id", jnode->valuestring);
+                cJSON_AddNumberToObject(node_obj, "mem_bytes",
+                                        num_or_zero(snap, "mem_bytes"));
+                cJSON_AddNumberToObject(node_obj, "cpu_pct",
+                                        num_or_zero(snap, "cpu_pct"));
+                cJSON_AddNumberToObject(node_obj, "ts",
+                                        num_or_zero(snap, "ts"));
+                cJSON_AddItemToArray(nodes, node_obj);
             }
             const cJSON *jshards = cJSON_GetObjectItemCaseSensitive(snap, "shards");
             const cJSON *s = NULL;
