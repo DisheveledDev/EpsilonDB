@@ -3,21 +3,68 @@ name: C/C++ CI
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: Ubuntu_22_04
+            arch: x64
+          - os: ubuntu-22.04-arm
+            platform: Ubuntu_22_04
+            arch: arm64
+          - os: ubuntu-24.04
+            platform: Ubuntu_24_04
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: Ubuntu_24_04
+            arch: arm64
+          - os: ubuntu-26.04
+            platform: Ubuntu_26_04
+            arch: x64
+          - os: ubuntu-26.04-arm
+            platform: Ubuntu_26_04
+            arch: arm64
+          - os: macos-26
+            platform: MacOS_26
+            arch: arm64
 
     steps:
     - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
     - name: make
       run: make
     - name: make check
       run: make check
-    - name: make distcheck
-      run: make distcheck
+    - name: derive version
+      id: version
+      run: |
+        if [ "${{ github.ref_type }}" = "tag" ]; then
+          VERSION="${GITHUB_REF_NAME#v}"
+        else
+          VERSION="$(git describe --tags --always 2>/dev/null || echo dev)"
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+    - name: package binaries
+      run: |
+        mkdir -p dist
+        cd bin
+        zip "../dist/EpsilonDB_${PLATFORM}_${ARCH}_${VERSION}.zip" epsilond epsilonctl epsilonbkup epsilonbench
+      env:
+        PLATFORM: ${{ matrix.platform }}
+        ARCH: ${{ matrix.arch }}
+        VERSION: ${{ steps.version.outputs.version }}
+    - name: upload to release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/EpsilonDB_*.zip
