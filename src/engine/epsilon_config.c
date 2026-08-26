@@ -127,17 +127,6 @@ void set_json_i64(cJSON *obj, const char *field, long long v)
     cJSON_AddStringToObject(obj, field, buf);
 }
 
-static void copy_settings(const cJSON *obj, edb_shard_settings *out)
-{
-    out->cache_size = json_i64(obj, "cache_size");
-    copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
-              "journal_mode");
-    if (out->journal_mode[0] == '\0') {
-        snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
-    }
-    out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
-    out->reindex_seconds = json_i64(obj, "reindex_seconds");
-}
 
 edb_config *edb_config_open(edb_engine *engine)
 {
@@ -184,34 +173,7 @@ void edb_config_close(edb_config *cfg)
 
 /* --- databases -------------------------------------------------------- */
 
-static void config_settings_provider(void *ctx, const char *partition,
-                                     edb_shard_settings *out)
-{
-    if (strcmp(partition, EDB_SYSTEM_DB) == 0) {
-        return;
-    }
-    edb_config *cfg = ctx;
-    cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS);
-    cJSON *item = NULL;
-    cJSON_ArrayForEach(item, all) {
-        char name[256];
-        copy_name(name, sizeof(name), item, "name");
-        if (strcmp(name, partition) != 0) {
-            continue;
-        }
-        copy_settings(item, out);
-        break;
-    }
-    cJSON_Delete(all);
-}
 
-void edb_config_register_settings(edb_config *cfg)
-{
-    if (cfg) {
-        edb_engine_set_settings_provider(cfg->engine,
-                                         config_settings_provider, cfg);
-    }
-}
 
 /* --- authorization ------------------------------------------------------ */
 

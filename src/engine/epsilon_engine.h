@@ -156,30 +156,10 @@ cJSON *edb_query_ts(edb_engine *mgr, const char *partition,
 /* Free a NULL-terminated list of malloc'd strings. */
 void edb_free_strings(char **strings);
 
-/* --- per-partition SQLite tuning -------------------------------------- */
-
-typedef struct {
-    long long cache_size;      /* KiB; >0 = explicit, 0 = auto (scaled from
-                                  shard size), <0 = SQLite default */
-    char journal_mode[16];     /* "DELETE" | "TRUNCATE" | "WAL" */
-    long long vacuum_seconds;  /* re-VACUUM interval; 0 = never */
-    long long reindex_seconds; /* re-REINDEX interval; 0 = never */
-} edb_shard_settings;
-
-/* Fills `out` with the default shard settings. */
-void edb_shard_settings_default(edb_shard_settings *out);
-
-/* Provider that resolves a partition's shard settings. Registered by the
- * config layer once it is open. The engine calls it (holding no locks)
- * when a shard is first opened or lazily re-checked. */
-typedef void (*edb_shard_settings_fn)(void *ctx, const char *partition,
-                                      edb_shard_settings *out);
-
-void edb_engine_set_settings_provider(edb_engine *mgr,
-                                      edb_shard_settings_fn fn, void *ctx);
-
-/* Reopens every open shard belonging to `partition` so its connection
- * picks up changed settings. Returns the number of shards reloaded. */
-int edb_engine_reload_partition(edb_engine *mgr, const char *partition);
+/* Manual maintenance: run VACUUM / REINDEX on every currently open shard
+ * belonging to `partition`. Returns the number of shards processed, or -1
+ * on bad arguments. */
+int edb_engine_vacuum_partition(edb_engine *mgr, const char *partition);
+int edb_engine_reindex_partition(edb_engine *mgr, const char *partition);
 
 #endif

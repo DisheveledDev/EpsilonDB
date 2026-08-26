@@ -29,19 +29,11 @@ typedef struct edb_shard {
     int cache_count;
 
     long long expired_since_vacuum;
-    edb_shard_settings settings;
-    long long last_vacuum_ts;
-    long long last_reindex_ts;
 } edb_shard;
 
 edb_shard *edb_shard_open(const char *path, const char *key,
-                          const char *partition, const char *keyspace,
-                          const edb_shard_settings *settings);
+                          const char *partition, const char *keyspace);
 void edb_shard_free(edb_shard *sh);
-
-/* Closes and reopens the shard connection with new settings. Returns true
- * on success (the shard keeps its old connection on failure). */
-bool edb_shard_reopen(edb_shard *sh, const edb_shard_settings *settings);
 
 bool edb_shard_put(edb_shard *sh, const char *id, const char *json_value,
                    long long ttl_seconds);
@@ -52,6 +44,11 @@ char **edb_shard_ids(edb_shard *sh, const cJSON *filters,
 cJSON *edb_shard_all(edb_shard *sh, const cJSON *filters);
 cJSON *edb_shard_query(edb_shard *sh, const cJSON *filters);
 bool edb_shard_cleanup(edb_shard *sh);
+
+/* Manual maintenance (admin-triggered). VACUUM resets the expired-row
+ * counter that drives the automatic vacuum. */
+bool edb_shard_vacuum(edb_shard *sh);
+bool edb_shard_reindex(edb_shard *sh);
 
 /* stage 5: replication-aware variants (see epsilon_engine.h) */
 bool edb_shard_replica_put(edb_shard *sh, const char *id,

@@ -339,7 +339,7 @@ void print_usage(void)
         "  list nodes | cluster        membership, leader and ranges",
         "",
         "performance:",
-        "  bench [records] [replication_factor] [cache_size] [journal_mode] [threads]",
+        "  bench [records] [replication_factor] [threads]",
         NULL,
     };
     for (int i = 0; lines[i]; i++) {
@@ -493,17 +493,14 @@ int execute_command(int argc, char **argv)
         if (rf < 1) {
             rf = 1;
         }
-        long cache = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
-        const char *journal = argi + 3 < argc ? argv[argi + 3] : "TRUNCATE";
-        long threads = argi + 4 < argc ? strtol(argv[argi + 4], NULL, 10) : 0;
+        long threads = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
         if (threads < 0) {
             threads = 0;
         }
         snprintf(body, sizeof(body),
                  "{\"records\":%ld,\"replication_factor\":%ld,"
-                 "\"cache_size\":%ld,\"journal_mode\":\"%s\","
                  "\"threads\":%ld}",
-                 records, rf, cache, journal, threads);
+                 records, rf, threads);
         return run("POST", "/admin/benchmark", body);
     }
 

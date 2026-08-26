@@ -6,8 +6,7 @@
  *
  * Usage:
  *   epsilonbench [-s socket] [-h host -p port -u user [-P password]] [--json]
- *                [records] [replication_factor] [cache_size]
- *                [journal_mode] [threads]
+ *                [records] [replication_factor] [threads]
  */
 
 #include <arpa/inet.h>
@@ -324,10 +323,6 @@ static int render_report(const cJSON *report)
            str(report, "threads", numbuf, sizeof(numbuf)));
     printf("  %-22s %s\n", "Replication factor",
            str(report, "replication_factor", numbuf, sizeof(numbuf)));
-    printf("  %-22s %s\n", "Cache size (KB)",
-           str(report, "cache_size", numbuf, sizeof(numbuf)));
-    printf("  %-22s %s\n", "Journal mode",
-           str(report, "journal_mode", numbuf, sizeof(numbuf)));
     printf("\n");
 
     print_row("Operation", "Count", "Seconds", "Ops/sec");
@@ -359,8 +354,7 @@ static void print_usage(void)
     printf("usage: epsilonbench [-s socket] | [-h host -p port -u user "
            "[-P password]] [--json]\n");
     printf("                      [records] [replication_factor] "
-           "[cache_size]\n");
-    printf("                      [journal_mode] [threads]\n");
+           "[threads]\n");
     printf("  Runs the server-side workload benchmark against a running\n");
     printf("  epsilond and prints ops/sec per phase. Defaults to the local\n");
     printf("  admin socket; -h/-p/-u switch to a remote node. --json dumps\n");
@@ -473,9 +467,7 @@ int main(int argc, char **argv)
     if (rf < 1) {
         rf = 1;
     }
-    long cache = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
-    const char *journal = argi + 3 < argc ? argv[argi + 3] : "TRUNCATE";
-    long threads = argi + 4 < argc ? strtol(argv[argi + 4], NULL, 10) : 0;
+    long threads = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
     if (threads < 0) {
         threads = 0;
     }
@@ -483,9 +475,8 @@ int main(int argc, char **argv)
     char body[512];
     snprintf(body, sizeof(body),
              "{\"records\":%ld,\"replication_factor\":%ld,"
-             "\"cache_size\":%ld,\"journal_mode\":\"%s\","
              "\"threads\":%ld}",
-             records, rf, cache, journal, threads);
+             records, rf, threads);
 
     int status = 0;
     cJSON *report = http_json("POST", "/admin/benchmark", body, &status);

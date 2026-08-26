@@ -36,12 +36,6 @@ bool edb_partition_create(edb_config *cfg, const char *database,
     set_json_u64(obj, "update_mask", update_mask);
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
-    edb_shard_settings defaults;
-    edb_shard_settings_default(&defaults);
-    set_json_i64(obj, "cache_size", defaults.cache_size);
-    cJSON_AddStringToObject(obj, "journal_mode", defaults.journal_mode);
-    set_json_i64(obj, "vacuum_seconds", defaults.vacuum_seconds);
-    set_json_i64(obj, "reindex_seconds", defaults.reindex_seconds);
     bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
     cJSON_Delete(obj);
     return ok;
@@ -84,10 +78,6 @@ bool edb_partition_set_masks(edb_config *cfg, const char *database,
     set_json_u64(obj, "update_mask", update_mask);
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
-    set_json_i64(obj, "cache_size", existing.cache_size);
-    cJSON_AddStringToObject(obj, "journal_mode", existing.journal_mode);
-    set_json_i64(obj, "vacuum_seconds", existing.vacuum_seconds);
-    set_json_i64(obj, "reindex_seconds", existing.reindex_seconds);
     bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
     cJSON_Delete(obj);
     return ok;
@@ -111,53 +101,10 @@ bool edb_partition_get(edb_config *cfg, const char *database,
     out->update_mask = json_u64(obj, "update_mask");
     out->read_mask = json_u64(obj, "read_mask");
     out->delete_mask = json_u64(obj, "delete_mask");
-    out->cache_size = json_i64(obj, "cache_size");
-    copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
-              "journal_mode");
-    if (out->journal_mode[0] == '\0') {
-        snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
-    }
-    out->vacuum_seconds = json_i64(obj, "vacuum_seconds");
-    out->reindex_seconds = json_i64(obj, "reindex_seconds");
     cJSON_Delete(obj);
     return out->name[0] != '\0';
 }
 
-bool edb_partition_set_settings(edb_config *cfg, const char *database,
-                                const char *name,
-                                const edb_shard_settings *settings)
-{
-    if (!cfg || !database || !name || !settings) {
-        return false;
-    }
-    edb_partition_info existing;
-    if (!edb_partition_get(cfg, database, name, &existing)) {
-        return false;
-    }
-    char id[384];
-    snprintf(id, sizeof(id), "%s/%s", database, name);
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) {
-        return false;
-    }
-    cJSON_AddStringToObject(obj, "type", "partition");
-    cJSON_AddStringToObject(obj, "database", database);
-    cJSON_AddStringToObject(obj, "name", name);
-    set_json_u64(obj, "create_mask", existing.create_mask);
-    set_json_u64(obj, "update_mask", existing.update_mask);
-    set_json_u64(obj, "read_mask", existing.read_mask);
-    set_json_u64(obj, "delete_mask", existing.delete_mask);
-    set_json_i64(obj, "cache_size", settings->cache_size);
-    cJSON_AddStringToObject(obj, "journal_mode", settings->journal_mode);
-    set_json_i64(obj, "vacuum_seconds", settings->vacuum_seconds);
-    set_json_i64(obj, "reindex_seconds", settings->reindex_seconds);
-    bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
-    cJSON_Delete(obj);
-    if (ok) {
-        edb_engine_reload_partition(cfg->engine, name);
-    }
-    return ok;
-}
 
 /* Returns true if the partition already existed or was created now.
  * Auto-created partitions carry allow-all masks (0); operators can
@@ -285,14 +232,6 @@ edb_partition_info *edb_partition_list(edb_config *cfg, const char *database,
         out[n].update_mask = json_u64(item, "update_mask");
         out[n].read_mask = json_u64(item, "read_mask");
         out[n].delete_mask = json_u64(item, "delete_mask");
-        out[n].cache_size = json_i64(item, "cache_size");
-        copy_name(out[n].journal_mode, sizeof(out[n].journal_mode), item,
-                  "journal_mode");
-        if (out[n].journal_mode[0] == '\0') {
-            snprintf(out[n].journal_mode, sizeof(out[n].journal_mode), "TRUNCATE");
-        }
-        out[n].vacuum_seconds = json_i64(item, "vacuum_seconds");
-        out[n].reindex_seconds = json_i64(item, "reindex_seconds");
         n++;
     }
     cJSON_Delete(all);

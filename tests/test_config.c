@@ -167,10 +167,6 @@ static void test_partitions_and_perms(void)
     CHECK(p.create_mask == 0 && p.delete_mask == admins &&
           p.read_mask == (readers | writers | admins));
 
-    /* stored defaults: cache auto (0), vacuum weekly, reindex daily */
-    CHECK(p.cache_size == 0 && p.vacuum_seconds == 604800 &&
-          p.reindex_seconds == 86400);
-
     /* mask semantics: 0 allows everything */
     CHECK(edb_check_perm(p.create_mask, 0, EDB_PERM_CREATE));
     CHECK(edb_check_perm(p.create_mask, ~0ULL, EDB_PERM_CREATE));
