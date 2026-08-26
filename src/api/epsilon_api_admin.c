@@ -230,43 +230,7 @@ bool handle_admin_users(const edb_http_request *req,
 
 /* Parses optional shard-tuning fields from a partition request body. Returns
  * true when at least one tuning field was present. */
-static bool partition_settings_from_json(const cJSON *body,
-                                        edb_shard_settings *out)
-{
-    edb_shard_settings_default(out);
-    bool present = false;
-    const cJSON *cs = cJSON_GetObjectItemCaseSensitive(body, "cache_size");
-    if (cJSON_IsNumber(cs)) {
-        out->cache_size = (long long)cs->valuedouble;
-        present = true;
-    }
-    const cJSON *jm = cJSON_GetObjectItemCaseSensitive(body, "journal_mode");
-    if (cJSON_IsString(jm) && jm->valuestring) {
-        snprintf(out->journal_mode, sizeof(out->journal_mode), "%s",
-                 jm->valuestring);
-        present = true;
-    }
-    const cJSON *vs = cJSON_GetObjectItemCaseSensitive(body, "vacuum_seconds");
-    if (cJSON_IsNumber(vs)) {
-        out->vacuum_seconds = (long long)vs->valuedouble;
-        present = true;
-    }
-    const cJSON *rs = cJSON_GetObjectItemCaseSensitive(body, "reindex_seconds");
-    if (cJSON_IsNumber(rs)) {
-        out->reindex_seconds = (long long)rs->valuedouble;
-        present = true;
-    }
-    return present;
-}
 
-static void partition_add_settings_json(cJSON *o,
-                                        const edb_partition_info *p)
-{
-    cJSON_AddNumberToObject(o, "cache_size", (double)p->cache_size);
-    cJSON_AddStringToObject(o, "journal_mode", p->journal_mode);
-    cJSON_AddNumberToObject(o, "vacuum_seconds", (double)p->vacuum_seconds);
-    cJSON_AddNumberToObject(o, "reindex_seconds", (double)p->reindex_seconds);
-}
 
 bool handle_admin_partitions(const edb_http_request *req,
                                     edb_http_response *res)
@@ -307,7 +271,6 @@ bool handle_admin_partitions(const edb_http_request *req,
                     snprintf(b, sizeof(b), "%llu",
                              (unsigned long long)parts[i].delete_mask);
                     cJSON_AddStringToObject(o, "delete_mask", b);
-                    partition_add_settings_json(o, &parts[i]);
                     cJSON_AddItemToArray(arr2, o);
                 }
                 free(parts);
@@ -334,7 +297,6 @@ bool handle_admin_partitions(const edb_http_request *req,
             snprintf(b, sizeof(b), "%llu",
                      (unsigned long long)list[i].delete_mask);
             cJSON_AddStringToObject(o, "delete_mask", b);
-            partition_add_settings_json(o, &list[i]);
             cJSON_AddItemToArray(arr, o);
         }
         free(list);
@@ -376,14 +338,6 @@ bool handle_admin_partitions(const edb_http_request *req,
         bool ok = edb_partition_create(g_ctx.config, database->valuestring,
                                        name->valuestring, create_mask,
                                        update_mask, read_mask, delete_mask);
-        if (ok) {
-            edb_shard_settings settings;
-            if (partition_settings_from_json(body, &settings)) {
-                edb_partition_set_settings(g_ctx.config,
-                                           database->valuestring,
-                                           name->valuestring, &settings);
-            }
-        }
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 409, "create failed (duplicate?)");
@@ -429,14 +383,6 @@ bool handle_admin_partitions(const edb_http_request *req,
                                           name->valuestring, create_mask,
                                           update_mask, read_mask,
                                           delete_mask);
-        if (ok) {
-            edb_shard_settings settings;
-            if (partition_settings_from_json(body, &settings)) {
-                edb_partition_set_settings(g_ctx.config,
-                                           database->valuestring,
-                                           name->valuestring, &settings);
-            }
-        }
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 404, "partition not found");
@@ -495,6 +441,66 @@ bool handle_admin_delete(const edb_http_request *req,
 /* GET /admin/keyspaces: the registry of used
  * database/partition/keyspace triples (populated transparently by
  * writes). Optional ?database=<name> narrows the listing. */
+/* POST /admin/partitions/<database>/<name>/{vacuum,reindex}: run manual
+ * maintenance on every open shard of the partition on this node. Returns
+ * the number of shards processed. */
+bool handle_partition_maintenance(const edb_http_request *req,
+                                  edb_http_response *res)
+{
+    if (strcmp(req->method, "POST") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    if (!require_admin_auth(req, res)) {
+        return true;
+    }
+    const char *p = req->path + strlen("/admin/partitions/");
+    const char *slash = strchr(p, '/');
+    const char *action = slash ? strrchr(slash, '/') : NULL;
+    if (!slash || !action || action == slash ||
+        (size_t)(slash - p) >= 128) {
+        respond_error(res, 400,
+                      "expected /admin/partitions/<database>/<name>/(vacuum|reindex)");
+        return true;
+    }
+    char database[128];
+    char name[256];
+    snprintf(database, sizeof(database), "%.*s", (int)(slash - p), p);
+    size_t name_len = (size_t)(action - slash - 1);
+    if (name_len == 0 || name_len >= sizeof(name)) {
+        respond_error(res, 400,
+                      "expected /admin/partitions/<database>/<name>/(vacuum|reindex)");
+        return true;
+    }
+    snprintf(name, sizeof(name), "%.*s", (int)name_len, slash + 1);
+
+    bool vacuum = strcmp(action + 1, "vacuum") == 0;
+    bool reindex = strcmp(action + 1, "reindex") == 0;
+    if (!vacuum && !reindex) {
+        respond_error(res, 404, "unknown maintenance action");
+        return true;
+    }
+
+    int n = vacuum
+                ? edb_engine_vacuum_partition(g_ctx.engine, name)
+                : edb_engine_reindex_partition(g_ctx.engine, name);
+    if (n < 0) {
+        respond_error(res, 400, "maintenance failed");
+        return true;
+    }
+    res->status = 200;
+    res->content_type = "application/json";
+    if (vacuum) {
+        res->body = edb_http_body_printf(&res->body_len,
+                                         "{\"vacuumed\":%d}", n);
+    } else {
+        res->body = edb_http_body_printf(&res->body_len,
+                                         "{\"reindexed\":%d}", n);
+    }
+    return true;
+}
+
+
 bool handle_admin_keyspaces(const edb_http_request *req,
                                    edb_http_response *res)
 {
@@ -555,11 +561,6 @@ bool handle_admin_benchmark(const edb_http_request *req,
         return true;
     }
     int replication_factor = 1;
-    long long cache_size = 0;
-    /* copy out of the body: the body is freed below and the benchmark
-     * report keeps the journal-mode string */
-    char journal_buf[16];
-    const char *journal_mode = "TRUNCATE";
     int partitions = 10;
     int records = 100000;
     int threads = 0;
@@ -567,14 +568,6 @@ bool handle_admin_benchmark(const edb_http_request *req,
         const cJSON *j;
         j = cJSON_GetObjectItemCaseSensitive(body, "replication_factor");
         if (cJSON_IsNumber(j)) replication_factor = (int)j->valuedouble;
-        j = cJSON_GetObjectItemCaseSensitive(body, "cache_size");
-        if (cJSON_IsNumber(j)) cache_size = (long long)j->valuedouble;
-        j = cJSON_GetObjectItemCaseSensitive(body, "journal_mode");
-        if (cJSON_IsString(j) && j->valuestring && *j->valuestring) {
-            snprintf(journal_buf, sizeof(journal_buf), "%s",
-                     j->valuestring);
-            journal_mode = journal_buf;
-        }
         j = cJSON_GetObjectItemCaseSensitive(body, "partitions");
         if (cJSON_IsNumber(j)) partitions = (int)j->valuedouble;
         j = cJSON_GetObjectItemCaseSensitive(body, "records");
@@ -584,8 +577,7 @@ bool handle_admin_benchmark(const edb_http_request *req,
     }
     cJSON_Delete(body);
     cJSON *report = edb_benchmark_run(g_ctx.config, replication_factor,
-                                      cache_size, journal_mode, partitions,
-                                      records, threads);
+                                      partitions, records, threads);
     respond_json(res, 200, report ? report : cJSON_CreateObject());
     return true;
 }

@@ -24,9 +24,6 @@ struct edb_shard_manager {
     pthread_mutex_t lock;              /* guards buckets + bucket counts */
     struct shard_link *buckets[EDB_SHARD_BUCKETS];
 
-    edb_shard_settings_fn settings_fn;
-    void *settings_ctx;
-
     pthread_t cleanup_thread;
     bool cleanup_running;
     pthread_mutex_t wakeup_lock;
@@ -54,14 +51,6 @@ static void shard_key(const char *partition, const char *keyspace,
     snprintf(framed, sizeof(framed), "%s:%s", partition_hash,
              keyspace_hash);
     edb_md5_hex(framed, strlen(framed), out);
-}
-
-static void legacy_shard_key(const char *partition, const char *keyspace,
-                             char out[33])
-{
-    char combined[1024];
-    snprintf(combined, sizeof(combined), "%s%s", partition, keyspace);
-    edb_md5_hex(combined, strlen(combined), out);
 }
 
 /* Look up a shard by key without opening it. Caller holds mgr->lock. */
@@ -105,114 +94,11 @@ static edb_shard *insert_shard(edb_engine *mgr, edb_shard *sh,
     return sh;
 }
 
-static bool migrate_legacy_shard(edb_engine *mgr, const char *partition,
-                                 const char *keyspace, const char *new_key)
-{
-    char legacy_key[33];
-    legacy_shard_key(partition, keyspace, legacy_key);
-    if (strcmp(legacy_key, new_key) == 0) {
-        return true;
-    }
-    char new_path[1024];
-    char legacy_path[1024];
-    if (snprintf(new_path, sizeof(new_path), "%s/%s.sqlite", mgr->path,
-                 new_key) >= (int)sizeof(new_path) ||
-        snprintf(legacy_path, sizeof(legacy_path), "%s/%s.sqlite", mgr->path,
-                 legacy_key) >= (int)sizeof(legacy_path)) {
-        return false;
-    }
-    struct stat file_stat;
-    if (stat(new_path, &file_stat) == 0 ||
-        (stat(legacy_path, &file_stat) != 0 && errno == ENOENT)) {
-        return true;
-    }
-
-    pthread_mutex_lock(&mgr->lock);
-    struct shard_link **link = &mgr->buckets[bucket_for(legacy_key)];
-    while (*link && strcmp((*link)->shard->key, legacy_key) != 0) {
-        link = &(*link)->next;
-    }
-    edb_shard *legacy = NULL;
-    if (*link) {
-        if ((*link)->shard->refs > 0) {
-            pthread_mutex_unlock(&mgr->lock);
-            return false;
-        }
-        struct shard_link *removed = *link;
-        legacy = removed->shard;
-        *link = removed->next;
-        free(removed);
-    }
-    if (legacy) {
-        edb_shard_free(legacy);
-    }
-    bool migrated = rename(legacy_path, new_path) == 0 || errno == ENOENT;
-    if (migrated) {
-        const char *suffixes[] = {"-wal", "-shm", "-journal"};
-        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
-            char old_side[1060];
-            char new_side[1060];
-            snprintf(old_side, sizeof(old_side), "%s%s", legacy_path,
-                     suffixes[i]);
-            snprintf(new_side, sizeof(new_side), "%s%s", new_path,
-                     suffixes[i]);
-            if (rename(old_side, new_side) != 0 && errno != ENOENT) {
-                migrated = false;
-                break;
-            }
-        }
-    }
-    pthread_mutex_unlock(&mgr->lock);
-    return migrated;
-}
-
-void edb_engine_set_settings_provider(edb_engine *mgr,
-                                      edb_shard_settings_fn fn, void *ctx)
-{
-    if (!mgr) {
-        return;
-    }
-    pthread_mutex_lock(&mgr->lock);
-    mgr->settings_fn = fn;
-    mgr->settings_ctx = ctx;
-    pthread_mutex_unlock(&mgr->lock);
-}
-
-static void resolve_settings(edb_engine *mgr, const char *partition,
-                             edb_shard_settings *out)
-{
-    edb_shard_settings_default(out);
-    edb_shard_settings_fn fn;
-    void *ctx;
-    pthread_mutex_lock(&mgr->lock);
-    fn = mgr->settings_fn;
-    ctx = mgr->settings_ctx;
-    pthread_mutex_unlock(&mgr->lock);
-    if (fn) {
-        fn(ctx, partition, out);
-    }
-}
-
-static bool settings_differ(const edb_shard_settings *a,
-                            const edb_shard_settings *b)
-{
-    return a->cache_size != b->cache_size ||
-           strcmp(a->journal_mode, b->journal_mode) != 0 ||
-           a->vacuum_seconds != b->vacuum_seconds ||
-           a->reindex_seconds != b->reindex_seconds;
-}
-
 static edb_shard *shard_for(edb_engine *mgr, const char *partition,
                             const char *keyspace)
 {
     char key[33];
     shard_key(partition, keyspace, key);
-    if (!migrate_legacy_shard(mgr, partition, keyspace, key)) {
-        return NULL;
-    }
-
-    edb_shard_settings desired;
-    resolve_settings(mgr, partition, &desired);
 
     pthread_mutex_lock(&mgr->lock);
     edb_shard *sh = find_locked(mgr, key);
@@ -228,8 +114,7 @@ static edb_shard *shard_for(edb_engine *mgr, const char *partition,
             return NULL;
         }
         snprintf(path, len, "%s/%s.sqlite", mgr->path, key);
-        edb_shard *opened =
-            edb_shard_open(path, key, partition, keyspace, &desired);
+        edb_shard *opened = edb_shard_open(path, key, partition, keyspace);
         free(path);
         if (!opened) {
             return NULL;
@@ -237,22 +122,13 @@ static edb_shard *shard_for(edb_engine *mgr, const char *partition,
         return insert_shard(mgr, opened, true);
     }
 
-    /* Cached handle: adopt the (now known) partition name and reopen when
-     * the settings have changed since the handle was opened (e.g. a startup
-     * scan opened it with defaults before the config layer was attached). */
-    bool reopen = false;
+    /* Cached handle: adopt the (now known) partition name. */
     pthread_mutex_lock(&sh->lock);
     if (sh->partition[0] == '\0') {
         snprintf(sh->partition, sizeof(sh->partition), "%s", partition);
         snprintf(sh->keyspace, sizeof(sh->keyspace), "%s", keyspace);
     }
-    if (settings_differ(&sh->settings, &desired)) {
-        reopen = true;
-    }
     pthread_mutex_unlock(&sh->lock);
-    if (reopen) {
-        edb_shard_reopen(sh, &desired);
-    }
     return sh;
 }
 
@@ -395,7 +271,7 @@ edb_engine *edb_engine_open(const char *path)
             continue;
         }
         snprintf(full, plen, "%s/%s", path, entry->d_name);
-        edb_shard *sh = edb_shard_open(full, key, "", "", NULL);
+        edb_shard *sh = edb_shard_open(full, key, "", "");
         free(full);
         if (!sh) {
             edb_log("WARN",
@@ -601,9 +477,7 @@ bool edb_shard_invalidate(edb_engine *mgr, const char *partition,
         (int)sizeof(path)) {
         return false;
     }
-    edb_shard_settings settings;
-    resolve_settings(mgr, partition, &settings);
-
+    /* wipe all non-system shards (restore path) */
     edb_shard *sh = NULL;
     pthread_mutex_lock(&mgr->lock);
     sh = find_locked(mgr, key);
@@ -618,8 +492,7 @@ bool edb_shard_invalidate(edb_engine *mgr, const char *partition,
     snprintf(side, sizeof(side), "%s-shm", path);
     unlink(side);
 
-    edb_shard *fresh = edb_shard_open(path, key, partition, keyspace,
-                                      &settings);
+    edb_shard *fresh = edb_shard_open(path, key, partition, keyspace);
     bool ok = false;
     if (fresh) {
         pthread_mutex_lock(&fresh->lock);
@@ -637,14 +510,11 @@ bool edb_shard_invalidate(edb_engine *mgr, const char *partition,
             sh->cache_count = 0;
             sqlite3 *old = sh->db;
             sh->db = fresh->db;
-            sh->settings = fresh->settings;
             sh->partition[0] = '\0';
             snprintf(sh->partition, sizeof(sh->partition), "%s", partition);
             sh->keyspace[0] = '\0';
             snprintf(sh->keyspace, sizeof(sh->keyspace), "%s", keyspace);
             sh->expired_since_vacuum = 0;
-            sh->last_vacuum_ts = (long long)time(NULL);
-            sh->last_reindex_ts = (long long)time(NULL);
             fresh->db = NULL;
             if (old) {
                 sqlite3_close_v2(old);
@@ -672,32 +542,67 @@ bool edb_shard_is_open(edb_engine *mgr, const char *partition,
     return sh != NULL;
 }
 
-int edb_engine_reload_partition(edb_engine *mgr, const char *partition)
+/* Runs `fn` on every currently open shard belonging to `partition`.
+ * Shards are ref-counted so they stay alive while maintained. */
+static int maintain_partition(edb_engine *mgr, const char *partition,
+                              bool (*fn)(edb_shard *))
 {
-    if (!mgr || !partition || !*partition) {
-        return 0;
+    if (!mgr || !partition || !*partition || !fn) {
+        return -1;
     }
-    edb_shard_settings settings;
-    resolve_settings(mgr, partition, &settings);
 
-    int reloaded = 0;
+    int processed = 0;
     pthread_mutex_lock(&mgr->lock);
+    size_t count = 0;
     for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
         for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
-            edb_shard *sh = l->shard;
-            pthread_mutex_lock(&sh->lock);
-            bool match = strcmp(sh->partition, partition) == 0;
-            pthread_mutex_unlock(&sh->lock);
-            if (!match) {
-                continue;
+            pthread_mutex_lock(&l->shard->lock);
+            bool match = strcmp(l->shard->partition, partition) == 0 &&
+                         l->shard->partition[0] != '\0';
+            pthread_mutex_unlock(&l->shard->lock);
+            if (match) {
+                count++;
             }
-            if (edb_shard_reopen(sh, &settings)) {
-                reloaded++;
+        }
+    }
+    edb_shard **shards = count ? malloc(count * sizeof(*shards)) : NULL;
+    if (count && !shards) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
+        for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
+            pthread_mutex_lock(&l->shard->lock);
+            bool match = strcmp(l->shard->partition, partition) == 0 &&
+                         l->shard->partition[0] != '\0';
+            pthread_mutex_unlock(&l->shard->lock);
+            if (match && used < count) {
+                shards[used++] = l->shard;
+                l->shard->refs++;
             }
         }
     }
     pthread_mutex_unlock(&mgr->lock);
-    return reloaded;
+
+    for (size_t i = 0; i < used; i++) {
+        if (fn(shards[i])) {
+            processed++;
+        }
+        shard_release(mgr, shards[i]);
+    }
+    free(shards);
+    return processed;
+}
+
+int edb_engine_vacuum_partition(edb_engine *mgr, const char *partition)
+{
+    return maintain_partition(mgr, partition, edb_shard_vacuum);
+}
+
+int edb_engine_reindex_partition(edb_engine *mgr, const char *partition)
+{
+    return maintain_partition(mgr, partition, edb_shard_reindex);
 }
 
 bool edb_shard_validate(edb_engine *mgr, const char *partition,

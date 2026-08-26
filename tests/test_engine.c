@@ -335,16 +335,13 @@ static void test_concurrent_puts(void)
 
 static void test_shard_size_and_defaults(void)
 {
-    /* maintenance defaults: vacuum weekly, reindex daily, cache auto */
-    edb_shard_settings dflt;
-    edb_shard_settings_default(&dflt);
-    CHECK(dflt.vacuum_seconds == 604800);
-    CHECK(dflt.reindex_seconds == 86400);
-    CHECK(dflt.cache_size == 0);
-
     rm_rf("tests/data/size");
     edb_engine *mgr = edb_engine_open("tests/data/size");
     CHECK(mgr != NULL);
+
+    /* manual maintenance runs over an open partition's shards */
+    CHECK(edb_engine_vacuum_partition(mgr, "nope") == 0);
+    CHECK(edb_engine_reindex_partition(mgr, "nope") == 0);
 
     /* missing shard reports 0 bytes */
     CHECK(edb_engine_shard_size(mgr, "nope", "nope") == 0);
@@ -363,6 +360,14 @@ static void test_shard_size_and_defaults(void)
     CHECK(edb_put(mgr, "sz", "main", "b", doc, -1));
     long long grown = edb_engine_shard_size(mgr, "sz", "main");
     CHECK(grown > small);
+
+    /* manual VACUUM/REINDEX hit the open shards of the partition */
+    CHECK(edb_engine_vacuum_partition(mgr, "sz") == 1);
+    CHECK(edb_engine_reindex_partition(mgr, "sz") == 1);
+    /* data still readable afterwards */
+    cJSON *doc_out = edb_get(mgr, "sz", "main", "a");
+    CHECK(doc_out != NULL);
+    cJSON_Delete(doc_out);
 
     edb_engine_close(mgr);
 }

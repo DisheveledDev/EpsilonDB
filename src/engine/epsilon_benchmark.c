@@ -184,7 +184,6 @@ static bench_phase run_phase(edb_engine *engine, const char *db_name,
 }
 
 cJSON *edb_benchmark_run(edb_config *cfg, int replication_factor,
-                         long long cache_size, const char *journal_mode,
                          int partitions, int records_per_partition,
                          int threads)
 {
@@ -209,9 +208,6 @@ cJSON *edb_benchmark_run(edb_config *cfg, int replication_factor,
     if (threads > BENCH_MAX_THREADS) {
         threads = BENCH_MAX_THREADS;
     }
-    if (!journal_mode || !*journal_mode) {
-        journal_mode = "TRUNCATE";
-    }
 
     edb_engine *engine = edb_config_engine(cfg);
 
@@ -232,23 +228,15 @@ cJSON *edb_benchmark_run(edb_config *cfg, int replication_factor,
     cJSON_AddNumberToObject(report, "threads", (double)threads);
     cJSON_AddNumberToObject(report, "replication_factor",
                             (double)replication_factor);
-    cJSON_AddNumberToObject(report, "cache_size", (double)cache_size);
-    cJSON_AddStringToObject(report, "journal_mode", journal_mode);
 
     /* --- setup --------------------------------------------------------- */
     edb_database_create(cfg, db_name, replication_factor);
-    edb_shard_settings settings;
-    edb_shard_settings_default(&settings);
-    settings.cache_size = cache_size;
-    snprintf(settings.journal_mode, sizeof(settings.journal_mode), "%s",
-             journal_mode);
     for (int p = 0; p < partitions; p++) {
         char pname[64];
         snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
         edb_partition_create(cfg, db_name, pname, EDB_MASK_ALLOW_ALL,
                              EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
                              EDB_MASK_ALLOW_ALL);
-        edb_partition_set_settings(cfg, db_name, pname, &settings);
     }
 
     /* --- writes -------------------------------------------------------- */

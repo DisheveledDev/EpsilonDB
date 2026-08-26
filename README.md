@@ -45,12 +45,11 @@ watch it perform as you grow it.
 - **REST data API**: put/get/delete/all/ids/query with typed JSON filters,
   nested key paths, comparison operators, and TTLs (`?ttl=seconds`).
 - **Sharded storage**: one SQLite database per shard, named from a framed
-  digest of partition and keyspace; legacy concatenated-name shards migrate
-  lazily; soft deletes; a 60s cleanup pass with a 2h grace window (lets
-  offline nodes replay missed changes). Per-partition tuning: SQLite cache
-  size (0 = automatic, scaled from the shard's on-disk size), journal mode
-  (DELETE/TRUNCATE/WAL, default TRUNCATE), and VACUUM/REINDEX intervals
-  (default weekly/daily), applied on shard open and on update.
+  digest of partition and keyspace; soft deletes; a 60s cleanup pass with a
+  2h grace window (lets offline nodes replay missed changes). Shard
+  connections use SQLite's default journal mode (DELETE) and default cache
+  size; VACUUM/REINDEX run on request (per-partition admin endpoints +
+  console buttons), plus an automatic VACUUM once 10k rows have expired.
 - **Clustering**: permanent TCP mesh between peers (ESTP protocol),
   heartbeat-based membership, deterministic leader election
   (lexicographically smallest online node id), contiguous hash-range
@@ -151,13 +150,13 @@ a delete is `UPDATE Data SET ttl = now - 5`; the 60-second cleanup pass is a
 single `DELETE ... WHERE ttl < ?` with a two-hour grace window so offline
 nodes can replay missed changes. Ordered iteration
 (`ORDER BY timestamp ASC`) for `ids`/`all`/`query` falls out of the B-tree
-for free, as does VACUUM/REINDEX maintenance after update-heavy periods.
+for free, as does on-request VACUUM/REINDEX maintenance after update-heavy
+periods.
 
 **Transactional snapshot transfer.** Rebalancing copies a live shard with the
 `sqlite3_backup_*` API, which streams a transactionally-consistent image
-while writes keep flowing — never a raw file copy. `synchronous=FULL` (and a
-configurable journal mode: DELETE/TRUNCATE/WAL) makes every commit and every
-transferred copy crash-safe.
+while writes keep flowing — never a raw file copy. `synchronous=FULL`
+makes every commit and every transferred copy crash-safe.
 
 **A concurrency model that matches.** Each shard is serialized by one mutex
 and opened with `SQLITE_OPEN_FULLMUTEX`. SQLite's locking is sometimes cited
@@ -327,7 +326,7 @@ through the system store, so any node can show the whole cluster's metrics:
   snapshots into reads/writes/updates/deletes per partition/keyspace,
   on-disk size per shard (plus a top-10 `largest_shards` list), slowest
   operations with latency, and the pending-replication backlog.
-- `epsilonbench [records] [rf] [cache_size] [journal_mode] [threads]`
+- `epsilonbench [records] [rf] [threads]`
   runs the throwaway benchmark (against a running server, over the local
   admin socket or `-h/-p/-u/-P` for a remote node; `--json` dumps the raw
   report) and prints writes/s, gets/s, queries/s, updates/s and deletes/s.

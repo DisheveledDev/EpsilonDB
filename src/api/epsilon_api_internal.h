@@ -69,6 +69,8 @@ bool handle_admin_groups(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_users(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_partitions(const edb_http_request *req,
                              edb_http_response *res);
+bool handle_partition_maintenance(const edb_http_request *req,
+                                  edb_http_response *res);
 bool handle_admin_delete(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_keyspaces(const edb_http_request *req,
                             edb_http_response *res);

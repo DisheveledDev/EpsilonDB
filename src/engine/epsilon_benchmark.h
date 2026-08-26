@@ -18,7 +18,6 @@
  * is owned by exactly one worker) so shards are exercised concurrently.
  * Pass 0 to use one thread per partition. */
 cJSON *edb_benchmark_run(edb_config *cfg, int replication_factor,
-                         long long cache_size, const char *journal_mode,
                          int partitions, int records_per_partition,
                          int threads);
 

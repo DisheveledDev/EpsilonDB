@@ -676,7 +676,6 @@ bool edb_api_register(edb_http_server *srv, edb_engine *engine,
     g_ctx.config = config;
     edb_config_set_replicator(config, g_repl ? api_replicate_config : NULL,
                               g_repl);
-    edb_config_register_settings(config);
 
     bool ok = true;
     ok &= edb_http_add_handler(srv, "PUT", "/data/", handle_data_put);
@@ -704,6 +703,8 @@ bool edb_api_register(edb_http_server *srv, edb_engine *engine,
                                handle_admin_partitions);
     ok &= edb_http_add_handler(srv, "PUT", "/admin/partitions",
                                handle_admin_partitions);
+    ok &= edb_http_add_handler(srv, "POST", "/admin/partitions/",
+                               handle_partition_maintenance);
     ok &= edb_http_add_handler(srv, "GET", "/admin/keyspaces",
                                handle_admin_keyspaces);
     ok &= edb_http_add_handler(srv, "GET", "/admin/analytics",

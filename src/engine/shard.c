@@ -180,88 +180,18 @@ static const char *sql_operator(const char *operator_name)
     return "<=";
 }
 
-void edb_shard_settings_default(edb_shard_settings *out)
-{
-    if (!out) {
-        return;
-    }
-    out->cache_size = 0;          /* 0 = auto: scaled from the shard size */
-    snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
-    out->vacuum_seconds = 604800;  /* weekly */
-    out->reindex_seconds = 86400;  /* daily */
-}
 
-/* Automatic page-cache floors and caps: never below the SQLite default
- * (2 MB) and never above 256 MB so a single large shard cannot pin an
- * unbounded amount of memory. */
-#define EDB_CACHE_AUTO_MIN_KB 2048
-#define EDB_CACHE_AUTO_MAX_KB 262144
-
-/* Effective page-cache size (KiB) for a shard connection: the configured
- * value when set (negative = SQLite default, no pragma), otherwise 10% of
- * the on-disk shard size so bigger shards get proportionally bigger
- * caches. The file may not exist yet on first open; the floor applies. */
-static long long effective_cache_kb(const char *path,
-                                    const edb_shard_settings *s)
+/* Applies the connection settings to an open connection. Shards use
+ * SQLite's default journal mode (DELETE); only synchronous=FULL is set. */
+static int configure_connection(sqlite3 *db, const char *key)
 {
-    if (!s) {
-        return 0;
-    }
-    if (s->cache_size > 0) {
-        return s->cache_size;
-    }
-    if (s->cache_size < 0) {
-        return 0;
-    }
-    long long kb = EDB_CACHE_AUTO_MIN_KB;
-    if (path) {
-        struct stat st;
-        if (stat(path, &st) == 0 && st.st_size > 0) {
-            long long want = (long long)st.st_size / 10 / 1024;
-            if (want > kb) {
-                kb = want;
-            }
-            if (kb > EDB_CACHE_AUTO_MAX_KB) {
-                kb = EDB_CACHE_AUTO_MAX_KB;
-            }
-        }
-    }
-    return kb;
-}
-
-/* Applies journal_mode + synchronous + cache_size to an open connection.
- * cache_size is a positive kibibyte count, expressed to SQLite via the
- * negative-value convention (abs(N) * 1024 bytes). */
-static int configure_connection(sqlite3 *db, const char *key,
-                                const char *path,
-                                const edb_shard_settings *s)
-{
-    char sql[256];
     char *err = NULL;
-    const char *mode = (s && s->journal_mode[0]) ? s->journal_mode
-                                                 : "TRUNCATE";
-    if (strcmp(mode, "DELETE") != 0 && strcmp(mode, "TRUNCATE") != 0 &&
-        strcmp(mode, "WAL") != 0) {
-        mode = "TRUNCATE";
-    }
-    snprintf(sql, sizeof(sql), "PRAGMA journal_mode=%s;"
-                               "PRAGMA synchronous=FULL;", mode);
-    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
-        edb_log("ERROR", "shard %s: journal pragma failed: %s", key,
+    if (sqlite3_exec(db, "PRAGMA synchronous=FULL;", NULL, NULL, &err) !=
+        SQLITE_OK) {
+        edb_log("ERROR", "shard %s: pragma failed: %s", key,
                 err ? err : "?");
         sqlite3_free(err);
         return -1;
-    }
-    long long cache_kb = effective_cache_kb(path, s);
-    if (cache_kb > 0) {
-        snprintf(sql, sizeof(sql), "PRAGMA cache_size=-%lld;",
-                 (long long)cache_kb);
-        if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
-            edb_log("ERROR", "shard %s: cache_size pragma failed: %s", key,
-                    err ? err : "?");
-            sqlite3_free(err);
-            return -1;
-        }
     }
     return 0;
 }
@@ -301,8 +231,7 @@ static int setup_schema(sqlite3 *db, const char *key)
 }
 
 edb_shard *edb_shard_open(const char *path, const char *key,
-                          const char *partition, const char *keyspace,
-                          const edb_shard_settings *settings)
+                          const char *partition, const char *keyspace)
 {
     edb_shard *sh = calloc(1, sizeof(*sh));
     if (!sh) {
@@ -315,11 +244,6 @@ edb_shard *edb_shard_open(const char *path, const char *key,
     snprintf(sh->keyspace, sizeof(sh->keyspace), "%s",
              keyspace ? keyspace : "");
     pthread_mutex_init(&sh->lock, NULL);
-    if (settings) {
-        sh->settings = *settings;
-    } else {
-        edb_shard_settings_default(&sh->settings);
-    }
 
     int rc = sqlite3_open_v2(path, &sh->db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
@@ -337,58 +261,16 @@ edb_shard *edb_shard_open(const char *path, const char *key,
     }
 
     sqlite3_busy_timeout(sh->db, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(sh->db, sh->key, path, &sh->settings) != 0 ||
+    if (configure_connection(sh->db, sh->key) != 0 ||
         setup_schema(sh->db, sh->key) != 0) {
         edb_shard_free(sh);
         return NULL;
     }
 
-    sh->last_vacuum_ts = now_epoch();
-    sh->last_reindex_ts = now_epoch();
     return sh;
 }
 
 /* Reopens an existing shard connection with new settings. */
-bool edb_shard_reopen(edb_shard *sh, const edb_shard_settings *settings)
-{
-    if (!sh || !settings) {
-        return false;
-    }
-    pthread_mutex_lock(&sh->lock);
-    for (int i = 0; i < sh->cache_count; i++) {
-        sqlite3_finalize(sh->cache[i].stmt);
-    }
-    sh->cache_count = 0;
-
-    sqlite3 *fresh = NULL;
-    if (sqlite3_open_v2(sh->path, &fresh,
-                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
-                            SQLITE_OPEN_FULLMUTEX,
-                        NULL) != SQLITE_OK) {
-        if (fresh) {
-            sqlite3_close(fresh);
-        }
-        pthread_mutex_unlock(&sh->lock);
-        return false;
-    }
-    sqlite3_busy_timeout(fresh, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(fresh, sh->key, sh->path, settings) != 0 ||
-        setup_schema(fresh, sh->key) != 0) {
-        sqlite3_close(fresh);
-        pthread_mutex_unlock(&sh->lock);
-        return false;
-    }
-    sqlite3 *old = sh->db;
-    sh->db = fresh;
-    sh->settings = *settings;
-    sh->last_vacuum_ts = now_epoch();
-    sh->last_reindex_ts = now_epoch();
-    if (old) {
-        sqlite3_close_v2(old);
-    }
-    pthread_mutex_unlock(&sh->lock);
-    return true;
-}
 
 void edb_shard_free(edb_shard *sh)
 {
@@ -890,13 +772,11 @@ bool edb_shard_cleanup(edb_shard *sh)
     }
     sqlite3_free(err);
 
-    /* time-based maintenance, gated on the per-partition intervals */
-    int64_t now = now_epoch();
-    if (ok && sh->settings.vacuum_seconds > 0 &&
-        now - sh->last_vacuum_ts >= sh->settings.vacuum_seconds) {
+    /* VACUUM once enough rows have expired so freed pages are reclaimed
+     * instead of accumulating until the next manual vacuum. */
+    if (ok && sh->expired_since_vacuum >= EDB_VACUUM_THRESHOLD) {
         err = NULL;
         if (sqlite3_exec(sh->db, "VACUUM", NULL, NULL, &err) == SQLITE_OK) {
-            sh->last_vacuum_ts = now;
             sh->expired_since_vacuum = 0;
         } else {
             edb_log("ERROR", "shard %s: vacuum failed: %s", sh->key,
@@ -904,18 +784,45 @@ bool edb_shard_cleanup(edb_shard *sh)
             sqlite3_free(err);
         }
     }
-    if (ok && sh->settings.reindex_seconds > 0 &&
-        now - sh->last_reindex_ts >= sh->settings.reindex_seconds) {
-        err = NULL;
-        if (sqlite3_exec(sh->db, "REINDEX", NULL, NULL, &err) == SQLITE_OK) {
-            sh->last_reindex_ts = now;
-        } else {
-            edb_log("ERROR", "shard %s: reindex failed: %s", sh->key,
-                    err ? err : "?");
-            sqlite3_free(err);
-        }
-    }
 
+    pthread_mutex_unlock(&sh->lock);
+    return ok;
+}
+
+/* Runs one maintenance statement on an open shard. Assumes sh->lock held. */
+static bool shard_exec_locked(edb_shard *sh, const char *sql)
+{
+    char *err = NULL;
+    if (sqlite3_exec(sh->db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        edb_log("ERROR", "shard %s: %s failed: %s", sh->key, sql,
+                err ? err : "?");
+        sqlite3_free(err);
+        return false;
+    }
+    return true;
+}
+
+bool edb_shard_vacuum(edb_shard *sh)
+{
+    if (!sh || sh->partition[0] == '\0') {
+        return false;
+    }
+    pthread_mutex_lock(&sh->lock);
+    bool ok = shard_exec_locked(sh, "VACUUM");
+    if (ok) {
+        sh->expired_since_vacuum = 0;
+    }
+    pthread_mutex_unlock(&sh->lock);
+    return ok;
+}
+
+bool edb_shard_reindex(edb_shard *sh)
+{
+    if (!sh || sh->partition[0] == '\0') {
+        return false;
+    }
+    pthread_mutex_lock(&sh->lock);
+    bool ok = shard_exec_locked(sh, "REINDEX");
     pthread_mutex_unlock(&sh->lock);
     return ok;
 }
