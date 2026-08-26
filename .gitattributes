@@ -1,0 +1,10 @@
+# Shell scripts must keep LF endings. On a Windows checkout with
+# core.autocrlf=true they otherwise get CRLF, and the kernel cannot execute
+# "#!/bin/sh\r" -- the test suite fails with "No such file or directory".
+*.sh text eol=lf
+
+# Sources are text; let git normalise them in the repository.
+*.c text
+*.h text
+*.md text
+Makefile text
