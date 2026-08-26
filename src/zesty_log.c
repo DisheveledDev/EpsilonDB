@@ -125,6 +125,8 @@ void zdb_log_rotate_if_needed(void)
     time_t now = time(NULL);
     struct tm tmv;
     char today[9];
+    char dated[2048] = "";
+    bool compress = false;
 
     localtime_r(&now, &tmv);
     strftime(today, sizeof(today), "%Y%m%d", &tmv);
@@ -143,15 +145,19 @@ void zdb_log_rotate_if_needed(void)
         fclose(g_log);
         g_log = NULL;
     }
-    if (g_log_date[0]) {
-        char dated[2048];
-        snprintf(dated, sizeof(dated), "%s-%s", g_log_path, g_log_date);
-        rename(g_log_path, dated);
-        gzip_file(dated);
+    if (g_log_date[0] &&
+        snprintf(dated, sizeof(dated), "%s-%s", g_log_path,
+                 g_log_date) < (int)sizeof(dated) &&
+        rename(g_log_path, dated) == 0) {
+        compress = true;
     }
     g_log = fopen(g_log_path, "a");
     snprintf(g_log_date, sizeof(g_log_date), "%s", today);
     pthread_mutex_unlock(&g_log_mutex);
+
+    if (compress) {
+        gzip_file(dated);
+    }
 }
 
 /* Writes a timestamped line to the log file and to the console. */

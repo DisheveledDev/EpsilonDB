@@ -147,6 +147,21 @@ static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
         zdb_shard_free(legacy);
     }
     bool migrated = rename(legacy_path, new_path) == 0 || errno == ENOENT;
+    if (migrated) {
+        const char *suffixes[] = {"-wal", "-shm", "-journal"};
+        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+            char old_side[1060];
+            char new_side[1060];
+            snprintf(old_side, sizeof(old_side), "%s%s", legacy_path,
+                     suffixes[i]);
+            snprintf(new_side, sizeof(new_side), "%s%s", new_path,
+                     suffixes[i]);
+            if (rename(old_side, new_side) != 0 && errno != ENOENT) {
+                migrated = false;
+                break;
+            }
+        }
+    }
     pthread_mutex_unlock(&mgr->lock);
     return migrated;
 }
@@ -255,6 +270,8 @@ static void shard_release(zdb_engine *mgr, zdb_shard *sh)
     }
 }
 
+static void shard_release(zdb_engine *mgr, zdb_shard *sh);
+
 static void close_all(zdb_engine *mgr)
 {
     pthread_mutex_lock(&mgr->lock);
@@ -273,13 +290,32 @@ static void close_all(zdb_engine *mgr)
 
 static void cleanup_all_shards(zdb_engine *mgr)
 {
+    size_t count = 0;
     pthread_mutex_lock(&mgr->lock);
     for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
         for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
-            zdb_shard_cleanup(l->shard);
+            count++;
+        }
+    }
+    zdb_shard **shards = count ? malloc(count * sizeof(*shards)) : NULL;
+    if (count && !shards) {
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+        for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
+            l->shard->refs++;
+            shards[used++] = l->shard;
         }
     }
     pthread_mutex_unlock(&mgr->lock);
+
+    for (size_t i = 0; i < used; i++) {
+        zdb_shard_cleanup(shards[i]);
+        shard_release(mgr, shards[i]);
+    }
+    free(shards);
 }
 
 static void *cleanup_thread_main(void *arg)
@@ -531,20 +567,19 @@ static bool shard_integrity_ok(zdb_shard *sh)
 bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
                           const char *keyspace)
 {
-    if (!mgr) {
+    if (!mgr || !partition || !keyspace) {
         return false;
     }
     char key[33];
     shard_key(partition, keyspace, key);
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s.sqlite", mgr->path, key);
+    if (snprintf(path, sizeof(path), "%s/%s.sqlite", mgr->path, key) >=
+        (int)sizeof(path)) {
+        return false;
+    }
     zdb_shard_settings settings;
     resolve_settings(mgr, partition, &settings);
 
-    /* Close the old connection first (checkpointing its WAL) and drop any
-     * stale sidecars so a WAL left behind by the replaced file cannot be
-     * replayed against the new database. Hold sh->lock across the swap so a
-     * concurrent accessor never sees a half-replaced handle. */
     zdb_shard *sh = NULL;
     pthread_mutex_lock(&mgr->lock);
     sh = find_locked(mgr, key);
@@ -552,17 +587,6 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
         pthread_mutex_lock(&sh->lock);
     }
     pthread_mutex_unlock(&mgr->lock);
-
-    if (sh) {
-        for (int i = 0; i < sh->cache_count; i++) {
-            sqlite3_finalize(sh->cache[i].stmt);
-        }
-        sh->cache_count = 0;
-        if (sh->db) {
-            sqlite3_close_v2(sh->db);
-            sh->db = NULL;
-        }
-    }
 
     char side[1060];
     snprintf(side, sizeof(side), "%s-wal", path);
@@ -583,17 +607,25 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
 
     if (sh) {
         if (ok && fresh) {
+            for (int i = 0; i < sh->cache_count; i++) {
+                sqlite3_finalize(sh->cache[i].stmt);
+            }
+            sh->cache_count = 0;
+            sqlite3 *old = sh->db;
             sh->db = fresh->db;
+            sh->settings = fresh->settings;
+            sh->partition[0] = '\0';
+            snprintf(sh->partition, sizeof(sh->partition), "%s", partition);
+            sh->keyspace[0] = '\0';
+            snprintf(sh->keyspace, sizeof(sh->keyspace), "%s", keyspace);
             sh->expired_since_vacuum = 0;
             sh->last_vacuum_ts = (long long)time(NULL);
             sh->last_reindex_ts = (long long)time(NULL);
-            free(fresh->path);
-            pthread_mutex_destroy(&fresh->lock);
-            free(fresh);
-            fresh = NULL;
+            fresh->db = NULL;
+            if (old) {
+                sqlite3_close_v2(old);
+            }
         }
-        /* on failure sh->db stays NULL: the file was replaced and there is
-         * nothing to fall back to */
         pthread_mutex_unlock(&sh->lock);
     }
     if (fresh) {

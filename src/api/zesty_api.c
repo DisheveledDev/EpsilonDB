@@ -26,7 +26,6 @@ static api_ctx g_ctx;   /* handlers receive no user pointer; single server */
 static zdb_cluster *g_cluster;   /* may be NULL: clustering disabled */
 static zdb_repl *g_repl;         /* may be NULL: replication disabled */
 static zdb_analytics *g_analytics; /* may be NULL: analytics disabled */
-static pthread_mutex_t g_data_put_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Monotonic microseconds for latency measurement. */
 static long long api_now_us(void)
@@ -630,13 +629,11 @@ static bool handle_data_put(const zdb_http_request *req,
     if (query_param(req, "ttl", ttlbuf, sizeof(ttlbuf))) {
         ttl = strtoll(ttlbuf, NULL, 10);
     }
-    pthread_mutex_lock(&g_data_put_lock);
     cJSON *existing = zdb_get(g_ctx.engine, part, ks, id);
     bool is_update = existing != NULL;
     zdb_permission permission = existing ? ZDB_PERM_UPDATE : ZDB_PERM_CREATE;
     cJSON_Delete(existing);
     if (!authorize_partition(g_ctx.config, db, part, groups, permission, res)) {
-        pthread_mutex_unlock(&g_data_put_lock);
         free(json);
         return true;
     }
@@ -652,7 +649,14 @@ static bool handle_data_put(const zdb_http_request *req,
             cJSON_AddStringToObject(change, "partition", part);
             cJSON_AddStringToObject(change, "keyspace", ks);
             cJSON_AddStringToObject(change, "id", id);
-            cJSON_AddItemToObject(change, "value", cJSON_Parse(json));
+            cJSON *value = cJSON_Parse(json);
+            if (!value) {
+                cJSON_Delete(change);
+                free(json);
+                respond_error(res, 500, "encode failed");
+                return true;
+            }
+            cJSON_AddItemToObject(change, "value", value);
             cJSON_AddNumberToObject(change, "ttl_abs",
                                     ttl >= 0 ? (double)(ts + ttl) : -1);
             cJSON_AddNumberToObject(change, "ts", (double)ts);
@@ -663,7 +667,6 @@ static bool handle_data_put(const zdb_http_request *req,
                                                         change_json);
                 free(change_json);
                 if (status == ZDB_REPL_QUORUM_LOST) {
-                    pthread_mutex_unlock(&g_data_put_lock);
                     free(json);
                     respond_error(res, 503,
                                   "quorum unavailable: write rejected");
@@ -678,7 +681,6 @@ static bool handle_data_put(const zdb_http_request *req,
     if (ok) {
         zdb_partition_ensure(g_ctx.config, db, part, ks, NULL);
     }
-    pthread_mutex_unlock(&g_data_put_lock);
     free(json);
 
     if (g_analytics && ok) {
@@ -1792,17 +1794,6 @@ static bool handle_admin_cluster(const zdb_http_request *req,
  * (its local demo/scratch data is discarded in favour of the shared
  * cluster data). Config shards are left in place: the seed sync below
  * snapshots them over the local copies. */
-static void wipe_local_shards(void)
-{
-    char keys[512][33];
-    size_t n = zdb_engine_shard_keys(g_ctx.engine, keys, 512);
-    for (size_t i = 0; i < n; i++) {
-        if (zdb_config_is_system_key(g_ctx.config, keys[i])) {
-            continue;
-        }
-        zdb_shard_gc(g_ctx.engine, keys[i]);
-    }
-}
 
 static bool catchup_from_holder(const char key[33], const char *partition,
                                 const char *keyspace)
@@ -1913,7 +1904,6 @@ static bool handle_admin_join(const zdb_http_request *req,
         zdb_cluster_persist_keys(zdb_engine_path(g_ctx.engine), enc_key,
                                  mac_key);
     }
-    wipe_local_shards();
     respond_json(res, 200, NULL);
 
     /* --- stage 6e: run the full rebalance flow for this node -------- */
@@ -2135,7 +2125,7 @@ static bool handle_status(const zdb_http_request *req,
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "service", "zestydb");
     cJSON_AddStringToObject(o, "version", "0.1.0");
-    cJSON_AddBoolToObject(o, "clustered", false);
+    cJSON_AddBoolToObject(o, "clustered", g_cluster != NULL);
     respond_json(res, 200, o);
     return true;
 }

@@ -42,14 +42,16 @@ void zdb_random_hex(char *out, size_t hex_chars)
 {
     static const char hex[] = "0123456789abcdef";
     uint8_t bytes[128];
-    size_t count = hex_chars / 2;
+    size_t count = (hex_chars + 1) / 2;
     if (count > sizeof(bytes)) {
         count = sizeof(bytes);
     }
     zdb_random_bytes(bytes, count);
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count && i * 2 < hex_chars; i++) {
         out[i * 2] = hex[bytes[i] >> 4];
-        out[i * 2 + 1] = hex[bytes[i] & 0xf];
+        if (i * 2 + 1 < hex_chars) {
+            out[i * 2 + 1] = hex[bytes[i] & 0xf];
+        }
     }
     out[hex_chars] = '\0';
 }

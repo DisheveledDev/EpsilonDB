@@ -119,6 +119,7 @@ struct zdb_cluster {
     pthread_mutex_t send_lock;      /* serialises frame writes */
     pthread_cond_t conn_cv;         /* signalled when refs hit zero */
     size_t nconn_threads;           /* live reader threads (for stop) */
+    peer_conn *pending_conns;
     peer_conn *conns;
 
     zdb_peer_info *peers;           /* includes self */
@@ -1260,6 +1261,29 @@ static void reader_exiting_locked(zdb_cluster *cl)
     pthread_cond_broadcast(&cl->conn_cv);
 }
 
+static void pending_remove_locked(zdb_cluster *cl, peer_conn *c)
+{
+    peer_conn **link = &cl->pending_conns;
+    while (*link && *link != c) {
+        link = &(*link)->next;
+    }
+    if (*link == c) {
+        *link = c->next;
+        c->next = NULL;
+    }
+}
+
+static void pending_discard(zdb_cluster *cl, peer_conn *c)
+{
+    pthread_mutex_lock(&cl->lock);
+    pending_remove_locked(cl, c);
+    reader_exiting_locked(cl);
+    pthread_mutex_unlock(&cl->lock);
+    shutdown(c->fd, SHUT_RDWR);
+    close(c->fd);
+    free(c);
+}
+
 static void *conn_thread(void *arg)
 {
     peer_conn *c = arg;
@@ -1324,11 +1348,7 @@ static void *conn_thread(void *arg)
                     cJSON_Delete(r);
                     zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
                     free(rs);
-                    close(c->fd);
-                    free(c);
-                    pthread_mutex_lock(&cl->lock);
-                    reader_exiting_locked(cl);
-                    pthread_mutex_unlock(&cl->lock);
+                    pending_discard(cl, c);
                     return NULL;
                 }
                 if (!known && busy) {
@@ -1339,11 +1359,7 @@ static void *conn_thread(void *arg)
                     cJSON_Delete(r);
                     zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
                     free(rs);
-                    close(c->fd);
-                    free(c);
-                    pthread_mutex_lock(&cl->lock);
-                    reader_exiting_locked(cl);
-                    pthread_mutex_unlock(&cl->lock);
+                    pending_discard(cl, c);
                     return NULL;
                 }
             }
@@ -1392,17 +1408,14 @@ static void *conn_thread(void *arg)
     free(payload);
 
     if (!c->node_id[0]) {
-        close(c->fd);
-        free(c);
-        pthread_mutex_lock(&cl->lock);
-        reader_exiting_locked(cl);
-        pthread_mutex_unlock(&cl->lock);
+        pending_discard(cl, c);
         return NULL;
     }
 
     send_hello_state(cl, c->fd, true, false);
 
     pthread_mutex_lock(&cl->lock);
+    pending_remove_locked(cl, c);
     c->last_recv = epoch_now();
     c->refs = 1;   /* the reader's own reference */
     c->next = cl->conns;
@@ -1633,8 +1646,13 @@ static void spawn_conn_thread(peer_conn *c)
     zdb_cluster *cl = c->owner;
     pthread_mutex_lock(&cl->lock);
     cl->nconn_threads++;
+    c->next = cl->pending_conns;
+    cl->pending_conns = c;
     pthread_mutex_unlock(&cl->lock);
     if (pthread_create(&tid, &attr, conn_thread, c) != 0) {
+        pthread_mutex_lock(&cl->lock);
+        pending_remove_locked(cl, c);
+        pthread_mutex_unlock(&cl->lock);
         close(c->fd);
         free(c);
         pthread_mutex_lock(&cl->lock);
@@ -1758,7 +1776,7 @@ static void maintainer_tick(zdb_cluster *cl)
     pthread_mutex_lock(&cl->lock);
     for (size_t i = 0; i < cl->npeers; i++) {
         zdb_peer_info p = cl->peers[i];   /* copy; lock released below */
-        if (strcmp(p.id, cl->self_id) == 0 ||
+        if (strcmp(p.id, cl->self_id) == 0 || p.removed ||
             p.addr[0] == '\0' || p.port <= 0 ||
             (p.port == cl->self_port &&
              strcmp(p.addr, "127.0.0.1") == 0) ||
@@ -2028,6 +2046,9 @@ void zdb_cluster_stop(zdb_cluster *cl)
         c->dead = true;
         shutdown(c->fd, SHUT_RDWR);
     }
+    for (peer_conn *c = cl->pending_conns; c; c = c->next) {
+        shutdown(c->fd, SHUT_RDWR);
+    }
     while (cl->nconn_threads > 0) {
         pthread_cond_wait(&cl->conn_cv, &cl->lock);
     }
@@ -2162,7 +2183,9 @@ size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
     const char *candidates[MAX_PEERS];
     size_t ncandidates = 0;
     for (size_t i = 0; i < cl->npeers && ncandidates < MAX_PEERS; i++) {
-        candidates[ncandidates++] = cl->peers[i].id;
+        if (!cl->peers[i].removed) {
+            candidates[ncandidates++] = cl->peers[i].id;
+        }
     }
     for (size_t i = 1; i < ncandidates; i++) {
         const char *candidate = candidates[i];
@@ -2275,6 +2298,12 @@ bool zdb_cluster_remove_node(zdb_cluster *cl, const char *node_id)
         }
     }
     if (found) {
+        for (peer_conn *conn = cl->conns; conn; conn = conn->next) {
+            if (strcmp(conn->node_id, node_id) == 0) {
+                conn->dead = true;
+                shutdown(conn->fd, SHUT_RDWR);
+            }
+        }
         am_leader = leader_is_self_locked(cl);
         if (am_leader) {
             shrink_live_locked(cl);

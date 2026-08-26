@@ -584,12 +584,30 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
         zdb_log("WARN",
                 "quorum lost writing '%s': %d/%d holders reached",
                 db, acknowledgements, required);
+        for (size_t i = 0; i < npeers; i++) {
+            if (!delivered[i] && strcmp(peers[i].id, rp->self_id) != 0 &&
+                peers[i].id[0]) {
+                char *copy = strdup(payload);
+                if (copy) {
+                    cache_append(&rp->cache, peers[i].id, cid, copy);
+                }
+            }
+        }
         free(payload);
         cJSON_Delete(change);
         return ZDB_REPL_QUORUM_LOST;
     }
 
     if (!apply_change_local(rp, change)) {
+        for (size_t i = 0; i < npeers; i++) {
+            if (!delivered[i] && strcmp(peers[i].id, rp->self_id) != 0 &&
+                peers[i].id[0]) {
+                char *copy = strdup(payload);
+                if (copy) {
+                    cache_append(&rp->cache, peers[i].id, cid, copy);
+                }
+            }
+        }
         free(payload);
         cJSON_Delete(change);
         return ZDB_REPL_LOCAL_FAIL;
@@ -841,7 +859,13 @@ static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
 static void *repl_maint_main(void *arg)
 {
     zdb_repl *rp = arg;
-    while (rp->running) {
+    for (;;) {
+        pthread_mutex_lock(&rp->sync_lock);
+        bool running = rp->running;
+        pthread_mutex_unlock(&rp->sync_lock);
+        if (!running) {
+            break;
+        }
         sleep_ms(REPL_TICK_MS);
         zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
         size_t count = zdb_cluster_peers(rp->cluster, peers,
@@ -865,6 +889,24 @@ static void *repl_maint_main(void *arg)
  * fills replies[] with parsed result documents (caller frees). */
 #define MAX_REPLIES 16
 
+typedef struct {
+    const zdb_peer_info *peer;
+    const char *payload;
+    cJSON *reply;
+} query_job;
+
+static void *query_worker(void *arg)
+{
+    query_job *job = arg;
+    char *reply = NULL;
+    if (rpc_once(job->peer->addr, job->peer->port, ZSTP_QUERY,
+                 job->payload, ZSTP_RESULT, &reply) == ZSTP_RESULT) {
+        job->reply = reply ? cJSON_Parse(reply) : NULL;
+    }
+    free(reply);
+    return NULL;
+}
+
 static size_t query_all(zdb_repl *rp, const cJSON *request,
                         cJSON **replies, size_t cap)
 {
@@ -872,8 +914,7 @@ static size_t query_all(zdb_repl *rp, const cJSON *request,
     if (!payload) {
         return 0;
     }
-    const cJSON *database =
-        cJSON_GetObjectItemCaseSensitive(request, "db");
+    const cJSON *database = cJSON_GetObjectItemCaseSensitive(request, "db");
     const cJSON *partition =
         cJSON_GetObjectItemCaseSensitive(request, "partition");
     const cJSON *keyspace =
@@ -888,26 +929,32 @@ static size_t query_all(zdb_repl *rp, const cJSON *request,
                                  keyspace->valuestring,
                                  replication_factor(rp, database->valuestring),
                                  holders);
-
-    size_t got = 0;
     zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-    size_t npeers =
-        zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
-    for (size_t i = 0; i < npeers && got < cap; i++) {
+    size_t npeers = zdb_cluster_peers(rp->cluster, peers,
+                                      MAX_PEERS_SNAPSHOT);
+    query_job jobs[MAX_REPLIES];
+    pthread_t threads[MAX_REPLIES];
+    size_t njobs = 0;
+    for (size_t i = 0; i < npeers && njobs < cap && njobs < MAX_REPLIES; i++) {
         if (strcmp(peers[i].id, rp->self_id) == 0 ||
             !id_in_holders(peers[i].id, holders, nholders) ||
             !peers[i].online || peers[i].addr[0] == '\0' ||
             peers[i].port <= 0) {
             continue;
         }
-        char *reply = NULL;
-        if (rpc_once(peers[i].addr, peers[i].port, ZSTP_QUERY, payload,
-                     ZSTP_RESULT, &reply) == ZSTP_RESULT) {
-            cJSON *doc = reply ? cJSON_Parse(reply) : NULL;
-            free(reply);
-            if (doc) {
-                replies[got++] = doc;
-            }
+        jobs[njobs].peer = &peers[i];
+        jobs[njobs].payload = payload;
+        jobs[njobs].reply = NULL;
+        if (pthread_create(&threads[njobs], NULL, query_worker,
+                           &jobs[njobs]) == 0) {
+            njobs++;
+        }
+    }
+    size_t got = 0;
+    for (size_t i = 0; i < njobs; i++) {
+        pthread_join(threads[i], NULL);
+        if (jobs[i].reply) {
+            replies[got++] = jobs[i].reply;
         }
     }
     free(payload);
@@ -1825,7 +1872,9 @@ void zdb_repl_stop(zdb_repl *rp)
     if (!rp) {
         return;
     }
+    pthread_mutex_lock(&rp->sync_lock);
     rp->running = false;
+    pthread_mutex_unlock(&rp->sync_lock);
     pthread_join(rp->maint_thread, NULL);
     zdb_cluster_set_dispatcher(rp->cluster, NULL, NULL);
     cache_close(&rp->cache);

@@ -10,3 +10,12 @@ tests/data/chaos/
 tests/data/console_live/
 bin/data
 tests/data
+tests/test_cluster
+tests/test_config
+tests/test_delta
+tests/test_engine
+tests/test_join
+tests/test_rebalance
+tests/test_replication
+tests/test_snapshot
+tests/test_structure

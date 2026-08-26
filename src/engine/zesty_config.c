@@ -226,6 +226,40 @@ bool zdb_database_create(zdb_config *cfg, const char *name,
     return ok;
 }
 
+static bool remove_keyspaces_for(zdb_config *cfg, const char *database,
+                                 const char *partition)
+{
+    cJSON *all = collect(cfg, CFG_KEYSPACE_KEYSPACES);
+    if (!all) {
+        return true;
+    }
+    bool ok = true;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, all) {
+        const cJSON *db = cJSON_GetObjectItemCaseSensitive(item, "database");
+        const cJSON *part = cJSON_GetObjectItemCaseSensitive(item, "partition");
+        if (!cJSON_IsString(db) || !cJSON_IsString(part) ||
+            strcmp(db->valuestring, database) != 0 ||
+            (partition && strcmp(part->valuestring, partition) != 0)) {
+            continue;
+        }
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        if (!cJSON_IsString(name)) {
+            ok = false;
+            continue;
+        }
+        char id[640];
+        if (snprintf(id, sizeof(id), "%s/%s/%s", database,
+                     part->valuestring, name->valuestring) >= (int)sizeof(id) ||
+            !remove_record(cfg, CFG_KEYSPACE_KEYSPACES, id)) {
+            ok = false;
+        }
+    }
+    cJSON_Delete(all);
+    return ok;
+}
+
+
 bool zdb_database_delete(zdb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
@@ -237,8 +271,9 @@ bool zdb_database_delete(zdb_config *cfg, const char *name)
     for (size_t i = 0; parts && i < n; i++) {
         zdb_partition_delete(cfg, name, parts[i].name);
     }
+    bool keyspaces_ok = remove_keyspaces_for(cfg, name, NULL);
     free(parts);
-    return remove_record(cfg, CFG_KEYSPACE_DATABASES, name);
+    return keyspaces_ok && remove_record(cfg, CFG_KEYSPACE_DATABASES, name);
 }
 
 bool zdb_database_get(zdb_config *cfg, const char *name,
@@ -297,7 +332,10 @@ static uint64_t next_free_bit(zdb_config *cfg)
     zdb_group_info *groups = zdb_group_list(cfg, &n);
     uint64_t used = 0;
     for (size_t i = 0; groups && i < n; i++) {
-        used |= (1ULL << (groups[i].bit_position - 1));
+        if (groups[i].bit_position >= 1 &&
+            groups[i].bit_position <= ZDB_MAX_GROUPS) {
+            used |= (1ULL << (groups[i].bit_position - 1));
+        }
     }
     free(groups);
     for (int bit = 1; bit <= ZDB_MAX_GROUPS; bit++) {
@@ -679,7 +717,8 @@ bool zdb_partition_delete(zdb_config *cfg, const char *database,
     }
     char id[384];
     snprintf(id, sizeof(id), "%s/%s", database, name);
-    return remove_record(cfg, CFG_KEYSPACE_PARTITIONS, id);
+    return remove_keyspaces_for(cfg, database, name) &&
+           remove_record(cfg, CFG_KEYSPACE_PARTITIONS, id);
 }
 
 bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
@@ -931,7 +970,7 @@ static void config_settings_provider(void *ctx, const char *partition,
                                      zdb_shard_settings *out)
 {
     if (strcmp(partition, ZDB_SYSTEM_DB) == 0) {
-        return;   /* keep the defaults already in `out` */
+        return;
     }
     zdb_config *cfg = ctx;
     cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS);

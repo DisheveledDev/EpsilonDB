@@ -114,7 +114,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
              journal_mode);
     for (int p = 0; p < partitions; p++) {
         char pname[64];
-        snprintf(pname, sizeof(pname), "p%d", p);
+        snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
         zdb_partition_create(cfg, db_name, pname, ZDB_MASK_ALLOW_ALL,
                              ZDB_MASK_ALLOW_ALL, ZDB_MASK_ALLOW_ALL,
                              ZDB_MASK_ALLOW_ALL);
@@ -126,7 +126,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         long long t0 = now_us();
         for (int p = 0; p < partitions; p++) {
             char pname[64];
-            snprintf(pname, sizeof(pname), "p%d", p);
+            snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
             for (int i = 0; i < records_per_partition; i++) {
                 write_record(engine, pname, i);
             }
@@ -143,7 +143,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         long long t0 = now_us();
         for (int p = 0; p < partitions; p++) {
             char pname[64];
-            snprintf(pname, sizeof(pname), "p%d", p);
+            snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
             for (int i = 0; i < sample; i++) {
                 char id[64];
                 snprintf(id, sizeof(id), "rec-%d",
@@ -162,7 +162,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         long long t0 = now_us();
         for (int p = 0; p < partitions; p++) {
             char pname[64];
-            snprintf(pname, sizeof(pname), "p%d", p);
+            snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
             for (int q = 0; q < sample; q++) {
                 cJSON *f = make_filter("age", "lt", 10 + q * 5);
                 cJSON *rows = zdb_query(engine, pname, BENCH_KEYSpace, f);
@@ -181,7 +181,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         long long t0 = now_us();
         for (int p = 0; p < partitions; p++) {
             char pname[64];
-            snprintf(pname, sizeof(pname), "p%d", p);
+            snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
             for (int i = 0; i < sample; i++) {
                 char id[64];
                 char value[128];
@@ -202,7 +202,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         long long t0 = now_us();
         for (int p = 0; p < partitions; p++) {
             char pname[64];
-            snprintf(pname, sizeof(pname), "p%d", p);
+            snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
             for (int i = 0; i < records_per_partition; i++) {
                 delete_record(engine, pname, i);
             }
@@ -217,7 +217,7 @@ cJSON *zdb_benchmark_run(zdb_config *cfg, int replication_factor,
         char pname[64];
         char path[1024];
         char key[33];
-        snprintf(pname, sizeof(pname), "p%d", p);
+        snprintf(pname, sizeof(pname), "%.48s_p%d", db_name, p);
         if (zdb_shard_path(engine, pname, BENCH_KEYSpace, path, sizeof(path),
                            key)) {
             zdb_shard_gc(engine, key);
