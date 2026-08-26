@@ -20,7 +20,7 @@
 #define C_RED    "\033[31m"
 
 static FILE *g_log = NULL;
-static const char *g_log_path = NULL;
+static char *g_log_path = NULL;
 static char g_log_date[9] = "";   /* "YYYYMMDD" of the open log file */
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -50,20 +50,36 @@ void zdb_log_open(const char *path)
     time_t now = time(NULL);
     struct tm tmv;
     char dir[1024];
+    char *owned_path = NULL;
 
-    g_log_path = path;
-
-    /* ensure the parent directory exists (best effort: /var/log/zestydb) */
-    snprintf(dir, sizeof(dir), "%s", path ? path : "");
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        mkdir_p(dir);
+    if (path && *path) {
+        owned_path = strdup(path);
+        if (!owned_path) {
+            return;
+        }
     }
 
-    g_log = fopen(path ? path : "", "a");
+    if (owned_path) {
+        /* ensure the parent directory exists (best effort: /var/log/zestydb) */
+        snprintf(dir, sizeof(dir), "%s", owned_path);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            mkdir_p(dir);
+        }
+    }
+
+    pthread_mutex_lock(&g_log_mutex);
+    FILE *new_log = owned_path ? fopen(owned_path, "a") : NULL;
+    if (g_log) {
+        fclose(g_log);
+    }
+    free(g_log_path);
+    g_log = new_log;
+    g_log_path = owned_path;
     localtime_r(&now, &tmv);
     strftime(g_log_date, sizeof(g_log_date), "%Y%m%d", &tmv);
+    pthread_mutex_unlock(&g_log_mutex);
 }
 
 void zdb_log_close(void)
@@ -73,6 +89,9 @@ void zdb_log_close(void)
         fclose(g_log);
         g_log = NULL;
     }
+    free(g_log_path);
+    g_log_path = NULL;
+    g_log_date[0] = '\0';
     pthread_mutex_unlock(&g_log_mutex);
 }
 
@@ -107,13 +126,14 @@ void zdb_log_rotate_if_needed(void)
     struct tm tmv;
     char today[9];
 
-    if (!g_log_path) {
-        return;
-    }
     localtime_r(&now, &tmv);
     strftime(today, sizeof(today), "%Y%m%d", &tmv);
 
     pthread_mutex_lock(&g_log_mutex);
+    if (!g_log_path) {
+        pthread_mutex_unlock(&g_log_mutex);
+        return;
+    }
     if (strcmp(today, g_log_date) == 0) {
         pthread_mutex_unlock(&g_log_mutex);
         return;
