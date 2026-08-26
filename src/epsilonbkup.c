@@ -5,11 +5,16 @@
  * See epsilonbkup_internal.h and the README for the full protocol.
  */
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -25,6 +30,105 @@
 #define CHUNK_BYTES (8 * 1024 * 1024)
 #define MAX_SHARDS 8192
 #define MAX_NODES 64
+
+/* ------------------------------------------------------------------ */
+/* process + filesystem helpers                                        */
+/*                                                                     */
+/* These deliberately avoid system()/popen(): the paths below come from */
+/* argv and from a restore manifest, and interpolating them into a      */
+/* shell string lets a single quote in a filename run arbitrary         */
+/* commands as whatever user runs the tool (often root, since the       */
+/* installer registers a system service).                               */
+
+/* Runs argv directly (no shell). When `cwd` is non-NULL the child
+ * chdir()s there first. Returns the child's exit status, or -1 if it
+ * could not be run or was killed by a signal. */
+static int run_argv(const char *cwd, char *const argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        if (cwd && chdir(cwd) != 0) {
+            _exit(127);
+        }
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) {
+                close(devnull);
+            }
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Recursively deletes `path`. Returns 0 on success (including when the
+ * path does not exist). Replaces the previous `rm -rf` shell-out. */
+static int remove_tree(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return (errno == ENOENT) ? 0 : -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return unlink(path) == 0 ? 0 : -1;
+    }
+    DIR *d = opendir(path);
+    if (!d) {
+        return -1;
+    }
+    int rc = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char child[PATH_MAX];
+        if (snprintf(child, sizeof(child), "%s/%s", path, ent->d_name) >=
+            (int)sizeof(child)) {
+            rc = -1;
+            continue;
+        }
+        if (remove_tree(child) != 0) {
+            rc = -1;
+        }
+    }
+    closedir(d);
+    if (rmdir(path) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+/* Resolves `path` to an absolute path without requiring it to exist
+ * (realpath() fails on a file that has not been created yet). Returns 0
+ * on success. */
+static int absolute_path(const char *path, char *out, size_t outsz)
+{
+    if (!path || !*path) {
+        return -1;
+    }
+    if (path[0] == '/') {
+        return (snprintf(out, outsz, "%s", path) < (int)outsz) ? 0 : -1;
+    }
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        return -1;
+    }
+    return (snprintf(out, outsz, "%s/%s", cwd, path) < (int)outsz) ? 0 : -1;
+}
+
 static void shard_key_for(const char *partition, const char *keyspace,
                           char out[33])
 {
@@ -56,6 +160,9 @@ typedef struct {
     int mesh_port;
     int http_port;
     bool online;
+    /* Reachable over the process-wide transport already configured (the
+     * local admin socket), rather than by dialling addr:http_port. */
+    bool local;
 } cluster_node;
 
 static int node_cmp(const void *a, const void *b)
@@ -70,12 +177,15 @@ static int shard_cmp(const void *a, const void *b)
 
 static char *staging_dir_make(const char *out_zip)
 {
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s.staging", out_zip);
-    char cmd[1100];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s'", dir, dir);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "epsilonbkup: cannot create staging dir '%s'\n", dir);
+    char dir[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s.staging", out_zip) >=
+        (int)sizeof(dir)) {
+        fprintf(stderr, "epsilonbkup: output path too long\n");
+        return NULL;
+    }
+    if (remove_tree(dir) != 0 || (mkdir(dir, 0700) != 0 && errno != EEXIST)) {
+        fprintf(stderr, "epsilonbkup: cannot create staging dir '%s': %s\n",
+                dir, strerror(errno));
         return NULL;
     }
     return strdup(dir);
@@ -136,7 +246,7 @@ static int cmd_backup(int argc, char **argv)
     }
 
     /* per-node connectivity: HTTP port (from gossip) + mesh peer port */
-    cluster_node nodes[MAX_NODES];
+    cluster_node nodes[MAX_NODES] = {0};
     size_t nnodes = 0;
     if (!single_node) {
         const cJSON *jnodes =
@@ -180,10 +290,13 @@ static int cmd_backup(int argc, char **argv)
             }
         }
     } else {
-        /* single node: our own HTTP connection */
+        /* single node: reuse whatever transport the tool is already using.
+         * With no -h that is the local admin socket, for which there is no
+         * TCP port; the node must still be treated as reachable. */
         snprintf(nodes[0].id, sizeof(nodes[0].id), "%s",
                  g_host ? g_host : "local");
         nodes[0].http_port = g_host ? g_port : 0;
+        nodes[0].local = true;
         nodes[0].online = true;
         nnodes = 1;
     }
@@ -252,7 +365,8 @@ static int cmd_backup(int argc, char **argv)
         return 1;
     }
     for (size_t n = 0; n < nnodes; n++) {
-        if (!nodes[n].online || nodes[n].http_port <= 0) {
+        if (!nodes[n].online ||
+            (!nodes[n].local && nodes[n].http_port <= 0)) {
             continue;
         }
         int mstatus = 0;
@@ -345,6 +459,13 @@ static int cmd_backup(int argc, char **argv)
 
     if (nshards == 0) {
         printf("no data shards to back up (cluster is empty)\n");
+        remove_tree(staging);
+        cJSON_Delete(cluster);
+        cJSON_Delete(keyspaces);
+        free(names);
+        free(staging);
+        free(shards);
+        return 0;
     }
 
     /* --- fetch each shard from a node that holds it ------------------ */
@@ -371,7 +492,7 @@ static int cmd_backup(int argc, char **argv)
                             nodes[n].id);
                 }
             }
-            if (!got && nodes[n].http_port > 0) {
+            if (!got && (nodes[n].local || nodes[n].http_port > 0)) {
                 const char *saved_host = g_host;
                 int saved_port = g_port;
                 if (!single_node) {
@@ -451,11 +572,27 @@ static int cmd_backup(int argc, char **argv)
         free(mjson);
     }
 
-    /* zip the sqlite files + manifest at the top level */
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && zip -q -r '%s' . >/dev/null 2>&1", staging, out_zip);
-    int zrc = system(cmd);
+    /* zip the sqlite files + manifest at the top level.
+     *
+     * The archive path must be made absolute first: zip runs with the
+     * staging directory as its working directory, so a relative output
+     * name would be created *inside* the staging tree and then destroyed
+     * by the cleanup below, leaving no backup behind while still
+     * reporting success. */
+    char zip_abs[PATH_MAX];
+    if (absolute_path(out_zip, zip_abs, sizeof(zip_abs)) != 0) {
+        fprintf(stderr, "epsilonbkup: cannot resolve output path '%s'\n",
+                out_zip);
+        cJSON_Delete(cluster);
+        cJSON_Delete(keyspaces);
+        free(names);
+        free(staging);
+        free(shards);
+        return 1;
+    }
+    char *zip_argv[] = { (char *)"zip", (char *)"-q", (char *)"-r",
+                         zip_abs, (char *)".", NULL };
+    int zrc = run_argv(staging, zip_argv);
     if (zrc != 0) {
         fprintf(stderr,
                 "epsilonbkup: zip failed (is 'zip' installed?); files are "
@@ -464,14 +601,13 @@ static int cmd_backup(int argc, char **argv)
         cJSON_Delete(keyspaces);
         free(names);
         free(staging);
+        free(shards);
         return 1;
     }
-    printf("backup written to %s (%zu shards, %zu failed)\n", out_zip,
+    printf("backup written to %s (%zu shards, %zu failed)\n", zip_abs,
            ok, failed);
     if (!keep_staging) {
-        char rm[1100];
-        snprintf(rm, sizeof(rm), "rm -rf '%s'", staging);
-        system(rm);
+        remove_tree(staging);
     } else {
         printf("staging files kept in %s\n", staging);
     }
@@ -495,19 +631,30 @@ static int cmd_restore(int argc, char **argv)
     const char *zip_path = argv[0];
 
     /* --- unpack ------------------------------------------------------- */
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s.unpacked", zip_path);
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s' && "
-             "unzip -q -o '%s' -d '%s' >/dev/null 2>&1", dir, dir, zip_path,
-             dir);
-    if (system(cmd) != 0) {
+    char dir[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s.unpacked", zip_path) >=
+        (int)sizeof(dir)) {
+        fprintf(stderr, "epsilonbkup: backup path too long\n");
+        return 1;
+    }
+    if (remove_tree(dir) != 0 || (mkdir(dir, 0700) != 0 && errno != EEXIST)) {
+        fprintf(stderr, "epsilonbkup: cannot create '%s': %s\n", dir,
+                strerror(errno));
+        return 1;
+    }
+    char *unzip_argv[] = { (char *)"unzip", (char *)"-q", (char *)"-o",
+                           (char *)zip_path, (char *)"-d", dir, NULL };
+    if (run_argv(NULL, unzip_argv) != 0) {
         fprintf(stderr, "epsilonbkup: cannot unpack '%s' (is 'unzip' "
                         "installed?)\n", zip_path);
         return 1;
     }
-    char mpath[1100];
-    snprintf(mpath, sizeof(mpath), "%s/manifest.json", dir);
+    char mpath[PATH_MAX];
+    if (snprintf(mpath, sizeof(mpath), "%s/manifest.json", dir) >=
+        (int)sizeof(mpath)) {
+        fprintf(stderr, "epsilonbkup: backup path too long\n");
+        return 1;
+    }
     cJSON *manifest = NULL;
     {
         char *mtext = NULL;
@@ -568,7 +715,7 @@ static int cmd_restore(int argc, char **argv)
     /* --- cluster topology --------------------------------------------- */
     int status = 0;
     cJSON *cluster = http_json("GET", "/admin/cluster", NULL, &status);
-    cluster_node nodes[MAX_NODES];
+    cluster_node nodes[MAX_NODES] = {0};
     size_t nnodes = 0;
     if (cluster && status < 400) {
         const cJSON *jnodes = cJSON_GetObjectItemCaseSensitive(cluster, "nodes");
@@ -719,9 +866,14 @@ static int cmd_restore(int argc, char **argv)
     /* --- push each shard to every online node ------------------------- */
     size_t pushed = 0, push_failed = 0;
     for (size_t i = 0; i < nshards; i++) {
-        char filepath[1100];
-        snprintf(filepath, sizeof(filepath), "%s/%s.sqlite", dir,
-                 shards[i].key);
+        char filepath[PATH_MAX];
+        if (snprintf(filepath, sizeof(filepath), "%s/%s.sqlite", dir,
+                     shards[i].key) >= (int)sizeof(filepath)) {
+            fprintf(stderr, "epsilonbkup: %s path too long\n",
+                    shards[i].key);
+            push_failed++;
+            continue;
+        }
         struct stat st;
         if (stat(filepath, &st) != 0) {
             fprintf(stderr, "epsilonbkup: %s missing from backup\n",
@@ -822,9 +974,7 @@ static int cmd_restore(int argc, char **argv)
         cJSON_Delete(r);
     }
 
-    char rm[1100];
-    snprintf(rm, sizeof(rm), "rm -rf '%s'", dir);
-    system(rm);
+    remove_tree(dir);
     cJSON_Delete(manifest);
     free(shards);
     printf("restore complete: %zu shards pushed, %zu failed, "

@@ -36,7 +36,8 @@
 #include "estp_wire.h"
 #include "epsilon_snap.h"
 
-#define MAX_PEERS_SNAPSHOT 64
+/* MAX_PEERS_SNAPSHOT comes from epsilon_repl_internal.h; it was duplicated
+ * here by the module split. */
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                       */

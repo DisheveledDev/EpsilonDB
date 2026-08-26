@@ -639,6 +639,10 @@ static void leader_react(edb_cluster *cl, bool changed)
     }
     bool target_published =
         am_leader && cl->target_generation != before_target;
+    /* Snapshot the generation while the lock is still held: connection
+     * threads update it from merge_state(), so reading cl->target_generation
+     * after the unlock below is a data race. */
+    long long target_generation = cl->target_generation;
     persist_state(cl);
     pthread_mutex_unlock(&cl->lock);
 
@@ -651,7 +655,7 @@ static void leader_react(edb_cluster *cl, bool changed)
 
     /* stage 6d: once every node reports compliance the leader promotes
      * automatically (the data migration steps happen via 6c catch-up) */
-    if (am_leader && cl->target_generation > 0) {
+    if (am_leader && target_generation > 0) {
         edb_cluster_maybe_promote(cl);
     }
 

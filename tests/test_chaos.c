@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "../vendor/cjson/cJSON.h"
+#include "test_sleep.h"
 
 #ifndef INADDR_LOOPBACK
 #define INADDR_LOOPBACK 0x7f000001UL
@@ -91,7 +92,7 @@ static void stop_node(pid_t pid)
         if (waitpid(pid, NULL, WNOHANG) == pid) {
             return;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
@@ -322,7 +323,7 @@ static bool wait_for(int seconds, bool (*cond)(void *), void *ctx)
         if (cond(ctx)) {
             return true;
         }
-        usleep(200 * 1000);
+        edb_sleep_us(200 * 1000);
     }
     return cond(ctx);
 }
@@ -356,7 +357,7 @@ int main(int argc, char **argv)
         up = http_request(ports[0], "GET", "/status", NULL, NULL,
                           NULL) == 200;
         if (!up) {
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
     }
     CHECK(up);
@@ -381,7 +382,7 @@ int main(int argc, char **argv)
             jup = http_request(ports[i], "GET", "/status", NULL, NULL,
                                NULL) == 200;
             if (!jup) {
-                usleep(100 * 1000);
+                edb_sleep_us(100 * 1000);
             }
         }
         CHECK(jup);

@@ -13,6 +13,7 @@
 #include "../src/engine/epsilon_config.h"
 #include "../src/socket/epsilon_cluster.h"
 #include "../src/socket/epsilon_repl.h"
+#include "test_sleep.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -197,7 +198,7 @@ static bool wait_for(int seconds, bool (*cond)(void *), void *ctx)
         if (cond(ctx)) {
             return true;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
     return cond(ctx);
 }
@@ -207,7 +208,7 @@ static bool wait_for(int seconds, bool (*cond)(void *), void *ctx)
  * before the persistent connection takes over. */
 static void settle(void)
 {
-    usleep(2 * 1000 * 1000);
+    edb_sleep_us(2 * 1000 * 1000);
 }
 
 /* --- condition helpers ---------------------------------------------- */
@@ -290,7 +291,7 @@ int main(void)
             if (both) {
                 break;
             }
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
 
         cJSON *vb = edb_get(b.engine, "main", "kv", "greeting");
@@ -383,7 +384,7 @@ int main(void)
                 replayed = true;
             }
             cJSON_Delete(doc);
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
         CHECK(replayed);
     }
@@ -504,7 +505,7 @@ int main(void)
                 converged_data = true;
             }
             cJSON_Delete(doc);
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
         CHECK(converged_data);
     }

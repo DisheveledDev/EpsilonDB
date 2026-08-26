@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "test_sleep.h"
 
 #ifndef INADDR_LOOPBACK
 #define INADDR_LOOPBACK 0x7f000001UL
@@ -128,7 +129,7 @@ static bool wait_up(int port)
         if (s == 200) {
             return true;
         }
-        usleep(200 * 1000);
+        edb_sleep_us(200 * 1000);
     }
     return false;
 }
@@ -204,7 +205,7 @@ int main(int argc, char **argv)
                    strstr(sb, "\"target_version\":0") != NULL;
         promoted = jok && sok;
         if (!promoted) {
-            usleep(200 * 1000);
+            edb_sleep_us(200 * 1000);
         }
     }
     CHECK(promoted);

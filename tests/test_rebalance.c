@@ -19,6 +19,7 @@
 #include "../src/engine/epsilon_config.h"
 #include "../src/socket/epsilon_cluster.h"
 #include "../src/socket/epsilon_repl.h"
+#include "test_sleep.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -159,14 +160,14 @@ static bool wait_for(int seconds, bool (*cond)(void *), void *ctx)
         if (cond(ctx)) {
             return true;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
     return cond(ctx);
 }
 
 static void settle(void)
 {
-    usleep(3 * 1000 * 1000);
+    edb_sleep_us(3 * 1000 * 1000);
 }
 
 typedef struct {
@@ -294,7 +295,9 @@ int main(void)
         struct stat st;
         CHECK(stat(path, &st) != 0);
         /* the other shard is untouched */
-        CHECK(edb_get(e, "other", "docs", "d-0") != NULL);
+        cJSON *other = edb_get(e, "other", "docs", "d-0");
+        CHECK(other != NULL);
+        cJSON_Delete(other);
 
         edb_engine_close(e);
     }
@@ -334,7 +337,7 @@ int main(void)
         for (int i = 0; i < 100 && !cleared; i++) {
             cleared = edb_cluster_target_generation(a.cluster) == 0;
             if (!cleared) {
-                usleep(100 * 1000);
+                edb_sleep_us(100 * 1000);
             }
         }
         CHECK(cleared);
@@ -368,7 +371,7 @@ int main(void)
         for (int i = 0; i < 100 && !pending; i++) {
             pending = edb_cluster_target_generation(a.cluster) > 0;
             if (!pending) {
-                usleep(100 * 1000);
+                edb_sleep_us(100 * 1000);
             }
         }
         CHECK(pending);

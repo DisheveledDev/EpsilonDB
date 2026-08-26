@@ -14,6 +14,7 @@
 
 #include "../src/engine/epsilon_config.h"
 #include "../src/socket/epsilon_cluster.h"
+#include "test_sleep.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -37,7 +38,7 @@ static void wait_for(int seconds, bool (*cond)(void *), void *ctx)
         if (cond(ctx)) {
             return;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
 }
 
@@ -273,7 +274,7 @@ static void test_two_node_wave_lock_and_promotion(void)
         if (cleared_a && cleared_b) {
             break;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
     CHECK(cleared_a && cleared_b);
 

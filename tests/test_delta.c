@@ -19,6 +19,7 @@
 #include "../src/socket/epsilon_cluster.h"
 #include "../src/socket/epsilon_repl.h"
 #include "../src/socket/epsilon_snap.h"
+#include "test_sleep.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -181,14 +182,14 @@ static bool wait_for(int seconds, bool (*cond)(void *), void *ctx)
         if (cond(ctx)) {
             return true;
         }
-        usleep(100 * 1000);
+        edb_sleep_us(100 * 1000);
     }
     return cond(ctx);
 }
 
 static void settle(void)
 {
-    usleep(3 * 1000 * 1000);
+    edb_sleep_us(3 * 1000 * 1000);
 }
 
 typedef struct {
@@ -371,7 +372,7 @@ int main(void)
     for (int i = 0; i < 100 && !converged; i++) {
         converged = rows_equal(a.engine, d.engine, "main", "kv");
         if (!converged) {
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
     }
     CHECK(converged);
@@ -399,7 +400,7 @@ int main(void)
         other_converged =
             rows_equal(a.engine, d.engine, "other", "docs");
         if (!other_converged) {
-            usleep(100 * 1000);
+            edb_sleep_us(100 * 1000);
         }
     }
     CHECK(other_converged);
