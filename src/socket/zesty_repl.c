@@ -829,7 +829,7 @@ static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
         pthread_mutex_unlock(&rp->replay_lock);
         return;
     }
-    snprintf(rp->replaying, sizeof(rp->replaying), "%s", peer->id);
+    snprintf(rp->replaying, sizeof(rp->replaying), "%.63s", peer->id);
     pthread_mutex_unlock(&rp->replay_lock);
 
     size_t count = 0;

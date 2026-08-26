@@ -1932,7 +1932,8 @@ static bool handle_admin_join(const zdb_http_request *req,
     for (int i = 0; i < 100 && !pending; i++) {
         pending = zdb_cluster_target_generation(g_cluster) > 0;
         if (!pending) {
-            usleep(100 * 1000);
+            struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 * 1000000L };
+            nanosleep(&delay, NULL);
         }
     }
     if (synced && pending && zdb_cluster_needs_sync(g_cluster)) {
