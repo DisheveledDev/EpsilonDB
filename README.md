@@ -173,7 +173,7 @@ EpsilonDB's own footprint small and dependable.
 ## Build
 
 Requires a C11 compiler, POSIX.1-2008 (pthreads). No external
-dependencies: SQLite and cJSON are vendored under `src/sqlite/` and
+dependencies: SQLite and cJSON are vendored under `vendor/sqlite/` and
 `vendor/cjson/`.
 
     make            # builds bin/epsilond, bin/epsilonctl, bin/libepsilon.a
@@ -413,8 +413,8 @@ Directory map:
     src/socket/    ESTP wire codec, cluster mesh, replication, snapshots
     src/httpd/     minimal HTTP/1.1 server (keep-alive, routes, static files)
     src/api/       REST handlers (data ops, sync protocol, admin ops)
-    src/sqlite/    vendored SQLite amalgamation (do not modify)
-    vendor/        vendored cJSON (do not modify)
+    vendor/sqlite/ vendored SQLite amalgamation (do not modify)
+    vendor/cjson/  vendored cJSON (do not modify)
     tests/         plain-assert test harness, run via make test
 
 Design notes inherited from Switchblade:

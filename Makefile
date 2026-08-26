@@ -23,7 +23,7 @@ ifeq ($(STATIC),1)
 endif
 
 # Vendored third-party sources (do not modify; see AGENTS.md)
-VENDOR_SRC = vendor/cjson/cJSON.c src/sqlite/sqlite3.c
+VENDOR_SRC = vendor/cjson/cJSON.c vendor/sqlite/sqlite3.c
 
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
              src/engine/epsilon_crypto.c src/engine/shard.c \
@@ -105,7 +105,7 @@ $(BACKUP_BIN): src/epsilonbkup.c src/epsilonbkup_http.c $(ENGINE_LIB)
 
 # The SQLite amalgamation predates strict C11 system-header interactions on
 # some toolchains; compile it with relaxed flags.
-src/sqlite/sqlite3.o: src/sqlite/sqlite3.c
+vendor/sqlite/sqlite3.o: vendor/sqlite/sqlite3.c
 	$(CC) -std=c11 -w -O2 -c -o $@ $<
 
 # The embedded admin console is a single long string literal; relax the

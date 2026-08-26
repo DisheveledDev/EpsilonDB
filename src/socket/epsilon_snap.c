@@ -35,7 +35,7 @@
 
 #include "../../vendor/cjson/cJSON.h"
 #include "../engine/epsilon_engine.h"
-#include "../sqlite/sqlite3.h"
+#include "../../vendor/sqlite/sqlite3.h"
 #include "estp_wire.h"
 
 #define SNAP_CONNECT_TIMEOUT_MS 1500

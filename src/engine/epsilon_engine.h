@@ -24,7 +24,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "../sqlite/sqlite3.h"
+#include "../../vendor/sqlite/sqlite3.h"
 #include "../../vendor/cjson/cJSON.h"
 
 #define EDB_CLEANUP_INTERVAL_SECONDS 60

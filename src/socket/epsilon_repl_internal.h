@@ -9,7 +9,7 @@
 #include <pthread.h>
 
 #include "epsilon_repl.h"
-#include "../sqlite/sqlite3.h"
+#include "../../vendor/sqlite/sqlite3.h"
 
 #define MAX_PEERS_SNAPSHOT 64
 #define REPL_CONNECT_TIMEOUT_MS 1500
