@@ -232,6 +232,7 @@ int main(int argc, char **argv)
             edb_log_close();
             return 1;
         }
+        edb_cluster_set_http_port(cluster, port);
         edb_log("INFO", "cluster node %s advertising %s:%d (peer port %d)",
              node_id, advertise_addr, peer_port, peer_port);
 

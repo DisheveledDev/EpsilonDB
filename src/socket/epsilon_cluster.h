@@ -38,7 +38,8 @@ typedef struct edb_cluster edb_cluster;
 typedef struct {
     char id[EDB_NODE_ID_MAX];
     char addr[EDB_ADDR_MAX];
-    int port;
+    int port;                 /* mesh peer port */
+    int http_port;            /* client-facing HTTP port (0 = unknown) */
     long long last_seen;      /* epoch seconds, from gossip */
     bool online;              /* mesh connection alive */
     bool removed;             /* tombstoned: permanently out of the cluster
@@ -62,6 +63,10 @@ edb_cluster *edb_cluster_start(edb_config *cfg, const char *advertise_addr,
                                int peer_port, char node_id_out[EDB_NODE_ID_MAX]);
 
 void edb_cluster_stop(edb_cluster *cl);
+
+/* Records this node's client-facing HTTP port so it can be gossiped to
+ * peers (the mesh itself only knows peer ports). 0 clears it. */
+void edb_cluster_set_http_port(edb_cluster *cl, int http_port);
 
 /* Snapshot of the current membership view (including this node). */
 size_t edb_cluster_peers(edb_cluster *cl, edb_peer_info *out, size_t cap);

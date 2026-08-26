@@ -28,12 +28,24 @@ VENDOR_SRC = vendor/cjson/cJSON.c src/sqlite/sqlite3.c
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
              src/engine/epsilon_crypto.c src/engine/shard.c \
              src/engine/manager.c src/engine/epsilon_config.c \
+             src/engine/epsilon_config_entities.c \
+             src/engine/epsilon_config_partitions.c \
              src/engine/epsilon_analytics.c src/engine/epsilon_benchmark.c \
              src/epsilon_log.c
 ENGINE_OBJ = $(ENGINE_SRC:.c=.o) $(VENDOR_SRC:.c=.o)
 ENGINE_LIB = bin/libepsilon.a
 SERVER_BIN = bin/epsilond
 CLI_BIN = bin/epsilonctl
+BACKUP_BIN = bin/epsilonbkup
+BENCH_BIN = bin/epsilonbench
+
+# cluster module (mesh core + wire codec + rebalancing)
+CLUSTER_SRC = src/socket/epsilon_cluster.c src/socket/estp_wire.c \
+              src/socket/epsilon_cluster_rebalance.c
+
+# replication module (core + persisted change cache + quorum reads)
+REPL_SRC = src/socket/epsilon_repl.c src/socket/epsilon_repl_cache.c \
+           src/socket/epsilon_repl_read.c
 
 TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \
            tests/test_http.c tests/test_replication.c \
@@ -47,28 +59,46 @@ TEST_BINS = tests/test_crypto tests/test_engine tests/test_config \
             tests/test_console
 .PHONY: all test clean
 
-all: $(SERVER_BIN) $(CLI_BIN)
+all: $(SERVER_BIN) $(CLI_BIN) $(BACKUP_BIN) $(BENCH_BIN)
 $(ENGINE_LIB): $(ENGINE_OBJ)
 	@mkdir -p bin
 	ar rcs $@ $^
 
-$(SERVER_BIN): src/epsilond.c src/api/epsilon_api.c src/httpd/epsilon_http.c \
-               src/socket/epsilon_cluster.c src/socket/epsilon_repl.c \
+API_SRC = src/api/epsilon_api.c src/api/epsilon_api_data.c \
+          src/api/epsilon_api_admin.c src/api/epsilon_api_cluster.c \
+          src/api/epsilon_api_settings.c src/api/epsilon_api_console.c
+
+$(SERVER_BIN): src/epsilond.c $(API_SRC) src/httpd/epsilon_http.c \
+               $(CLUSTER_SRC) $(REPL_SRC) \
                src/socket/epsilon_snap.c src/admin/admin_console.o \
                $(ENGINE_LIB)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ src/epsilond.c src/api/epsilon_api.c \
-		src/httpd/epsilon_http.c src/socket/epsilon_cluster.c \
-		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+	$(CC) $(CFLAGS) -o $@ src/epsilond.c $(API_SRC) \
+		src/httpd/epsilon_http.c $(CLUSTER_SRC) \
+		$(REPL_SRC) src/socket/epsilon_snap.c \
 		src/admin/admin_console.o \
 		$(ENGINE_SRC:.c=.o) \
 		$(filter %.o,$(VENDOR_SRC:.c=.o)) $(LDFLAGS) $(STATIC_LDFLAGS) \
 		$(LDLIBS) $(STATIC_LDLIBS)
 
-$(CLI_BIN): src/epsilonctl.c vendor/cjson/cJSON.c
+CTL_SRC = src/epsilonctl.c src/epsilonctl_tui.c src/epsilonctl_install.c
+
+$(CLI_BIN): $(CTL_SRC) vendor/cjson/cJSON.c
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ src/epsilonctl.c vendor/cjson/cJSON.c \
+	$(CC) $(CFLAGS) -o $@ $(CTL_SRC) vendor/cjson/cJSON.c \
 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
+
+$(BENCH_BIN): src/epsilonbench.c vendor/cjson/cJSON.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ src/epsilonbench.c vendor/cjson/cJSON.c \
+		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
+
+$(BACKUP_BIN): src/epsilonbkup.c src/epsilonbkup_http.c $(ENGINE_LIB)
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ src/epsilonbkup.c src/epsilonbkup_http.c \
+		$(CLUSTER_SRC) src/socket/epsilon_snap.c \
+		-Lbin -lepsilon $(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) \
+		$(STATIC_LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -109,35 +139,35 @@ tests/test_console: tests/test_console.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 tests/test_cluster: tests/test_cluster.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
 		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_replication: tests/test_replication.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
-		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
+		$(REPL_SRC) src/socket/epsilon_snap.c \
 		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_structure: tests/test_structure.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
 		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_snapshot: tests/test_snapshot.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
 		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_delta: tests/test_delta.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
-		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
+		$(REPL_SRC) src/socket/epsilon_snap.c \
 		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_rebalance: tests/test_rebalance.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
-		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
+		$(REPL_SRC) src/socket/epsilon_snap.c \
 		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_join: tests/test_join.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
-		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+	$(CC) $(CFLAGS) -o $@ $< $(CLUSTER_SRC) \
+		$(REPL_SRC) src/socket/epsilon_snap.c \
 		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_chaos: tests/test_chaos.c $(ENGINE_LIB)

@@ -66,13 +66,18 @@ watch it perform as you grow it.
   when every node complies the leader promotes the new structure and old
   owners garbage-collect redundant shards one at a time. Only one node
   joins at a time (leader-held global rebalance lock).
+- **Backup & restore** (`bin/epsilonbkup`): download every shard from the
+  cluster as consistent SQLite snapshots and pack them into a zip;
+  restore locks the cluster, wipes the shards and pushes the backup back
+  onto every node. Config shards (auth, ranges, settings) are preserved,
+  so the topology and users survive a restore.
 - **Workload analytics**: every node records reads, writes, updates and
   deletes per shard plus latency, flushes a single snapshot into the system
   store every 10s (30-minute TTL, self-cleaning), and the whole cluster view
   is available from any node. Slow operations are keyed by
   partition/keyspace (and filter key for queries) - filter *values* are
   never recorded.
-- **Performance benchmark**: `epsilonctl bench` or the admin console creates a
+- **Performance benchmark**: `bin/epsilonbench` or the admin console creates a
   throwaway database and 10 partitions, times writes/gets/filtered
   queries/updates/deletes, reports ops/sec, and deletes it all afterwards.
   Partitions are spread across worker threads (one per partition by
@@ -228,6 +233,37 @@ the new parameters to the running server as settings (`server.bind`,
 `server.data_dir`, `server.log_path`) — restart the service afterwards so
 they take effect.
 
+## Backup and restore
+
+`bin/epsilonbkup` backs up the whole cluster (or a single node) into a zip
+file and restores it. It talks to one node over HTTP and to the cluster
+mesh for the data itself:
+
+    bin/epsilonbkup -h <host> -p <port> -u <user> backup -o backup.zip
+    bin/epsilonbkup -h <host> -p <port> -u <user> restore backup.zip
+
+Backup downloads every data shard as a transactionally consistent SQLite
+snapshot (the same online-backup path used for rebalancing), skips the
+reserved config shards, and packs the files with a `manifest.json` that
+maps each shard back to its partition/keyspace. Without `-h` the tool
+talks to the local admin socket, which suits a single-node deployment.
+
+Restore is the destructive counterpart, so it is careful:
+
+1. **Lock**: every online node is told to quiesce — data reads and writes
+   answer `503 restore in progress` until the unlock.
+2. **Wipe**: each node deletes its non-config shard files (auth, ranges,
+   settings, and the keyspace registry are kept, so the topology and users
+   survive).
+3. **Push**: each backed-up shard is uploaded in 8 MB chunks to every
+   online node (matching the cluster's fan-out replication), integrity-
+   checked with SQLite before it is renamed into place.
+4. **Unlock**: data operations resume.
+
+If any node is offline at restore time it is skipped with a warning, and
+the tool refuses to start unless at least one node could be locked.
+Requires `zip`/`unzip` on the PATH.
+
 ## Admin console
 
 The embedded Bootstrap web console is served at `/admin` straight from the
@@ -262,12 +298,14 @@ through the system store, so any node can show the whole cluster's metrics:
 - `GET /admin/analytics` (or the Analytics tab) aggregates per-node
   snapshots into reads/writes/updates/deletes per partition/keyspace,
   slowest operations with latency, and the pending-replication backlog.
-- `epsilonctl bench [records] [rf] [cache_size] [journal_mode] [threads]`
-  runs the throwaway benchmark and prints writes/s, gets/s, queries/s,
-  updates/s and deletes/s. The optional trailing `threads` argument
-  controls how many worker threads the partitions are spread across
-  (0 = one thread per partition); the reported count in the result
-  reflects the threads actually used.
+- `epsilonbench [records] [rf] [cache_size] [journal_mode] [threads]`
+  runs the throwaway benchmark (against a running server, over the local
+  admin socket or `-h/-p/-u` for a remote node; `--json` dumps the raw
+  report) and prints writes/s, gets/s, queries/s, updates/s and deletes/s.
+  The optional trailing `threads` argument controls how many worker
+  threads the partitions are spread across (0 = one thread per
+  partition); the reported count in the result reflects the threads
+  actually used.
 
 Snapshots are refreshed every 10 seconds and carry a 30-minute TTL, so a
 departed node simply ages out of the picture.
@@ -302,7 +340,7 @@ Or with the CLI (talks to the local admin socket):
       --filter '{"key":"age","operator":"gte","value":18}'
     bin/epsilonctl list databases|groups|users|partitions|settings|nodes
     bin/epsilonctl cluster
-    bin/epsilonctl bench 100000 1 2048 TRUNCATE 10
+    bin/epsilonbench 100000 1 2048 TRUNCATE 10
 
 ## JSON filters
 

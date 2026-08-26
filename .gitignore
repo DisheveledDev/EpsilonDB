@@ -19,3 +19,6 @@ tests/test_rebalance
 tests/test_replication
 tests/test_snapshot
 tests/test_structure
+libepsilon.a
+epsilonbkup
+epsilonbench
