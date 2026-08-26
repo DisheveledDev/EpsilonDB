@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "../vendor/cjson/cJSON.h"
+#include "epsilon_banner.h"
 
 #define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
 
@@ -363,6 +364,12 @@ static void print_usage(void)
 
 int main(int argc, char **argv)
 {
+    /* shared EpsilonDB banner */
+    for (int i = 0; i < EDB_BANNER_LINES; i++) {
+        printf("%s\n", edb_banner[i]);
+    }
+    printf("        performance benchmark client\n\n");
+
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' &&
            strcmp(argv[argi], "-") != 0) {

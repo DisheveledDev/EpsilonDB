@@ -16,23 +16,16 @@
 #include <unistd.h>
 
 #include "../vendor/cjson/cJSON.h"
+#include "epsilon_banner.h"
 #include "epsilonctl_internal.h"
 
 #ifndef SIGWINCH
 #define SIGWINCH 28
 #endif
 
-#define ZTUI_ART_LINES 8
-static const char *g_art[ZTUI_ART_LINES] = {
-    "  ______         _         _____  ____  ",
-    " |___  /        | |       |  __ \\|  _ \\ ",
-    "    / / ___  ___| |_ _   _| |  | | |_) |",
-    "   / / / _ \\/ __| __| | | | |  | |  _ < ",
-    "  / /_|  __/\\__ \\ |_| |_| | |__| | |_) |",
-    " /_____\\___||___/\\__|\\__, |_____/|____/ ",
-    "                      __/ |             ",
-    "                     |___/             ",
-};
+/* the shared EpsilonDB banner (same art as the server) */
+#define ZTUI_ART_LINES EDB_BANNER_LINES
+static const char *const *g_art = edb_banner;
 
 
 void sb_push(scrollback *sb, const char *text)

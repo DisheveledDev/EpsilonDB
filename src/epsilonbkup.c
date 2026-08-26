@@ -17,6 +17,7 @@
 #include "engine/md5.h"
 #include "socket/epsilon_cluster.h"
 #include "socket/epsilon_snap.h"
+#include "epsilon_banner.h"
 #include "epsilonbkup_internal.h"
 
 #define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
@@ -845,7 +846,12 @@ static void print_usage(void)
 
 int main(int argc, char **argv)
 {
-    int argi = 1;
+    /* shared EpsilonDB banner */
+    for (int i = 0; i < EDB_BANNER_LINES; i++) {
+        printf("%s\n", edb_banner[i]);
+    }
+    printf("        backup and restore tool\n\n");
+int argi = 1;
     while (argi < argc && argv[argi][0] == '-' &&
            strcmp(argv[argi], "-") != 0) {
         if ((strcmp(argv[argi], "-s") == 0 ||

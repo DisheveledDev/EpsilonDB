@@ -22,6 +22,7 @@
 #include "admin/admin_console.h"
 #include "api/epsilon_api.h"
 #include "engine/epsilon_config.h"
+#include "epsilon_banner.h"
 #include "httpd/epsilon_http.h"
 #include "socket/epsilon_cluster.h"
 #include "epsilon_log.h"
@@ -58,14 +59,9 @@ static void print_banner(void)
     const char *r = use_colour() ? C_RESET : "";
 
     printf("%s%s", b, g);
-    printf("  ______           _ _             _____  ____  \n");
-    printf(" |  ____|         (_) |           |  __ \\|  _ \\ \n");
-    printf(" | |__   _ __  ___ _| | ___  _ __ | |  | | |_) |\n");
-    printf(" |  __| | '_ \\/ __| | |/ _ \\| '_ \\| |  | |  _ < \n");
-    printf(" | |____| |_) \\__ \\ | | (_) | | | | |__| | |_) |\n");
-    printf(" |______| .__/|___/_|_|\\___/|_| |_|_____/|____/ \n");
-    printf("        | |                                     \n");
-    printf("        |_|                                     \n");
+    for (int i = 0; i < EDB_BANNER_LINES; i++) {
+        printf("%s\n", edb_banner[i]);
+    }
     printf("%s%s", y, r);
     printf("        distributed key/value database server\n");
     printf("%s", r);
