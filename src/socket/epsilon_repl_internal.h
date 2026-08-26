@@ -68,8 +68,9 @@ bool ack_ok(const char *reply);
 int replication_factor(edb_repl *rp, const char *db);
 size_t holder_ids(edb_repl *rp, const char *partition,
                   const char *keyspace, int rf,
-                  char (*out)[EDB_NODE_ID_MAX]);
-bool id_in_holders(const char *id, char (*holders)[EDB_NODE_ID_MAX],
+                  char out[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX]);
+bool id_in_holders(const char *id,
+                   char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX],
                    size_t n);
 bool find_peer(edb_repl *rp, const char *node_id, edb_peer_info *out);
 bool apply_change_local(edb_repl *rp, const cJSON *change);

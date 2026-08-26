@@ -75,9 +75,13 @@ static void node_stop(snap_node *n)
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
-static volatile sig_atomic_t g_serve_run = 1;
+/* Accessed from the serving thread and the main thread; `volatile` alone
+ * does not provide inter-thread ordering, so use a C11 atomic (flagged as a
+ * data race by ThreadSanitizer otherwise). */
+static atomic_int g_serve_run = 1;
 
 #include <signal.h>
 

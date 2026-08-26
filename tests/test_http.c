@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "test_sleep.h"
 
 #ifndef INADDR_LOOPBACK
 #define INADDR_LOOPBACK 0x7f000001UL
@@ -143,7 +144,7 @@ int main(int argc, char **argv)
     /* wait for the server to accept connections */
     bool up = false;
     for (int i = 0; i < 50 && !up; i++) {
-        usleep(100000);
+        edb_sleep_us(100000);
         int s = http_request("GET", "/status", NULL, NULL, NULL);
         up = (s == 200);
     }
