@@ -1,6 +1,6 @@
 /* test_chaos.c - stage 7: multi-node chaos/failure integration test.
  *
- * Spawns three real zestyd processes (fork/exec), joins them into one
+ * Spawns three real epsilond processes (fork/exec), joins them into one
  * cluster through the HTTP admin API and then fails nodes with SIGKILL
  * (no clean shutdown) while the cluster is under write load:
  *
@@ -70,7 +70,7 @@ static pid_t spawn_node(const char *dir, int http_port, int peer_port)
             !freopen(log, "a", stderr)) {
             _exit(127);
         }
-        execl("./bin/zestyd", "zestyd", "-p", hp, "-n", pp, "-d", dir,
+        execl("./bin/epsilond", "epsilond", "-p", hp, "-n", pp, "-d", dir,
               "-s", sock, (char *)NULL);
         _exit(127);
     }

@@ -1,6 +1,6 @@
-/* zesty_cluster.c - stage 4 cluster mesh implementation.
+/* epsilon_cluster.c - stage 4 cluster mesh implementation.
  *
- * Wire protocol (ZSTP):
+ * Wire protocol (ESTP):
  *   offset 0: magic 'Z''S''T''P'
  *   offset 4: version byte (1)
  *   offset 5: message type byte
@@ -8,8 +8,8 @@
  *   offset 10: JSON payload
  *
  * Message types:
- *   ZSTP_HELLO {node_id, addr, port}   first frame on any connection
- *   ZSTP_STATE {sender, nodes:[{id,addr,port,last_seen}],
+ *   ESTP_HELLO {node_id, addr, port}   first frame on any connection
+ *   ESTP_STATE {sender, nodes:[{id,addr,port,last_seen}],
  *                       ranges:{generation, assignments:[...]}}
  *
  * Both ends send HELLO immediately after connect, then gossip their full
@@ -23,9 +23,9 @@
  * other record and replicate with the same machinery later.
  */
 
-#include "zesty_cluster.h"
-#include "zesty_snap.h"
-#include "zstp_wire.h"
+#include "epsilon_cluster.h"
+#include "epsilon_snap.h"
+#include "estp_wire.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -45,7 +45,7 @@
 
 #include "../engine/md5.h"
 #include "../engine/random.h"
-#include "../engine/zesty_crypto.h"
+#include "../engine/epsilon_crypto.h"
 #include "../../vendor/cjson/cJSON.h"
 
 #define HEARTBEAT_SECONDS     3
@@ -94,9 +94,9 @@ static void set_socket_timeouts(int fd, int ms)
 typedef struct peer_conn {
     int fd;
     bool outbound;                  /* we dialled them */
-    char node_id[ZDB_NODE_ID_MAX];  /* known after HELLO exchange */
+    char node_id[EDB_NODE_ID_MAX];  /* known after HELLO exchange */
     long long last_recv;
-    struct zdb_cluster *owner;
+    struct edb_cluster *owner;
     struct peer_conn *next;
     /* lifecycle: the reader thread holds one reference. A thread that
      * wants to write on this socket takes another reference under
@@ -106,11 +106,11 @@ typedef struct peer_conn {
     bool dead;
 } peer_conn;
 
-struct zdb_cluster {
-    zdb_config *cfg;
+struct edb_cluster {
+    edb_config *cfg;
 
-    char self_id[ZDB_NODE_ID_MAX];
-    char self_addr[ZDB_ADDR_MAX];
+    char self_id[EDB_NODE_ID_MAX];
+    char self_addr[EDB_ADDR_MAX];
     int self_port;
 
     int listen_fd;
@@ -122,19 +122,19 @@ struct zdb_cluster {
     peer_conn *pending_conns;
     peer_conn *conns;
 
-    zdb_peer_info *peers;           /* includes self */
+    edb_peer_info *peers;           /* includes self */
     size_t npeers;
     size_t peers_cap;
 
     long long generation;
     long long gc_after;
-    zdb_range_info *ranges;
+    edb_range_info *ranges;
     size_t nranges;
     size_t ranges_cap;
 
     /* stage 6: pending target structure (generation 0 = none pending) */
     long long target_generation;
-    zdb_range_info *target_ranges;
+    edb_range_info *target_ranges;
     size_t ntarget_ranges;
     size_t target_ranges_cap;
 
@@ -144,9 +144,9 @@ struct zdb_cluster {
      * node cannot mark itself compliant before its data lands. */
     bool auto_compliant;
 
-    char leader[ZDB_NODE_ID_MAX];
+    char leader[EDB_NODE_ID_MAX];
 
-    zstp_dispatch_fn dispatch;      /* per-cluster REPL/QUERY handler */
+    estp_dispatch_fn dispatch;      /* per-cluster REPL/QUERY handler */
     void *dispatch_ctx;
     size_t dispatch_inflight;
 
@@ -155,7 +155,7 @@ struct zdb_cluster {
     pthread_t maintainer_thread;
 };
 
-static bool leader_is_self_locked(const zdb_cluster *cl)
+static bool leader_is_self_locked(const edb_cluster *cl)
 {
     return cl->leader[0] && strcmp(cl->leader, cl->self_id) == 0;
 }
@@ -163,7 +163,7 @@ static bool leader_is_self_locked(const zdb_cluster *cl)
 /* ------------------------------------------------------------------ */
 /* wire codec                                                          */
 
-static zstp_dispatch_fn g_dispatcher;
+static estp_dispatch_fn g_dispatcher;
 static void *g_dispatcher_ctx;
 static pthread_mutex_t g_dispatch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dispatch_done = PTHREAD_COND_INITIALIZER;
@@ -203,12 +203,12 @@ static int read_full(int fd, void *buf, size_t len)
     return 0;
 }
 
-bool zstp_type_valid(int type)
+bool estp_type_valid(int type)
 {
-    return type >= ZSTP_HELLO && type <= ZSTP_VOID;
+    return type >= ESTP_HELLO && type <= ESTP_VOID;
 }
 
-void zstp_set_dispatcher(zstp_dispatch_fn fn, void *ctx)
+void estp_set_dispatcher(estp_dispatch_fn fn, void *ctx)
 {
     pthread_mutex_lock(&g_dispatch_lock);
     g_dispatcher = NULL;
@@ -231,7 +231,7 @@ static struct {
 } g_mesh_key;
 static pthread_mutex_t g_mesh_key_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void zstp_set_mesh_key(const uint8_t enc_key[32], const uint8_t mac_key[32])
+void estp_set_mesh_key(const uint8_t enc_key[32], const uint8_t mac_key[32])
 {
     pthread_mutex_lock(&g_mesh_key_lock);
     if (enc_key && mac_key) {
@@ -259,18 +259,18 @@ static bool mesh_key_snapshot(uint8_t enc_key[32], uint8_t mac_key[32])
     return active;
 }
 
-int zstp_send_frame_raw(int fd, zstp_type type, const void *data, size_t len,
+int estp_send_frame_raw(int fd, estp_type type, const void *data, size_t len,
                         void *send_lock)
 {
-    if (!zstp_type_valid((int)type) || len > ZSTP_MAX_PAYLOAD) {
+    if (!estp_type_valid((int)type) || len > ESTP_MAX_PAYLOAD) {
         return -1;
     }
-    unsigned char hdr[ZSTP_HEADER_SIZE];
+    unsigned char hdr[ESTP_HEADER_SIZE];
     hdr[0] = 'Z';
     hdr[1] = 'S';
     hdr[2] = 'T';
     hdr[3] = 'P';
-    hdr[4] = ZSTP_VERSION;
+    hdr[4] = ESTP_VERSION;
     hdr[5] = (unsigned char)type;
 
     uint8_t enc_key[32];
@@ -282,14 +282,14 @@ int zstp_send_frame_raw(int fd, zstp_type type, const void *data, size_t len,
     uint8_t *body = NULL;
     size_t body_len = len;
     if (encrypted) {
-        uint8_t nonce[ZDB_NONCE_LEN];
-        zdb_random_bytes(nonce, sizeof(nonce));
-        body_len = ZDB_NONCE_LEN + len + ZDB_TAG_LEN;
+        uint8_t nonce[EDB_NONCE_LEN];
+        edb_random_bytes(nonce, sizeof(nonce));
+        body_len = EDB_NONCE_LEN + len + EDB_TAG_LEN;
         body = malloc(body_len ? body_len : 1);
         if (!body) {
             return -1;
         }
-        if (zdb_aead_seal(enc_key, mac_key, nonce, hdr + 4, 2,
+        if (edb_aead_seal(enc_key, mac_key, nonce, hdr + 4, 2,
                           (const uint8_t *)data, len, body, body_len) != 0) {
             free(body);
             return -1;
@@ -318,32 +318,32 @@ int zstp_send_frame_raw(int fd, zstp_type type, const void *data, size_t len,
     return rc;
 }
 
-int zstp_send_frame(int fd, zstp_type type, const char *json,
+int estp_send_frame(int fd, estp_type type, const char *json,
                     void *send_lock)
 {
-    return zstp_send_frame_raw(fd, type, json, json ? strlen(json) : 0,
+    return estp_send_frame_raw(fd, type, json, json ? strlen(json) : 0,
                                send_lock);
 }
 
-int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
+int estp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
 {
     *payload_out = NULL;
     if (plen_out) {
         *plen_out = 0;
     }
-    unsigned char hdr[ZSTP_HEADER_SIZE];
+    unsigned char hdr[ESTP_HEADER_SIZE];
     if (read_full(fd, hdr, sizeof(hdr)) != 0) {
         return -1;
     }
     if (hdr[0] != 'Z' || hdr[1] != 'S' || hdr[2] != 'T' ||
-        hdr[3] != 'P' || hdr[4] != ZSTP_VERSION ||
-        !zstp_type_valid(hdr[5])) {
+        hdr[3] != 'P' || hdr[4] != ESTP_VERSION ||
+        !estp_type_valid(hdr[5])) {
         return -1;
     }
     uint32_t be;
     memcpy(&be, hdr + 6, 4);
     uint32_t body_len = ntohl(be);
-    if (body_len > ZSTP_MAX_PAYLOAD + ZDB_NONCE_LEN + ZDB_TAG_LEN) {
+    if (body_len > ESTP_MAX_PAYLOAD + EDB_NONCE_LEN + EDB_TAG_LEN) {
         return -1;
     }
 
@@ -366,17 +366,17 @@ int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
     char *payload = NULL;
     uint32_t plen = body_len;
     if (encrypted) {
-        if (body_len < ZDB_NONCE_LEN + ZDB_TAG_LEN) {
+        if (body_len < EDB_NONCE_LEN + EDB_TAG_LEN) {
             free(body);
             return -1;
         }
-        plen = body_len - ZDB_NONCE_LEN - ZDB_TAG_LEN;
+        plen = body_len - EDB_NONCE_LEN - EDB_TAG_LEN;
         payload = malloc((size_t)plen + 1);
         if (!payload) {
             free(body);
             return -1;
         }
-        if (zdb_aead_open(enc_key, mac_key, hdr + 4, 2, body, body_len,
+        if (edb_aead_open(enc_key, mac_key, hdr + 4, 2, body, body_len,
                           (uint8_t *)payload, plen) < 0) {
             free(payload);
             free(body);
@@ -404,12 +404,12 @@ int zstp_recv_frame_raw(int fd, char **payload_out, uint32_t *plen_out)
     return hdr[5];
 }
 
-int zstp_recv_frame(int fd, char **payload_out)
+int estp_recv_frame(int fd, char **payload_out)
 {
-    return zstp_recv_frame_raw(fd, payload_out, NULL);
+    return estp_recv_frame_raw(fd, payload_out, NULL);
 }
 
-int zstp_dial(const char *addr, int port)
+int estp_dial(const char *addr, int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -455,21 +455,21 @@ int zstp_dial(const char *addr, int port)
     return fd;
 }
 
-static int zstp_send(int fd, zstp_type type, const char *json,
+static int estp_send(int fd, estp_type type, const char *json,
                      pthread_mutex_t *send_lock)
 {
-    return zstp_send_frame(fd, type, json, send_lock);
+    return estp_send_frame(fd, type, json, send_lock);
 }
 
-static int zstp_recv(int fd, char **payload_out)
+static int estp_recv(int fd, char **payload_out)
 {
-    return zstp_recv_frame(fd, payload_out);
+    return estp_recv_frame(fd, payload_out);
 }
 
 /* ------------------------------------------------------------------ */
 /* state serialisation                                                 */
 
-static cJSON *state_to_json(const zdb_cluster *cl)
+static cJSON *state_to_json(const edb_cluster *cl)
 {
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
@@ -530,7 +530,7 @@ static cJSON *state_to_json(const zdb_cluster *cl)
 
 /* Merges gossiped state into our view. Returns true when anything
  * changed. Caller holds cl->lock. */
-static bool merge_state(zdb_cluster *cl, const cJSON *doc)
+static bool merge_state(edb_cluster *cl, const cJSON *doc)
 {
     bool changed = false;
 
@@ -557,7 +557,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                 cJSON_GetObjectItemCaseSensitive(item, "removed");
             if (!cJSON_IsString(jid) || !jid->valuestring ||
                 !*jid->valuestring ||
-                strlen(jid->valuestring) >= ZDB_NODE_ID_MAX) {
+                strlen(jid->valuestring) >= EDB_NODE_ID_MAX) {
                 continue;
             }
             long long seen = cJSON_IsNumber(jseen)
@@ -567,7 +567,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                                       ? (long long)jcompliant->valuedouble
                                       : 0;
 
-            zdb_peer_info *mine = NULL;
+            edb_peer_info *mine = NULL;
             for (size_t i = 0; i < cl->npeers; i++) {
                 if (strcmp(cl->peers[i].id, jid->valuestring) == 0) {
                     mine = &cl->peers[i];
@@ -581,7 +581,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                 }
                 if (cl->npeers == cl->peers_cap) {
                     size_t cap = cl->peers_cap ? cl->peers_cap * 2 : 8;
-                    zdb_peer_info *grown =
+                    edb_peer_info *grown =
                         realloc(cl->peers, cap * sizeof(*grown));
                     if (!grown) {
                         continue;
@@ -599,7 +599,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
             /* never let gossip overwrite our own address/port */
             bool selfish = strcmp(mine->id, cl->self_id) == 0;
             if (!selfish && cJSON_IsString(jaddr) && jaddr->valuestring &&
-                strlen(jaddr->valuestring) < ZDB_ADDR_MAX &&
+                strlen(jaddr->valuestring) < EDB_ADDR_MAX &&
                 strcmp(mine->addr, jaddr->valuestring) != 0) {
                 snprintf(mine->addr, sizeof(mine->addr), "%s",
                          jaddr->valuestring);
@@ -647,7 +647,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                     n++;
                 }
                 if (n > cl->ranges_cap) {
-                    zdb_range_info *grown =
+                    edb_range_info *grown =
                         realloc(cl->ranges, n * sizeof(*grown));
                     if (grown) {
                         cl->ranges = grown;
@@ -715,7 +715,7 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                     n++;
                 }
                 if (n > cl->target_ranges_cap) {
-                    zdb_range_info *grown =
+                    edb_range_info *grown =
                         realloc(cl->target_ranges, n * sizeof(*grown));
                     if (grown) {
                         cl->target_ranges = grown;
@@ -783,14 +783,14 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
 #define SETTING_LOCK    "cluster.rebalance_lock"
 #define SETTING_DONE_PREFIX "rebalance.done."
 
-static void persist_state(zdb_cluster *cl)
+static void persist_state(edb_cluster *cl)
 {
     /* caller holds no locks beyond cl->lock */
     cJSON *doc = state_to_json(cl);
     if (doc) {
         char *json = cJSON_PrintUnformatted(doc);
         if (json) {
-            zdb_setting_set(cl->cfg, SETTING_MEMBERS, json);
+            edb_setting_set(cl->cfg, SETTING_MEMBERS, json);
             free(json);
         }
         cJSON_Delete(doc);
@@ -798,7 +798,7 @@ static void persist_state(zdb_cluster *cl)
     char rjson[128];
     snprintf(rjson, sizeof(rjson), "{\"generation\":%lld}",
              cl->generation);
-    zdb_setting_set(cl->cfg, SETTING_RANGES, rjson);
+    edb_setting_set(cl->cfg, SETTING_RANGES, rjson);
 
     if (cl->target_generation > 0) {
         cJSON *t = cJSON_CreateObject();
@@ -818,18 +818,18 @@ static void persist_state(zdb_cluster *cl)
             char *tjson = cJSON_PrintUnformatted(t);
             cJSON_Delete(t);
             if (tjson) {
-                zdb_setting_set(cl->cfg, SETTING_TARGET, tjson);
+                edb_setting_set(cl->cfg, SETTING_TARGET, tjson);
                 free(tjson);
             }
         }
     } else {
-        zdb_setting_delete(cl->cfg, SETTING_TARGET);
+        edb_setting_delete(cl->cfg, SETTING_TARGET);
     }
 }
 
-static void restore_state(zdb_cluster *cl)
+static void restore_state(edb_cluster *cl)
 {
-    char *members = zdb_setting_get(cl->cfg, SETTING_MEMBERS);
+    char *members = edb_setting_get(cl->cfg, SETTING_MEMBERS);
     if (members) {
         cJSON *doc = cJSON_Parse(members);
         if (doc) {
@@ -840,7 +840,7 @@ static void restore_state(zdb_cluster *cl)
         }
         free(members);
     }
-    char *rjson = zdb_setting_get(cl->cfg, SETTING_RANGES);
+    char *rjson = edb_setting_get(cl->cfg, SETTING_RANGES);
     if (rjson) {
         cJSON *doc = cJSON_Parse(rjson);
         if (doc) {
@@ -856,7 +856,7 @@ static void restore_state(zdb_cluster *cl)
         free(rjson);
     }
     /* restore a pending target so a restarted node resumes the wave */
-    char *tjson = zdb_setting_get(cl->cfg, SETTING_TARGET);
+    char *tjson = edb_setting_get(cl->cfg, SETTING_TARGET);
     if (tjson) {
         cJSON *doc = cJSON_Parse(tjson);
         if (doc) {
@@ -873,11 +873,11 @@ static void restore_state(zdb_cluster *cl)
 /* election + placement                                                */
 
 /* Caller holds cl->lock. */
-static bool is_online_view(const zdb_cluster *cl, const char *id);
+static bool is_online_view(const edb_cluster *cl, const char *id);
 
 /* Recompute leader = lexicographically smallest online node id.
  * Caller holds cl->lock. */
-static void recompute_leader(zdb_cluster *cl)
+static void recompute_leader(edb_cluster *cl)
 {
     const char *best = NULL;
     for (size_t i = 0; i < cl->npeers; i++) {
@@ -900,7 +900,7 @@ static void recompute_leader(zdb_cluster *cl)
 }
 
 /* Caller holds cl->lock. */
-static bool is_online_view(const zdb_cluster *cl, const char *id)
+static bool is_online_view(const edb_cluster *cl, const char *id)
 {
     if (strcmp(id, cl->self_id) == 0) {
         return true;
@@ -918,7 +918,7 @@ static bool is_online_view(const zdb_cluster *cl, const char *id)
  * Caller holds cl->lock. out/out_cap must be large enough or NULL to
  * just count. */
 static size_t build_slices(const char **ids, size_t n,
-                           zdb_range_info *out, size_t out_cap)
+                           edb_range_info *out, size_t out_cap)
 {
     uint64_t step = n ? 0x100000000ULL / n : 0;
     for (size_t i = 0; i < n; i++) {
@@ -950,7 +950,7 @@ static size_t build_slices(const char **ids, size_t n,
  * when membership grew (or otherwise diverged from live owners). The
  * live table keeps serving until every node reports compliance.
  * Caller holds cl->lock. Returns true when a new target was published. */
-static bool publish_target_locked(zdb_cluster *cl)
+static bool publish_target_locked(edb_cluster *cl)
 {
     const char *ids[MAX_PEERS];
     size_t n = 0;
@@ -1004,7 +1004,7 @@ static bool publish_target_locked(zdb_cluster *cl)
     }
 
     if (n > cl->target_ranges_cap) {
-        zdb_range_info *grown =
+        edb_range_info *grown =
             realloc(cl->target_ranges, n * sizeof(*grown));
         if (!grown) {
             return false;
@@ -1023,13 +1023,13 @@ static bool publish_target_locked(zdb_cluster *cl)
 }
 
 /* Leader-only: promote pending target to live. Caller holds cl->lock. */
-static void promote_target_locked(zdb_cluster *cl)
+static void promote_target_locked(edb_cluster *cl)
 {
     if (cl->target_generation == 0 || cl->ntarget_ranges == 0) {
         return;
     }
     if (cl->ntarget_ranges > cl->ranges_cap) {
-        zdb_range_info *grown = realloc(
+        edb_range_info *grown = realloc(
             cl->ranges, cl->ntarget_ranges * sizeof(*grown));
         if (!grown) {
             return;
@@ -1051,11 +1051,11 @@ static void promote_target_locked(zdb_cluster *cl)
  * transfer possible to a departed node, so the live table shrinks in place
  * rather than via a target wave). Voids any pending target. Caller holds
  * cl->lock. */
-static void shrink_live_locked(zdb_cluster *cl)
+static void shrink_live_locked(edb_cluster *cl)
 {
     cl->target_generation = 0;
     cl->ntarget_ranges = 0;
-    zdb_setting_delete(cl->cfg, SETTING_LOCK);
+    edb_setting_delete(cl->cfg, SETTING_LOCK);
 
     const char *ids[MAX_PEERS];
     size_t n = 0;
@@ -1078,7 +1078,7 @@ static void shrink_live_locked(zdb_cluster *cl)
     }
     if (n != cl->nranges) {
         if (n > cl->ranges_cap) {
-            zdb_range_info *grown =
+            edb_range_info *grown =
                 realloc(cl->ranges, n * sizeof(*grown));
             if (!grown) {
                 return;
@@ -1092,7 +1092,7 @@ static void shrink_live_locked(zdb_cluster *cl)
     }
 }
 
-bool zdb_cluster_publish_target(zdb_cluster *cl)
+bool edb_cluster_publish_target(edb_cluster *cl)
 {
     if (!cl) {
         return false;
@@ -1113,7 +1113,7 @@ bool zdb_cluster_publish_target(zdb_cluster *cl)
 /* Drops one reference taken by a sender. Caller holds cl->lock. When the
  * connection was torn down in the meantime and this is the last
  * reference, close the fd and free it here. */
-static void conn_unref_locked(zdb_cluster *cl, peer_conn *c)
+static void conn_unref_locked(edb_cluster *cl, peer_conn *c)
 {
     if (--c->refs == 0 && c->dead) {
         shutdown(c->fd, SHUT_RDWR);
@@ -1125,7 +1125,7 @@ static void conn_unref_locked(zdb_cluster *cl, peer_conn *c)
 
 /* Builds and sends HELLO (+STATE when requested) on a connection.
  * Returns 0 on success. */
-static int send_hello_state(zdb_cluster *cl, int fd, bool with_state,
+static int send_hello_state(edb_cluster *cl, int fd, bool with_state,
                             bool joining)
 {
     char *hello = NULL;
@@ -1150,9 +1150,9 @@ static int send_hello_state(zdb_cluster *cl, int fd, bool with_state,
     }
     pthread_mutex_unlock(&cl->lock);
 
-    int rc = zstp_send(fd, ZSTP_HELLO, hello ? hello : "{}", NULL);
+    int rc = estp_send(fd, ESTP_HELLO, hello ? hello : "{}", NULL);
     if (rc == 0 && with_state) {
-        rc = zstp_send(fd, ZSTP_STATE, state ? state : "{}", NULL);
+        rc = estp_send(fd, ESTP_STATE, state ? state : "{}", NULL);
     }
     free(hello);
     free(state);
@@ -1167,7 +1167,7 @@ static int send_hello_state(zdb_cluster *cl, int fd, bool with_state,
  * then released before acquiring send_lock for each write. Never hold
  * both at once here - the reverse order would deadlock against the
  * connection-teardown path. */
-static void gossip_state(zdb_cluster *cl)
+static void gossip_state(edb_cluster *cl)
 {
     pthread_mutex_lock(&cl->lock);
     cJSON *doc = state_to_json(cl);
@@ -1194,7 +1194,7 @@ static void gossip_state(zdb_cluster *cl)
     pthread_mutex_unlock(&cl->lock);
 
     for (size_t i = 0; i < used; i++) {
-        zstp_send(connections[i]->fd, ZSTP_STATE, state ? state : "{}",
+        estp_send(connections[i]->fd, ESTP_STATE, state ? state : "{}",
                   &cl->send_lock);
     }
 
@@ -1209,7 +1209,7 @@ static void gossip_state(zdb_cluster *cl)
 
 /* Leader reaction after topology changes: recompute ranges and persist.
  * Called without holding the lock. */
-static void leader_react(zdb_cluster *cl, bool changed)
+static void leader_react(edb_cluster *cl, bool changed)
 {
     if (!changed) {
         return;
@@ -1229,13 +1229,13 @@ static void leader_react(zdb_cluster *cl, bool changed)
      * only one structure change runs at a time (released on promotion
      * or when the wave is voided by a departure) */
     if (target_published) {
-        zdb_cluster_acquire_rebalance_lock(cl);
+        edb_cluster_acquire_rebalance_lock(cl);
     }
 
     /* stage 6d: once every node reports compliance the leader promotes
      * automatically (the data migration steps happen via 6c catch-up) */
     if (am_leader && cl->target_generation > 0) {
-        zdb_cluster_maybe_promote(cl);
+        edb_cluster_maybe_promote(cl);
     }
 
     /* a fresh target means the structure changed: gossip immediately so
@@ -1255,13 +1255,13 @@ static void leader_react(zdb_cluster *cl, bool changed)
  * The connection is registered only after the HELLO exchange so peers
  * never flap online with unknown identities. */
 /* Decrements the live reader-thread counter. Caller holds cl->lock. */
-static void reader_exiting_locked(zdb_cluster *cl)
+static void reader_exiting_locked(edb_cluster *cl)
 {
     cl->nconn_threads--;
     pthread_cond_broadcast(&cl->conn_cv);
 }
 
-static void pending_remove_locked(zdb_cluster *cl, peer_conn *c)
+static void pending_remove_locked(edb_cluster *cl, peer_conn *c)
 {
     peer_conn **link = &cl->pending_conns;
     while (*link && *link != c) {
@@ -1273,7 +1273,7 @@ static void pending_remove_locked(zdb_cluster *cl, peer_conn *c)
     }
 }
 
-static void pending_discard(zdb_cluster *cl, peer_conn *c)
+static void pending_discard(edb_cluster *cl, peer_conn *c)
 {
     pthread_mutex_lock(&cl->lock);
     pending_remove_locked(cl, c);
@@ -1287,11 +1287,11 @@ static void pending_discard(zdb_cluster *cl, peer_conn *c)
 static void *conn_thread(void *arg)
 {
     peer_conn *c = arg;
-    zdb_cluster *cl = c->owner;
+    edb_cluster *cl = c->owner;
 
     char *payload = NULL;
-    int t = zstp_recv(c->fd, &payload);
-    if (t == ZSTP_HELLO && payload) {
+    int t = estp_recv(c->fd, &payload);
+    if (t == ESTP_HELLO && payload) {
         cJSON *h = cJSON_Parse(payload);
         if (h) {
             const cJSON *jid =
@@ -1305,7 +1305,7 @@ static void *conn_thread(void *arg)
             bool joining = cJSON_IsTrue(jjoin);
             bool is_self = false;
             if (cJSON_IsString(jid) && jid->valuestring &&
-                strlen(jid->valuestring) < ZDB_NODE_ID_MAX) {
+                strlen(jid->valuestring) < EDB_NODE_ID_MAX) {
                 snprintf(c->node_id, sizeof(c->node_id), "%s",
                          jid->valuestring);
                 is_self = strcmp(c->node_id, cl->self_id) == 0;
@@ -1346,7 +1346,7 @@ static void *conn_thread(void *arg)
                     cJSON_AddStringToObject(r, "reject", "removed");
                     char *rs = r ? cJSON_PrintUnformatted(r) : NULL;
                     cJSON_Delete(r);
-                    zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
+                    estp_send(c->fd, ESTP_HELLO, rs ? rs : "{}", NULL);
                     free(rs);
                     pending_discard(cl, c);
                     return NULL;
@@ -1357,7 +1357,7 @@ static void *conn_thread(void *arg)
                     cJSON_AddStringToObject(r, "reject", "rebalance");
                     char *rs = r ? cJSON_PrintUnformatted(r) : NULL;
                     cJSON_Delete(r);
-                    zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
+                    estp_send(c->fd, ESTP_HELLO, rs ? rs : "{}", NULL);
                     free(rs);
                     pending_discard(cl, c);
                     return NULL;
@@ -1367,9 +1367,9 @@ static void *conn_thread(void *arg)
              * membership so we know where to dial them back */
             if (c->node_id[0] && !is_self && cJSON_IsString(jaddr) &&
                 jaddr->valuestring &&
-                strlen(jaddr->valuestring) < ZDB_ADDR_MAX) {
+                strlen(jaddr->valuestring) < EDB_ADDR_MAX) {
                 pthread_mutex_lock(&cl->lock);
-                zdb_peer_info *p = NULL;
+                edb_peer_info *p = NULL;
                 for (size_t i = 0; i < cl->npeers; i++) {
                     if (strcmp(cl->peers[i].id, c->node_id) == 0) {
                         p = &cl->peers[i];
@@ -1380,7 +1380,7 @@ static void *conn_thread(void *arg)
                     if (cl->npeers == cl->peers_cap) {
                         size_t cap =
                             cl->peers_cap ? cl->peers_cap * 2 : 8;
-                        zdb_peer_info *grown =
+                        edb_peer_info *grown =
                             realloc(cl->peers, cap * sizeof(*grown));
                         if (grown) {
                             cl->peers = grown;
@@ -1442,12 +1442,12 @@ static void *conn_thread(void *arg)
 
     bool changed = false;
     for (;;) {
-        t = zstp_recv(c->fd, &payload);
+        t = estp_recv(c->fd, &payload);
         if (t < 0) {
             break;
         }
         changed = false;
-        if (t == ZSTP_STATE && payload) {
+        if (t == ESTP_STATE && payload) {
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
             cJSON *doc = cJSON_Parse(payload);
@@ -1470,7 +1470,7 @@ static void *conn_thread(void *arg)
             }
             recompute_leader(cl);
             pthread_mutex_unlock(&cl->lock);
-        } else if (t == ZSTP_SNAP_REQ) {
+        } else if (t == ESTP_SNAP_REQ) {
             /* stage 6b/6c: shard snapshot request. Served directly
              * (not via the dispatcher) so the engine behind the config
              * store streams a consistent copy; runs without cl->lock
@@ -1478,23 +1478,23 @@ static void *conn_thread(void *arg)
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
             pthread_mutex_unlock(&cl->lock);
-            zdb_snap_serve(c->fd,
+            edb_snap_serve(c->fd,
                            payload ? (uint32_t)strlen(payload) : 0,
-                           payload, zdb_config_engine(cl->cfg));
-        } else if (t == ZSTP_VOID) {
+                           payload, edb_config_engine(cl->cfg));
+        } else if (t == ESTP_VOID) {
             /* stage 6e: rollback request. Only the leader acts; the
              * reply tells the requester whether a wave was voided. */
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
             pthread_mutex_unlock(&cl->lock);
-            bool ok = zdb_cluster_void_target(cl);
+            bool ok = edb_cluster_void_target(cl);
             char reply[32];
             snprintf(reply, sizeof(reply), "{\"ok\":%s}",
                      ok ? "true" : "false");
-            zstp_send(c->fd, ZSTP_ACK, reply, &cl->send_lock);
-        } else if (t == ZSTP_REPL || t == ZSTP_QUERY ||
-                   t == ZSTP_FLUSH) {
-            zstp_dispatch_fn fn = NULL;
+            estp_send(c->fd, ESTP_ACK, reply, &cl->send_lock);
+        } else if (t == ESTP_REPL || t == ESTP_QUERY ||
+                   t == ESTP_FLUSH) {
+            estp_dispatch_fn fn = NULL;
             void *fn_ctx = NULL;
             bool global = false;
             pthread_mutex_lock(&cl->lock);
@@ -1520,7 +1520,7 @@ static void *conn_thread(void *arg)
             char *reply = NULL;
             if (fn && fn(fn_ctx, t, payload ? payload : "{}", &reply_type,
                          &reply) && reply) {
-                zstp_send(c->fd, (zstp_type)reply_type, reply,
+                estp_send(c->fd, (estp_type)reply_type, reply,
                           &cl->send_lock);
             }
             free(reply);
@@ -1598,7 +1598,7 @@ static void *conn_thread(void *arg)
          * departed node); any pending target is void */
         cl->target_generation = 0;
         cl->ntarget_ranges = 0;
-        zdb_setting_delete(cl->cfg, SETTING_LOCK);
+        edb_setting_delete(cl->cfg, SETTING_LOCK);
         if (cl->nranges > 0) {
             const char *ids[MAX_PEERS];
             size_t n = 0;
@@ -1643,7 +1643,7 @@ static void spawn_conn_thread(peer_conn *c)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    zdb_cluster *cl = c->owner;
+    edb_cluster *cl = c->owner;
     pthread_mutex_lock(&cl->lock);
     cl->nconn_threads++;
     c->next = cl->pending_conns;
@@ -1668,7 +1668,7 @@ static void spawn_conn_thread(peer_conn *c)
 
 static void *acceptor_main(void *arg)
 {
-    zdb_cluster *cl = arg;
+    edb_cluster *cl = arg;
     pthread_mutex_lock(&cl->lock);
     bool running = cl->running;
     int listen_fd = cl->listen_fd;
@@ -1718,10 +1718,10 @@ static void *acceptor_main(void *arg)
 
 static int dial_peer(const char *addr, int port)
 {
-    return zstp_dial(addr, port);
+    return estp_dial(addr, port);
 }
 
-static bool have_conn_locked(const zdb_cluster *cl, const char *id)
+static bool have_conn_locked(const edb_cluster *cl, const char *id)
 {
     for (const peer_conn *c = cl->conns; c; c = c->next) {
         if (strcmp(c->node_id, id) == 0) {
@@ -1731,7 +1731,7 @@ static bool have_conn_locked(const zdb_cluster *cl, const char *id)
     return false;
 }
 
-static void maintainer_tick(zdb_cluster *cl)
+static void maintainer_tick(edb_cluster *cl)
 {
     /* heartbeat established connections. Build the payload once under
      * cl->lock, reference every connection, then release cl->lock so a
@@ -1753,7 +1753,7 @@ static void maintainer_tick(zdb_cluster *cl)
     pthread_mutex_unlock(&cl->lock);
 
     for (size_t i = 0; i < nhb; i++) {
-        if (zstp_send(hb[i]->fd, ZSTP_STATE, state ? state : "{}",
+        if (estp_send(hb[i]->fd, ESTP_STATE, state ? state : "{}",
                       &cl->send_lock) != 0) {
             shutdown(hb[i]->fd, SHUT_RDWR);   /* reader thread tears it down */
         }
@@ -1775,7 +1775,7 @@ static void maintainer_tick(zdb_cluster *cl)
      * and comes back once the link is re-established. */
     pthread_mutex_lock(&cl->lock);
     for (size_t i = 0; i < cl->npeers; i++) {
-        zdb_peer_info p = cl->peers[i];   /* copy; lock released below */
+        edb_peer_info p = cl->peers[i];   /* copy; lock released below */
         if (strcmp(p.id, cl->self_id) == 0 || p.removed ||
             p.addr[0] == '\0' || p.port <= 0 ||
             (p.port == cl->self_port &&
@@ -1803,7 +1803,7 @@ static void maintainer_tick(zdb_cluster *cl)
     }
     pthread_mutex_unlock(&cl->lock);
 
-    zdb_cluster_maybe_promote(cl);
+    edb_cluster_maybe_promote(cl);
 
     /* stage 6e: auto-compliance. A node that already holds everything
      * the pending target assigns to it reports compliance without
@@ -1823,15 +1823,15 @@ static void maintainer_tick(zdb_cluster *cl)
     }
     pthread_mutex_unlock(&cl->lock);
     if (auto_ok && tgen > 0 && self_gen < tgen &&
-        !zdb_cluster_needs_sync(cl)) {
-        zdb_cluster_mark_compliant(cl);
+        !edb_cluster_needs_sync(cl)) {
+        edb_cluster_mark_compliant(cl);
     }
     pthread_mutex_lock(&cl->lock);
     bool gc_ready = cl->target_generation == 0 && cl->gc_after > 0 &&
                     epoch_now() >= cl->gc_after;
     pthread_mutex_unlock(&cl->lock);
     if (gc_ready) {
-        zdb_cluster_gc_redundant(cl);
+        edb_cluster_gc_redundant(cl);
     }
 
     /* auto-remove peers that have been offline for long enough: the
@@ -1865,7 +1865,7 @@ static void maintainer_tick(zdb_cluster *cl)
 
 static void *maintainer_main(void *arg)
 {
-    zdb_cluster *cl = arg;
+    edb_cluster *cl = arg;
     int elapsed_ms = 0;
     for (;;) {
         sleep_ms(MAINTAINER_TICK_MS);
@@ -1888,7 +1888,7 @@ static void *maintainer_main(void *arg)
 /* ------------------------------------------------------------------ */
 /* public API                                                          */
 
-static void add_self_locked(zdb_cluster *cl)
+static void add_self_locked(edb_cluster *cl)
 {
     for (size_t i = 0; i < cl->npeers; i++) {
         if (strcmp(cl->peers[i].id, cl->self_id) == 0) {
@@ -1903,14 +1903,14 @@ static void add_self_locked(zdb_cluster *cl)
     }
     if (cl->npeers == cl->peers_cap) {
         size_t cap = cl->peers_cap ? cl->peers_cap * 2 : 8;
-        zdb_peer_info *grown = realloc(cl->peers, cap * sizeof(*grown));
+        edb_peer_info *grown = realloc(cl->peers, cap * sizeof(*grown));
         if (!grown) {
             return;
         }
         cl->peers = grown;
         cl->peers_cap = cap;
     }
-    zdb_peer_info *p = &cl->peers[cl->npeers++];
+    edb_peer_info *p = &cl->peers[cl->npeers++];
     memset(p, 0, sizeof(*p));
     snprintf(p->id, sizeof(p->id), "%s", cl->self_id);
     snprintf(p->addr, sizeof(p->addr), "%s", cl->self_addr);
@@ -1919,16 +1919,16 @@ static void add_self_locked(zdb_cluster *cl)
     p->online = true;
 }
 
-zdb_cluster *zdb_cluster_start(zdb_config *cfg, const char *advertise_addr,
+edb_cluster *edb_cluster_start(edb_config *cfg, const char *advertise_addr,
                                int peer_port,
-                               char node_id_out[ZDB_NODE_ID_MAX])
+                               char node_id_out[EDB_NODE_ID_MAX])
 {
     if (!cfg || !advertise_addr || !*advertise_addr ||
         peer_port <= 0 || peer_port > 65535) {
         return NULL;
     }
 
-    zdb_cluster *cl = calloc(1, sizeof(*cl));
+    edb_cluster *cl = calloc(1, sizeof(*cl));
     if (!cl) {
         return NULL;
     }
@@ -1939,10 +1939,10 @@ zdb_cluster *zdb_cluster_start(zdb_config *cfg, const char *advertise_addr,
 
     /* stable node id: md5 of the advertise address + port */
     char seed[256];
-    snprintf(seed, sizeof(seed), "zdb-node:%s:%d", advertise_addr,
+    snprintf(seed, sizeof(seed), "edb-node:%s:%d", advertise_addr,
              peer_port);
     char hex[33];
-    zdb_md5_hex(seed, strlen(seed), hex);
+    edb_md5_hex(seed, strlen(seed), hex);
     snprintf(cl->self_id, sizeof(cl->self_id), "node-%.12s", hex);
 
     pthread_mutex_init(&cl->lock, NULL);
@@ -2003,7 +2003,7 @@ zdb_cluster *zdb_cluster_start(zdb_config *cfg, const char *advertise_addr,
     }
 
     if (node_id_out) {
-        snprintf(node_id_out, ZDB_NODE_ID_MAX, "%s", cl->self_id);
+        snprintf(node_id_out, EDB_NODE_ID_MAX, "%s", cl->self_id);
     }
     return cl;
 
@@ -2019,7 +2019,7 @@ fail:
     return NULL;
 }
 
-void zdb_cluster_stop(zdb_cluster *cl)
+void edb_cluster_stop(edb_cluster *cl)
 {
     if (!cl) {
         return;
@@ -2066,7 +2066,7 @@ void zdb_cluster_stop(zdb_cluster *cl)
     free(cl);
 }
 
-size_t zdb_cluster_peers(zdb_cluster *cl, zdb_peer_info *out, size_t cap)
+size_t edb_cluster_peers(edb_cluster *cl, edb_peer_info *out, size_t cap)
 {
     if (!cl || !out) {
         return 0;
@@ -2080,9 +2080,9 @@ size_t zdb_cluster_peers(zdb_cluster *cl, zdb_peer_info *out, size_t cap)
     return n;
 }
 
-const char *zdb_cluster_leader(zdb_cluster *cl)
+const char *edb_cluster_leader(edb_cluster *cl)
 {
-    static _Thread_local char buf[ZDB_NODE_ID_MAX];
+    static _Thread_local char buf[EDB_NODE_ID_MAX];
     if (!cl) {
         return NULL;
     }
@@ -2096,12 +2096,12 @@ const char *zdb_cluster_leader(zdb_cluster *cl)
     return buf[0] ? buf : NULL;
 }
 
-const char *zdb_cluster_self_id(zdb_cluster *cl)
+const char *edb_cluster_self_id(edb_cluster *cl)
 {
     return cl ? cl->self_id : "";
 }
 
-bool zdb_cluster_is_leader(zdb_cluster *cl)
+bool edb_cluster_is_leader(edb_cluster *cl)
 {
     if (!cl) {
         return false;
@@ -2112,7 +2112,7 @@ bool zdb_cluster_is_leader(zdb_cluster *cl)
     return me;
 }
 
-long long zdb_cluster_generation(zdb_cluster *cl)
+long long edb_cluster_generation(edb_cluster *cl)
 {
     if (!cl) {
         return 0;
@@ -2123,7 +2123,7 @@ long long zdb_cluster_generation(zdb_cluster *cl)
     return g;
 }
 
-size_t zdb_cluster_ranges(zdb_cluster *cl, zdb_range_info *out, size_t cap)
+size_t edb_cluster_ranges(edb_cluster *cl, edb_range_info *out, size_t cap)
 {
     if (!cl || !out) {
         return 0;
@@ -2137,9 +2137,9 @@ size_t zdb_cluster_ranges(zdb_cluster *cl, zdb_range_info *out, size_t cap)
     return n;
 }
 
-const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex)
+const char *edb_cluster_owner(edb_cluster *cl, const char *md5hex)
 {
-    static _Thread_local char owner_buf[ZDB_NODE_ID_MAX];
+    static _Thread_local char owner_buf[EDB_NODE_ID_MAX];
     if (!cl || !md5hex || strlen(md5hex) != 32) {
         return NULL;
     }
@@ -2162,8 +2162,8 @@ const char *zdb_cluster_owner(zdb_cluster *cl, const char *md5hex)
     return found ? owner_buf : NULL;
 }
 
-size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
-                           char (*node_ids)[ZDB_NODE_ID_MAX], size_t cap)
+size_t edb_cluster_holders(edb_cluster *cl, const char *md5hex,
+                           char (*node_ids)[EDB_NODE_ID_MAX], size_t cap)
 {
     if (!cl || !md5hex || strlen(md5hex) != 32 || !node_ids || cap == 0) {
         return 0;
@@ -2209,7 +2209,7 @@ size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
     size_t count = 0;
     for (size_t offset = 0; offset < ncandidates && count < cap; offset++) {
         size_t index = (start + offset) % ncandidates;
-        snprintf(node_ids[count], ZDB_NODE_ID_MAX, "%s", candidates[index]);
+        snprintf(node_ids[count], EDB_NODE_ID_MAX, "%s", candidates[index]);
         count++;
     }
     pthread_mutex_unlock(&cl->lock);
@@ -2221,7 +2221,7 @@ size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
  * membership views merge, then hang up (the maintainer re-dials).
  * Returns 0 on success, -2 when the seed refused because a rebalance
  * wave is pending, -3 when this node has been removed from the cluster. */
-static int join_exchange(zdb_cluster *cl, int fd)
+static int join_exchange(edb_cluster *cl, int fd)
 {
     send_hello_state(cl, fd, true, true);
 
@@ -2233,12 +2233,12 @@ static int join_exchange(zdb_cluster *cl, int fd)
     time_t deadline = time(NULL) + 2;
     while (time(NULL) < deadline) {
         char *payload = NULL;
-        int t = zstp_recv(fd, &payload);
+        int t = estp_recv(fd, &payload);
         if (t < 0) {
             break;
         }
         got_reply = true;
-        if (t == ZSTP_HELLO && payload) {
+        if (t == ESTP_HELLO && payload) {
             cJSON *h = cJSON_Parse(payload);
             const cJSON *jr =
                 h ? cJSON_GetObjectItemCaseSensitive(h, "reject") : NULL;
@@ -2249,7 +2249,7 @@ static int join_exchange(zdb_cluster *cl, int fd)
                 return rc;
             }
             cJSON_Delete(h);
-        } else if (t == ZSTP_STATE && payload) {
+        } else if (t == ESTP_STATE && payload) {
             cJSON *doc = cJSON_Parse(payload);
             if (doc) {
                 pthread_mutex_lock(&cl->lock);
@@ -2265,7 +2265,7 @@ static int join_exchange(zdb_cluster *cl, int fd)
     return got_reply ? 0 : -1;
 }
 
-int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
+int edb_cluster_join(edb_cluster *cl, const char *seed_addr, int seed_port)
 {
     if (!cl || !seed_addr || !*seed_addr || seed_port <= 0 ||
         seed_port > 65535) {
@@ -2281,7 +2281,7 @@ int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
     return rc;
 }
 
-bool zdb_cluster_remove_node(zdb_cluster *cl, const char *node_id)
+bool edb_cluster_remove_node(edb_cluster *cl, const char *node_id)
 {
     if (!cl || !node_id || !*node_id ||
         strcmp(node_id, cl->self_id) == 0) {
@@ -2318,8 +2318,8 @@ bool zdb_cluster_remove_node(zdb_cluster *cl, const char *node_id)
     return found;
 }
 
-void zdb_cluster_set_dispatcher(zdb_cluster *cl,
-                                zstp_dispatch_fn fn, void *ctx)
+void edb_cluster_set_dispatcher(edb_cluster *cl,
+                                estp_dispatch_fn fn, void *ctx)
 {
     if (!cl) {
         return;
@@ -2335,7 +2335,7 @@ void zdb_cluster_set_dispatcher(zdb_cluster *cl,
     pthread_mutex_unlock(&cl->lock);
 }
 
-size_t zdb_cluster_target_ranges(zdb_cluster *cl, zdb_range_info *out,
+size_t edb_cluster_target_ranges(edb_cluster *cl, edb_range_info *out,
                                  size_t cap)
 {
     if (!cl || !out) {
@@ -2350,7 +2350,7 @@ size_t zdb_cluster_target_ranges(zdb_cluster *cl, zdb_range_info *out,
     return n;
 }
 
-long long zdb_cluster_target_generation(zdb_cluster *cl)
+long long edb_cluster_target_generation(edb_cluster *cl)
 {
     if (!cl) {
         return 0;
@@ -2361,9 +2361,9 @@ long long zdb_cluster_target_generation(zdb_cluster *cl)
     return g;
 }
 
-const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex)
+const char *edb_cluster_target_owner(edb_cluster *cl, const char *md5hex)
 {
-    static _Thread_local char owner_buf[ZDB_NODE_ID_MAX];
+    static _Thread_local char owner_buf[EDB_NODE_ID_MAX];
     if (!cl || !md5hex || strlen(md5hex) != 32) {
         return NULL;
     }
@@ -2374,7 +2374,7 @@ const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex)
             (strncmp(md5hex, cl->target_ranges[i].end, 32) < 0 ||
              memcmp(cl->target_ranges[i].end,
                     "ffffffffffffffffffffffffffffffff", 32) == 0)) {
-            /* copy out: see zdb_cluster_owner for why a bare pointer
+            /* copy out: see edb_cluster_owner for why a bare pointer
              * into the (mutable) range table would dangle */
             snprintf(owner_buf, sizeof(owner_buf), "%s",
                      cl->target_ranges[i].node_id);
@@ -2386,10 +2386,10 @@ const char *zdb_cluster_target_owner(zdb_cluster *cl, const char *md5hex)
     return found ? owner_buf : NULL;
 }
 
-bool zdb_cluster_promote_target(zdb_cluster *cl)
+bool edb_cluster_promote_target(edb_cluster *cl)
 {
-    if (!cl || zdb_cluster_target_generation(cl) == 0 ||
-        !zdb_cluster_target_compliant(cl)) {
+    if (!cl || edb_cluster_target_generation(cl) == 0 ||
+        !edb_cluster_target_compliant(cl)) {
         return false;
     }
     bool promoted = false;
@@ -2400,9 +2400,9 @@ bool zdb_cluster_promote_target(zdb_cluster *cl)
             char name[96];
             snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
                      cl->peers[i].id);
-            zdb_setting_delete(cl->cfg, name);
+            edb_setting_delete(cl->cfg, name);
         }
-        zdb_setting_delete(cl->cfg, SETTING_LOCK);
+        edb_setting_delete(cl->cfg, SETTING_LOCK);
         persist_state(cl);
         promoted = true;
     }
@@ -2413,14 +2413,14 @@ bool zdb_cluster_promote_target(zdb_cluster *cl)
     return promoted;
 }
 
-bool zdb_cluster_target_compliant(zdb_cluster *cl)
+bool edb_cluster_target_compliant(edb_cluster *cl)
 {
     if (!cl) {
         return false;
     }
     pthread_mutex_lock(&cl->lock);
     long long target_generation = cl->target_generation;
-    char required[MAX_PEERS][ZDB_NODE_ID_MAX];
+    char required[MAX_PEERS][EDB_NODE_ID_MAX];
     size_t nrequired = 0;
     for (size_t i = 0; target_generation > 0 && i < cl->ntarget_ranges &&
                        nrequired < MAX_PEERS;
@@ -2433,7 +2433,7 @@ bool zdb_cluster_target_compliant(zdb_cluster *cl)
             }
         }
         if (!duplicate) {
-            snprintf(required[nrequired], ZDB_NODE_ID_MAX, "%s",
+            snprintf(required[nrequired], EDB_NODE_ID_MAX, "%s",
                      cl->target_ranges[i].node_id);
             nrequired++;
         }
@@ -2443,8 +2443,8 @@ bool zdb_cluster_target_compliant(zdb_cluster *cl)
         return false;
     }
 
-    zdb_peer_info peers[MAX_PEERS];
-    size_t npeers = zdb_cluster_peers(cl, peers, MAX_PEERS);
+    edb_peer_info peers[MAX_PEERS];
+    size_t npeers = edb_cluster_peers(cl, peers, MAX_PEERS);
     for (size_t i = 0; i < nrequired; i++) {
         bool compliant = false;
         for (size_t p = 0; p < npeers; p++) {
@@ -2460,7 +2460,7 @@ bool zdb_cluster_target_compliant(zdb_cluster *cl)
         char name[96];
         snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
                  required[i]);
-        char *value = zdb_setting_get(cl->cfg, name);
+        char *value = edb_setting_get(cl->cfg, name);
         if (value) {
             char *end = NULL;
             long long stored_generation = strtoll(value, &end, 10);
@@ -2475,14 +2475,14 @@ bool zdb_cluster_target_compliant(zdb_cluster *cl)
     return true;
 }
 
-void zdb_cluster_mark_compliant(zdb_cluster *cl)
+void edb_cluster_mark_compliant(edb_cluster *cl)
 {
     if (!cl) {
         return;
     }
-    long long tgen = zdb_cluster_target_generation(cl);
+    long long tgen = edb_cluster_target_generation(cl);
     if (tgen == 0) {
-        tgen = zdb_cluster_generation(cl);
+        tgen = edb_cluster_generation(cl);
     }
     if (tgen == 0) {
         return;
@@ -2505,7 +2505,7 @@ void zdb_cluster_mark_compliant(zdb_cluster *cl)
     snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
              cl->self_id);
     snprintf(val, sizeof(val), "%lld", tgen);
-    zdb_setting_set(cl->cfg, name, val);
+    edb_setting_set(cl->cfg, name, val);
 
     /* propagate compliance immediately so the leader can promote without
      * waiting for the next heartbeat */
@@ -2517,16 +2517,16 @@ void zdb_cluster_mark_compliant(zdb_cluster *cl)
 /* Leader-only: promote the pending target when every online node has
  * reported compliance. Safe to call from any thread (takes the lock).
  * Returns true when a promotion happened. */
-bool zdb_cluster_maybe_promote(zdb_cluster *cl)
+bool edb_cluster_maybe_promote(edb_cluster *cl)
 {
-    if (!cl || !zdb_cluster_is_leader(cl)) {
+    if (!cl || !edb_cluster_is_leader(cl)) {
         return false;
     }
-    if (zdb_cluster_target_generation(cl) == 0 ||
-        !zdb_cluster_target_compliant(cl)) {
+    if (edb_cluster_target_generation(cl) == 0 ||
+        !edb_cluster_target_compliant(cl)) {
         return false;
     }
-    return zdb_cluster_promote_target(cl);
+    return edb_cluster_promote_target(cl);
 }
 
 /* Removes one redundant local shard file (a shard whose key is now owned
@@ -2534,25 +2534,25 @@ bool zdb_cluster_maybe_promote(zdb_cluster *cl)
  * owner is assigned. Reserved __system__ config shards are never removed.
  * Returns the number of shards GC'd this call (0 or 1), so callers can
  * drain GC one at a time. */
-size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
+size_t edb_cluster_gc_redundant(edb_cluster *cl)
 {
-    if (!cl || zdb_cluster_target_generation(cl) != 0) {
+    if (!cl || edb_cluster_target_generation(cl) != 0) {
         return 0;
     }
-    zdb_engine *engine = zdb_config_engine(cl->cfg);
+    edb_engine *engine = edb_config_engine(cl->cfg);
     if (!engine) {
         return 0;
     }
     char keys[256][33];
-    size_t key_count = zdb_engine_shard_keys(engine, keys, 256);
+    size_t key_count = edb_engine_shard_keys(engine, keys, 256);
     size_t keyspace_count = 0;
-    zdb_keyspace_info *keyspaces = zdb_keyspace_list(cl->cfg,
+    edb_keyspace_info *keyspaces = edb_keyspace_list(cl->cfg,
                                                      &keyspace_count);
-    zdb_peer_info peers[MAX_PEERS];
-    size_t peer_count = zdb_cluster_peers(cl, peers, MAX_PEERS);
+    edb_peer_info peers[MAX_PEERS];
+    size_t peer_count = edb_cluster_peers(cl, peers, MAX_PEERS);
 
     for (size_t i = 0; i < key_count; i++) {
-        if (zdb_config_is_system_key(cl->cfg, keys[i])) {
+        if (edb_config_is_system_key(cl->cfg, keys[i])) {
             continue;
         }
         int rf = 1;
@@ -2560,11 +2560,11 @@ size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
         for (size_t k = 0; k < keyspace_count; k++) {
             char path[1024];
             char candidate[33];
-            if (zdb_shard_path(engine, keyspaces[k].partition,
+            if (edb_shard_path(engine, keyspaces[k].partition,
                                keyspaces[k].name, path, sizeof(path),
                                candidate) && strcmp(candidate, keys[i]) == 0) {
-                zdb_database_info database;
-                if (zdb_database_get(cl->cfg, keyspaces[k].database,
+                edb_database_info database;
+                if (edb_database_get(cl->cfg, keyspaces[k].database,
                                      &database) &&
                     database.replication_factor > 0) {
                     rf = database.replication_factor;
@@ -2577,8 +2577,8 @@ size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
             rf = 1;
         }
 
-        char holders[MAX_PEERS][ZDB_NODE_ID_MAX];
-        size_t holder_count = zdb_cluster_holders(cl, keys[i], holders,
+        char holders[MAX_PEERS][EDB_NODE_ID_MAX];
+        size_t holder_count = edb_cluster_holders(cl, keys[i], holders,
                                                   MAX_PEERS);
         if ((size_t)rf > holder_count) {
             rf = (int)holder_count;
@@ -2602,7 +2602,7 @@ size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
                 break;
             }
         }
-        if (!keep_local && replicas_ready && zdb_shard_gc(engine, keys[i])) {
+        if (!keep_local && replicas_ready && edb_shard_gc(engine, keys[i])) {
             free(keyspaces);
             return 1;
         }
@@ -2611,12 +2611,12 @@ size_t zdb_cluster_gc_redundant(zdb_cluster *cl)
     return 0;
 }
 
-bool zdb_cluster_acquire_rebalance_lock(zdb_cluster *cl)
+bool edb_cluster_acquire_rebalance_lock(edb_cluster *cl)
 {
     if (!cl) {
         return false;
     }
-    char *cur = zdb_setting_get(cl->cfg, SETTING_LOCK);
+    char *cur = edb_setting_get(cl->cfg, SETTING_LOCK);
     if (cur) {
         cJSON *doc = cJSON_Parse(cur);
         free(cur);
@@ -2643,46 +2643,46 @@ bool zdb_cluster_acquire_rebalance_lock(zdb_cluster *cl)
     snprintf(json, sizeof(json),
              "{\"node\":\"%.63s\",\"ts\":%lld}", cl->self_id,
              epoch_now());
-    return zdb_setting_set(cl->cfg, SETTING_LOCK, json);
+    return edb_setting_set(cl->cfg, SETTING_LOCK, json);
 }
 
-void zdb_cluster_release_rebalance_lock(zdb_cluster *cl)
+void edb_cluster_release_rebalance_lock(edb_cluster *cl)
 {
     if (!cl) {
         return;
     }
-    zdb_setting_delete(cl->cfg, SETTING_LOCK);
+    edb_setting_delete(cl->cfg, SETTING_LOCK);
 }
 
 /* --- stage 6e: end-to-end rebalance wiring ---------------------------- */
 
-bool zdb_cluster_needs_sync(zdb_cluster *cl)
+bool edb_cluster_needs_sync(edb_cluster *cl)
 {
-    if (!cl || zdb_cluster_target_generation(cl) == 0) {
+    if (!cl || edb_cluster_target_generation(cl) == 0) {
         return false;
     }
-    zdb_engine *engine = zdb_config_engine(cl->cfg);
+    edb_engine *engine = edb_config_engine(cl->cfg);
     if (!engine) {
         return false;
     }
     size_t nks = 0;
-    zdb_keyspace_info *kss = zdb_keyspace_list(cl->cfg, &nks);
+    edb_keyspace_info *kss = edb_keyspace_list(cl->cfg, &nks);
     bool needed = false;
     for (size_t i = 0; kss && i < nks && !needed; i++) {
         char key[33];
         char path[1024];
-        if (!zdb_shard_path(engine, kss[i].partition, kss[i].name,
+        if (!edb_shard_path(engine, kss[i].partition, kss[i].name,
                             path, sizeof(path), key)) {
             continue;
         }
-        if (zdb_config_is_system_key(cl->cfg, key)) {
+        if (edb_config_is_system_key(cl->cfg, key)) {
             continue;   /* config shards replicate separately */
         }
-        const char *towner = zdb_cluster_target_owner(cl, key);
+        const char *towner = edb_cluster_target_owner(cl, key);
         if (!towner || strcmp(towner, cl->self_id) != 0) {
             continue;   /* the wave does not give us this shard */
         }
-        if (zdb_shard_validate(engine, kss[i].partition, kss[i].name)) {
+        if (edb_shard_validate(engine, kss[i].partition, kss[i].name)) {
             continue;
         }
         needed = true;
@@ -2691,7 +2691,7 @@ bool zdb_cluster_needs_sync(zdb_cluster *cl)
     return needed;
 }
 
-void zdb_cluster_set_auto_compliant(zdb_cluster *cl, bool enabled)
+void edb_cluster_set_auto_compliant(edb_cluster *cl, bool enabled)
 {
     if (!cl) {
         return;
@@ -2701,7 +2701,7 @@ void zdb_cluster_set_auto_compliant(zdb_cluster *cl, bool enabled)
     pthread_mutex_unlock(&cl->lock);
 }
 
-bool zdb_cluster_void_target(zdb_cluster *cl)
+bool edb_cluster_void_target(edb_cluster *cl)
 {
     if (!cl) {
         return false;
@@ -2720,7 +2720,7 @@ bool zdb_cluster_void_target(zdb_cluster *cl)
     if (voided) {
         /* back to the live structure: release the lock and let every
          * peer drop its stale pending copy via gossip */
-        zdb_cluster_release_rebalance_lock(cl);
+        edb_cluster_release_rebalance_lock(cl);
         pthread_mutex_lock(&cl->lock);
         persist_state(cl);
         pthread_mutex_unlock(&cl->lock);
@@ -2729,13 +2729,13 @@ bool zdb_cluster_void_target(zdb_cluster *cl)
     return voided;
 }
 
-bool zdb_cluster_request_void(zdb_cluster *cl)
+bool edb_cluster_request_void(edb_cluster *cl)
 {
     if (!cl) {
         return false;
     }
-    char leader[ZDB_NODE_ID_MAX] = "";
-    char addr[ZDB_ADDR_MAX] = "";
+    char leader[EDB_NODE_ID_MAX] = "";
+    char addr[EDB_ADDR_MAX] = "";
     int port = 0;
     pthread_mutex_lock(&cl->lock);
     snprintf(leader, sizeof(leader), "%s", cl->leader);
@@ -2751,7 +2751,7 @@ bool zdb_cluster_request_void(zdb_cluster *cl)
         strcmp(leader, cl->self_id) == 0) {
         /* no reachable leader (or we are it): void locally so a leader
          * joiner still rolls back instead of hanging on its own RPC */
-        return zdb_cluster_void_target(cl);
+        return edb_cluster_void_target(cl);
     }
     int fd = dial_peer(addr, port);
     if (fd < 0) {
@@ -2761,25 +2761,25 @@ bool zdb_cluster_request_void(zdb_cluster *cl)
     snprintf(hello, sizeof(hello),
              "{\"node_id\":\"ephemeral\",\"addr\":\"%s\",\"port\":0}",
              cl->self_addr);
-    zstp_send(fd, ZSTP_HELLO, hello, NULL);
+    estp_send(fd, ESTP_HELLO, hello, NULL);
 
     /* absorb their HELLO/STATE before asking */
     for (;;) {
         char *payload = NULL;
-        int t = zstp_recv(fd, &payload);
+        int t = estp_recv(fd, &payload);
         free(payload);
-        if (t < 0 || t == ZSTP_STATE) {
+        if (t < 0 || t == ESTP_STATE) {
             break;
         }
     }
     char req[64];
-    long long tgen = zdb_cluster_target_generation(cl);
+    long long tgen = edb_cluster_target_generation(cl);
     snprintf(req, sizeof(req), "{\"generation\":%lld}", tgen);
-    zstp_send(fd, ZSTP_VOID, req, NULL);
+    estp_send(fd, ESTP_VOID, req, NULL);
     bool ok = false;
     char *payload = NULL;
-    int t = zstp_recv(fd, &payload);
-    if (t == ZSTP_ACK && payload) {
+    int t = estp_recv(fd, &payload);
+    if (t == ESTP_ACK && payload) {
         cJSON *doc = cJSON_Parse(payload);
         const cJSON *jok =
             doc ? cJSON_GetObjectItemCaseSensitive(doc, "ok") : NULL;
@@ -2794,16 +2794,16 @@ bool zdb_cluster_request_void(zdb_cluster *cl)
 /* ------------------------------------------------------------------ */
 /* mesh key management                                                 */
 
-int zdb_cluster_derive_keys(const char *secret, uint8_t enc_key[32],
+int edb_cluster_derive_keys(const char *secret, uint8_t enc_key[32],
                             uint8_t mac_key[32])
 {
-    static const uint8_t salt[] = "zestyd-mesh";
-    static const uint8_t info[] = "zestyd-mesh-v1";
+    static const uint8_t salt[] = "epsilond-mesh";
+    static const uint8_t info[] = "epsilond-mesh-v1";
     uint8_t okm[64];
     if (!secret || !*secret) {
         return -1;
     }
-    if (zdb_hkdf_sha256((const uint8_t *)secret, strlen(secret), salt,
+    if (edb_hkdf_sha256((const uint8_t *)secret, strlen(secret), salt,
                         sizeof(salt) - 1, info, sizeof(info) - 1, okm,
                         sizeof(okm)) != 0) {
         return -1;
@@ -2813,7 +2813,7 @@ int zdb_cluster_derive_keys(const char *secret, uint8_t enc_key[32],
     return 0;
 }
 
-bool zdb_cluster_persist_keys(const char *data_dir, const uint8_t enc_key[32],
+bool edb_cluster_persist_keys(const char *data_dir, const uint8_t enc_key[32],
                               const uint8_t mac_key[32])
 {
     char path[1024];
@@ -2842,7 +2842,7 @@ bool zdb_cluster_persist_keys(const char *data_dir, const uint8_t enc_key[32],
     return true;
 }
 
-bool zdb_cluster_load_keys(const char *data_dir, uint8_t enc_key[32],
+bool edb_cluster_load_keys(const char *data_dir, uint8_t enc_key[32],
                            uint8_t mac_key[32])
 {
     char path[1024];

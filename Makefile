@@ -4,7 +4,7 @@ LDFLAGS ?=
 LDLIBS   = -lpthread
 
 # --- static linking -------------------------------------------------------
-# `make STATIC=1` links bin/zestyd and bin/zestyctl fully statically so they
+# `make STATIC=1` links bin/epsilond and bin/epsilonctl fully statically so they
 # can be copied to other machines with the same CPU architecture and OS.
 # SQLite and cJSON are already compiled in; this additionally links libc,
 # libm, and pthread statically. Only Linux/glibc supports this: macOS ships
@@ -26,14 +26,14 @@ endif
 VENDOR_SRC = vendor/cjson/cJSON.c src/sqlite/sqlite3.c
 
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
-             src/engine/zesty_crypto.c src/engine/shard.c \
-             src/engine/manager.c src/engine/zesty_config.c \
-             src/engine/zesty_analytics.c src/engine/zesty_benchmark.c \
-             src/zesty_log.c
+             src/engine/epsilon_crypto.c src/engine/shard.c \
+             src/engine/manager.c src/engine/epsilon_config.c \
+             src/engine/epsilon_analytics.c src/engine/epsilon_benchmark.c \
+             src/epsilon_log.c
 ENGINE_OBJ = $(ENGINE_SRC:.c=.o) $(VENDOR_SRC:.c=.o)
-ENGINE_LIB = bin/libzesty.a
-SERVER_BIN = bin/zestyd
-CLI_BIN = bin/zestyctl
+ENGINE_LIB = bin/libepsilon.a
+SERVER_BIN = bin/epsilond
+CLI_BIN = bin/epsilonctl
 
 TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \
            tests/test_http.c tests/test_replication.c \
@@ -52,22 +52,22 @@ $(ENGINE_LIB): $(ENGINE_OBJ)
 	@mkdir -p bin
 	ar rcs $@ $^
 
-$(SERVER_BIN): src/zestyd.c src/api/zesty_api.c src/httpd/zesty_http.c \
-               src/socket/zesty_cluster.c src/socket/zesty_repl.c \
-               src/socket/zesty_snap.c src/admin/admin_console.o \
+$(SERVER_BIN): src/epsilond.c src/api/epsilon_api.c src/httpd/epsilon_http.c \
+               src/socket/epsilon_cluster.c src/socket/epsilon_repl.c \
+               src/socket/epsilon_snap.c src/admin/admin_console.o \
                $(ENGINE_LIB)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ src/zestyd.c src/api/zesty_api.c \
-		src/httpd/zesty_http.c src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c src/socket/zesty_snap.c \
+	$(CC) $(CFLAGS) -o $@ src/epsilond.c src/api/epsilon_api.c \
+		src/httpd/epsilon_http.c src/socket/epsilon_cluster.c \
+		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
 		src/admin/admin_console.o \
 		$(ENGINE_SRC:.c=.o) \
 		$(filter %.o,$(VENDOR_SRC:.c=.o)) $(LDFLAGS) $(STATIC_LDFLAGS) \
 		$(LDLIBS) $(STATIC_LDLIBS)
 
-$(CLI_BIN): src/zestyctl.c vendor/cjson/cJSON.c
+$(CLI_BIN): src/epsilonctl.c vendor/cjson/cJSON.c
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ src/zestyctl.c vendor/cjson/cJSON.c \
+	$(CC) $(CFLAGS) -o $@ src/epsilonctl.c vendor/cjson/cJSON.c \
 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
 
 %.o: %.c
@@ -94,13 +94,13 @@ test: all $(TEST_BINS)
 		&& ./tests/test_console_run.sh
 
 tests/test_crypto: tests/test_crypto.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_engine: tests/test_engine.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_config: tests/test_config.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_http: tests/test_http.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
@@ -109,39 +109,39 @@ tests/test_console: tests/test_console.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 tests/test_cluster: tests/test_cluster.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_replication: tests/test_replication.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c src/socket/zesty_snap.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_structure: tests/test_structure.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_snapshot: tests/test_snapshot.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_snap.c -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_delta: tests/test_delta.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c src/socket/zesty_snap.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_rebalance: tests/test_rebalance.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c src/socket/zesty_snap.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_join: tests/test_join.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< src/socket/zesty_cluster.c \
-		src/socket/zesty_repl.c src/socket/zesty_snap.c \
-		-Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< src/socket/epsilon_cluster.c \
+		src/socket/epsilon_repl.c src/socket/epsilon_snap.c \
+		-Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 tests/test_chaos: tests/test_chaos.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< -Lbin -lzesty $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf bin

@@ -12,8 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_cluster.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_cluster.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -44,8 +44,8 @@ static void wait_for(int seconds, bool (*cond)(void *), void *ctx)
 /* Both nodes hold an identical, non-empty target table with the given
  * slice count, and no node's target generation is stale. */
 typedef struct {
-    zdb_cluster *a;
-    zdb_cluster *b;
+    edb_cluster *a;
+    edb_cluster *b;
     size_t want_slices;
 } target_view;
 
@@ -55,14 +55,14 @@ static bool targets_converged(void *ctx)
     if (!t->a || !t->b) {
         return false;
     }
-    long long ga = zdb_cluster_target_generation(t->a);
-    long long gb = zdb_cluster_target_generation(t->b);
+    long long ga = edb_cluster_target_generation(t->a);
+    long long gb = edb_cluster_target_generation(t->b);
     if (ga == 0 || ga != gb || t->want_slices == 0) {
         return false;
     }
-    zdb_range_info ta[8], tb[8];
-    size_t na = zdb_cluster_target_ranges(t->a, ta, 8);
-    size_t nb = zdb_cluster_target_ranges(t->b, tb, 8);
+    edb_range_info ta[8], tb[8];
+    size_t na = edb_cluster_target_ranges(t->a, ta, 8);
+    size_t nb = edb_cluster_target_ranges(t->b, tb, 8);
     if (na != t->want_slices || nb != t->want_slices) {
         return false;
     }
@@ -88,8 +88,8 @@ static bool targets_converged(void *ctx)
 
 /* Both nodes converged on an identical live table of want_slices. */
 typedef struct {
-    zdb_cluster *a;
-    zdb_cluster *b;
+    edb_cluster *a;
+    edb_cluster *b;
     size_t want_slices;
 } live_view;
 
@@ -99,14 +99,14 @@ static bool lives_converged(void *ctx)
     if (!t->a || !t->b) {
         return false;
     }
-    long long ga = zdb_cluster_generation(t->a);
-    long long gb = zdb_cluster_generation(t->b);
+    long long ga = edb_cluster_generation(t->a);
+    long long gb = edb_cluster_generation(t->b);
     if (ga == 0 || ga != gb) {
         return false;
     }
-    zdb_range_info ra[8], rb[8];
-    size_t na = zdb_cluster_ranges(t->a, ra, 8);
-    size_t nb = zdb_cluster_ranges(t->b, rb, 8);
+    edb_range_info ra[8], rb[8];
+    size_t na = edb_cluster_ranges(t->a, ra, 8);
+    size_t nb = edb_cluster_ranges(t->b, rb, 8);
     if (na != t->want_slices || nb != t->want_slices) {
         return false;
     }
@@ -133,28 +133,28 @@ static void test_single_node_has_no_pending_wave(void)
 {
     prepare_dir("tests/data/structure1");
 
-    zdb_engine *e = zdb_engine_open("tests/data/structure1");
-    zdb_config *c = zdb_config_open(e);
+    edb_engine *e = edb_engine_open("tests/data/structure1");
+    edb_config *c = edb_config_open(e);
     CHECK(c != NULL);
 
-    char id[ZDB_NODE_ID_MAX];
-    zdb_cluster *a = zdb_cluster_start(c, "127.0.0.1", 19211, id);
+    char id[EDB_NODE_ID_MAX];
+    edb_cluster *a = edb_cluster_start(c, "127.0.0.1", 19211, id);
     CHECK(a != NULL);
-    CHECK(zdb_cluster_is_leader(a));
-    CHECK(zdb_cluster_generation(a) >= 1);
-    CHECK(zdb_cluster_target_generation(a) == 0);
+    CHECK(edb_cluster_is_leader(a));
+    CHECK(edb_cluster_generation(a) >= 1);
+    CHECK(edb_cluster_target_generation(a) == 0);
 
-    zdb_range_info r[8];
-    CHECK(zdb_cluster_ranges(a, r, 8) == 1);
-    CHECK(zdb_cluster_target_ranges(a, r, 8) == 0);
+    edb_range_info r[8];
+    CHECK(edb_cluster_ranges(a, r, 8) == 1);
+    CHECK(edb_cluster_target_ranges(a, r, 8) == 0);
 
-    char *t = zdb_setting_get(c, TARGET_SETTING);
+    char *t = edb_setting_get(c, TARGET_SETTING);
     CHECK(t == NULL);
     free(t);
 
-    zdb_cluster_stop(a);
-    zdb_config_close(c);
-    zdb_engine_close(e);
+    edb_cluster_stop(a);
+    edb_config_close(c);
+    edb_engine_close(e);
 }
 
 static void test_two_node_wave_lock_and_promotion(void)
@@ -162,48 +162,48 @@ static void test_two_node_wave_lock_and_promotion(void)
     prepare_dir("tests/data/structure2/a");
     prepare_dir("tests/data/structure2/b");
 
-    zdb_engine *ea = zdb_engine_open("tests/data/structure2/a");
-    zdb_config *ca = zdb_config_open(ea);
-    zdb_engine *eb = zdb_engine_open("tests/data/structure2/b");
-    zdb_config *cb = zdb_config_open(eb);
+    edb_engine *ea = edb_engine_open("tests/data/structure2/a");
+    edb_config *ca = edb_config_open(ea);
+    edb_engine *eb = edb_engine_open("tests/data/structure2/b");
+    edb_config *cb = edb_config_open(eb);
     CHECK(ca && cb);
 
-    char ida[ZDB_NODE_ID_MAX], idb[ZDB_NODE_ID_MAX];
-    zdb_cluster *a = zdb_cluster_start(ca, "127.0.0.1", 19221, ida);
+    char ida[EDB_NODE_ID_MAX], idb[EDB_NODE_ID_MAX];
+    edb_cluster *a = edb_cluster_start(ca, "127.0.0.1", 19221, ida);
     CHECK(a != NULL);
-    CHECK(zdb_cluster_is_leader(a));
+    CHECK(edb_cluster_is_leader(a));
 
-    zdb_cluster *b = zdb_cluster_start(cb, "127.0.0.1", 19222, idb);
+    edb_cluster *b = edb_cluster_start(cb, "127.0.0.1", 19222, idb);
     CHECK(b != NULL);
     sleep(1);
 
     /* --- join publishes a pending target ---------------------------- */
-    zdb_cluster_set_auto_compliant(a, false);
-    zdb_cluster_set_auto_compliant(b, false);
-    CHECK(zdb_cluster_join(b, "127.0.0.1", 19221) == 0);
+    edb_cluster_set_auto_compliant(a, false);
+    edb_cluster_set_auto_compliant(b, false);
+    CHECK(edb_cluster_join(b, "127.0.0.1", 19221) == 0);
     target_view tv = { a, b, 2 };
     wait_for(15, targets_converged, &tv);
     CHECK(targets_converged(&tv));
-    CHECK(zdb_cluster_target_generation(a) > zdb_cluster_generation(a));
+    CHECK(edb_cluster_target_generation(a) > edb_cluster_generation(a));
 
     /* live tables untouched until promotion: still one full-space
      * slice per node (each was alone when it claimed the space) */
-    zdb_range_info ra[8], rb[8];
-    size_t nra = zdb_cluster_ranges(a, ra, 8);
-    size_t nrb = zdb_cluster_ranges(b, rb, 8);
+    edb_range_info ra[8], rb[8];
+    size_t nra = edb_cluster_ranges(a, ra, 8);
+    size_t nrb = edb_cluster_ranges(b, rb, 8);
     CHECK(nra == 1 && nrb == 1);
 
     /* ownership under the target table agrees across nodes and covers
      * both members exactly once */
     const char *own_a =
-        zdb_cluster_target_owner(a, "7fffffffffffffffffffffffffffffff");
+        edb_cluster_target_owner(a, "7fffffffffffffffffffffffffffffff");
     const char *own_b =
-        zdb_cluster_target_owner(b, "7fffffffffffffffffffffffffffffff");
+        edb_cluster_target_owner(b, "7fffffffffffffffffffffffffffffff");
     CHECK(own_a && own_b && strcmp(own_a, own_b) == 0);
 
     /* --- pending target persisted in the settings store ------------- */
-    char *ta = zdb_setting_get(ca, TARGET_SETTING);
-    char *tb = zdb_setting_get(cb, TARGET_SETTING);
+    char *ta = edb_setting_get(ca, TARGET_SETTING);
+    char *tb = edb_setting_get(cb, TARGET_SETTING);
     CHECK(ta && tb);
     CHECK(ta && strstr(ta, ida) && strstr(ta, idb));
     free(ta);
@@ -211,44 +211,44 @@ static void test_two_node_wave_lock_and_promotion(void)
 
     /* --- leader holds the rebalance lock during the wave ------------ */
     char *lock = NULL;
-    const char *leader_id = zdb_cluster_leader(a);
+    const char *leader_id = edb_cluster_leader(a);
     CHECK(leader_id != NULL);
     if (strcmp(leader_id, ida) == 0) {
-        lock = zdb_setting_get(ca, LOCK_SETTING);
+        lock = edb_setting_get(ca, LOCK_SETTING);
     } else {
-        lock = zdb_setting_get(cb, LOCK_SETTING);
+        lock = edb_setting_get(cb, LOCK_SETTING);
     }
     CHECK(lock && strstr(lock, leader_id) != NULL);
     free(lock);
 
     /* --- promotion gated on compliance ------------------------------ */
-    zdb_cluster *leader = strcmp(leader_id, ida) == 0 ? a : b;
-    zdb_config *leader_cfg = strcmp(leader_id, ida) == 0 ? ca : cb;
+    edb_cluster *leader = strcmp(leader_id, ida) == 0 ? a : b;
+    edb_config *leader_cfg = strcmp(leader_id, ida) == 0 ? ca : cb;
     const char *other_id = strcmp(leader_id, ida) == 0 ? idb : ida;
 
-    CHECK(!zdb_cluster_promote_target(leader));
-    zdb_cluster_mark_compliant(a);
-    zdb_cluster_mark_compliant(b);
+    CHECK(!edb_cluster_promote_target(leader));
+    edb_cluster_mark_compliant(a);
+    edb_cluster_mark_compliant(b);
     /* flags are local; the leader cannot see the remote node's flag yet
      * so promotion must still be refused */
-    CHECK(!zdb_cluster_promote_target(leader));
+    CHECK(!edb_cluster_promote_target(leader));
 
     char val[32];
     snprintf(val, sizeof(val), "%lld",
-             zdb_cluster_target_generation(leader));
+             edb_cluster_target_generation(leader));
     char done_name[96];
     snprintf(done_name, sizeof(done_name), DONE_PREFIX"%.63s", other_id);
-    CHECK(zdb_setting_set(leader_cfg, done_name, val));
+    CHECK(edb_setting_set(leader_cfg, done_name, val));
     /* stage 6d: the maintainer auto-promotes once compliance is fully
      * visible to the leader, so the wave may already be promoted by now
      * (pending target cleared). Promote explicitly only if still pending. */
-    if (zdb_cluster_target_generation(leader) != 0) {
-        CHECK(zdb_cluster_target_compliant(leader));
-        CHECK(zdb_cluster_promote_target(leader));
+    if (edb_cluster_target_generation(leader) != 0) {
+        CHECK(edb_cluster_target_compliant(leader));
+        CHECK(edb_cluster_promote_target(leader));
     }
 
     /* lock released by promotion */
-    lock = zdb_setting_get(leader_cfg, LOCK_SETTING);
+    lock = edb_setting_get(leader_cfg, LOCK_SETTING);
     CHECK(lock == NULL);
     free(lock);
 
@@ -262,12 +262,12 @@ static void test_two_node_wave_lock_and_promotion(void)
     bool cleared_a = false;
     bool cleared_b = false;
     for (int i = 0; i < 50; i++) {
-        if (zdb_cluster_target_generation(a) == 0 &&
-            zdb_cluster_target_ranges(a, ra, 8) == 0) {
+        if (edb_cluster_target_generation(a) == 0 &&
+            edb_cluster_target_ranges(a, ra, 8) == 0) {
             cleared_a = true;
         }
-        if (zdb_cluster_target_generation(b) == 0 &&
-            zdb_cluster_target_ranges(b, rb, 8) == 0) {
+        if (edb_cluster_target_generation(b) == 0 &&
+            edb_cluster_target_ranges(b, rb, 8) == 0) {
             cleared_b = true;
         }
         if (cleared_a && cleared_b) {
@@ -281,16 +281,16 @@ static void test_two_node_wave_lock_and_promotion(void)
      * every flag it can see, including its own */
     char done_self[96];
     snprintf(done_self, sizeof(done_self), DONE_PREFIX"%.63s", leader_id);
-    char *v = zdb_setting_get(leader_cfg, done_self);
+    char *v = edb_setting_get(leader_cfg, done_self);
     CHECK(v == NULL);
     free(v);
 
-    zdb_cluster_stop(b);
-    zdb_cluster_stop(a);
-    zdb_config_close(ca);
-    zdb_config_close(cb);
-    zdb_engine_close(ea);
-    zdb_engine_close(eb);
+    edb_cluster_stop(b);
+    edb_cluster_stop(a);
+    edb_config_close(ca);
+    edb_config_close(cb);
+    edb_engine_close(ea);
+    edb_engine_close(eb);
 }
 
 int main(void)

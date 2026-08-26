@@ -1,5 +1,5 @@
 /* Embedded Bootstrap admin console (single-page app). The HTML is stored
- * inline so the console is served directly from the zestyd binary with no
+ * inline so the console is served directly from the epsilond binary with no
  * external files; only the Bootstrap stylesheet/script load from a CDN. */
 
 #include "admin_console.h"
@@ -13,7 +13,7 @@ static const char console_html[] =
     "<head>\n"
     "<meta charset=\"utf-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-    "<title>ZestyDB Admin</title>\n"
+    "<title>EpsilonDB Admin</title>\n"
     "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n"
     "<style>\n"
     "body{font-size:.95rem}\n"
@@ -33,7 +33,7 @@ static const char console_html[] =
     "      <div class=\"col-md-5\">\n"
     "        <div class=\"card shadow-sm\">\n"
     "          <div class=\"card-body p-4\">\n"
-    "            <h4 class=\"mb-1\">ZestyDB Admin</h4>\n"
+    "            <h4 class=\"mb-1\">EpsilonDB Admin</h4>\n"
     "            <p id=\"auth-subtitle\" class=\"text-muted mb-4\"></p>\n"
     "            <div id=\"auth-form\"></div>\n"
     "            <div id=\"auth-error\" class=\"text-danger small mt-2\"></div>\n"
@@ -46,7 +46,7 @@ static const char console_html[] =
     "<div id=\"app-view\" class=\"d-none\">\n"
     "  <nav class=\"navbar navbar-expand-lg bg-primary-subtle border-bottom\">\n"
     "    <div class=\"container-fluid wrap\">\n"
-    "      <span class=\"navbar-brand fw-semibold\">ZestyDB</span>\n"
+    "      <span class=\"navbar-brand fw-semibold\">EpsilonDB</span>\n"
     "      <div class=\"ms-auto d-flex align-items-center gap-2\">\n"
     "        <span id=\"whoami\" class=\"text-muted small\"></span>\n"
     "        <button class=\"btn btn-sm btn-outline-secondary\" onclick=\"logout()\">Log out</button>\n"
@@ -124,7 +124,7 @@ static const char console_html[] =
     "<script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js\"></script>\n"
     "<script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>\n"
     "<script>\n"
-    "var state = { token: localStorage.getItem('zdb_token') || '', user: '' };\n"
+    "var state = { token: localStorage.getItem('edb_token') || '', user: '' };\n"
     "var SECTIONS = [\n"
     "  ['overview','Overview'], ['databases','Databases'], ['groups','Groups'],\n"
     "  ['users','Users'], ['partitions','Partitions'], ['keyspaces','Keyspaces'],\n"
@@ -206,7 +206,7 @@ static const char console_html[] =
     "}\n"
     "function renderWelcome() {\n"
     "  setError('');\n"
-    "  document.getElementById('auth-subtitle').textContent = 'Welcome to ZestyDB';\n"
+    "  document.getElementById('auth-subtitle').textContent = 'Welcome to EpsilonDB';\n"
     "  document.getElementById('auth-form').innerHTML =\n"
     "    '<div class=\"d-grid gap-2\">' +\n"
     "    '<button class=\"btn btn-primary btn-lg\" onclick=\"renderSetup()\">Start new cluster</button>' +\n"
@@ -281,7 +281,7 @@ static const char console_html[] =
     "  api('POST', '/admin/setup', body).then(function (r) {\n"
     "    if (r.status === 200 && r.json && r.json.token) {\n"
     "      state.token = r.json.token; state.user = r.json.username;\n"
-    "      localStorage.setItem('zdb_token', state.token); enterApp();\n"
+    "      localStorage.setItem('edb_token', state.token); enterApp();\n"
     "    } else { setError(failText(r)); }\n"
     "  });\n"
     "}\n"
@@ -291,14 +291,14 @@ static const char console_html[] =
     "  api('POST', '/admin/login', { username: u, password: p }).then(function (r) {\n"
     "    if (r.status === 200 && r.json && r.json.token) {\n"
     "      state.token = r.json.token; state.user = r.json.username;\n"
-    "      localStorage.setItem('zdb_token', state.token); enterApp();\n"
+    "      localStorage.setItem('edb_token', state.token); enterApp();\n"
     "    } else { setError(failText(r)); }\n"
     "  });\n"
     "}\n"
     "function logout() {\n"
     "  api('POST', '/admin/logout').then(function () {\n"
     "    state.token = ''; state.user = '';\n"
-    "    localStorage.removeItem('zdb_token');\n"
+    "    localStorage.removeItem('edb_token');\n"
     "    show('auth'); renderLogin();\n"
     "  });\n"
     "}\n"
@@ -833,9 +833,9 @@ static const char console_html[] =
     "function analyticsChart(id, type, labels, datasets, opts) {\n"
     "  var el = document.getElementById(id);\n"
     "  if (!el || !window.Chart) return;\n"
-    "  if (window._zdb_charts && window._zdb_charts[id]) window._zdb_charts[id].destroy();\n"
-    "  window._zdb_charts = window._zdb_charts || {};\n"
-    "  window._zdb_charts[id] = new Chart(el, { type: type, data: { labels: labels, datasets: datasets }, options: opts || {} });\n"
+    "  if (window._edb_charts && window._edb_charts[id]) window._edb_charts[id].destroy();\n"
+    "  window._edb_charts = window._edb_charts || {};\n"
+    "  window._edb_charts[id] = new Chart(el, { type: type, data: { labels: labels, datasets: datasets }, options: opts || {} });\n"
     "}\n"
     "function renderAnalytics() {\n"
     "  var c = document.getElementById('content');\n"
@@ -856,8 +856,8 @@ static const char console_html[] =
     "      card('Nodes', nodes.length) + card('Reads', tot.reads) + card('Writes', tot.writes) + card('Updates', tot.updates) + card('Deletes', tot.deletes) + card('Avg read', avgReadMs + ' ms') + card('Avg write', avgWriteMs + ' ms') + card('Pending repl.', pending) +\n"
     "      '</div>';\n"
     "    html += '<div class=\"row g-3\">' +\n"
-    "      '<div class=\"col-lg-7\"><div class=\"card shadow-sm\"><div class=\"card-body\"><h6>Reads &amp; writes per shard</h6><canvas id=\"zdb-chart-shards\"></canvas></div></div></div>' +\n"
-    "      '<div class=\"col-lg-5\"><div class=\"card shadow-sm\"><div class=\"card-body\"><h6>Top 10 slowest operations</h6><canvas id=\"zdb-chart-slow\"></canvas></div></div></div>' +\n"
+    "      '<div class=\"col-lg-7\"><div class=\"card shadow-sm\"><div class=\"card-body\"><h6>Reads &amp; writes per shard</h6><canvas id=\"edb-chart-shards\"></canvas></div></div></div>' +\n"
+    "      '<div class=\"col-lg-5\"><div class=\"card shadow-sm\"><div class=\"card-body\"><h6>Top 10 slowest operations</h6><canvas id=\"edb-chart-slow\"></canvas></div></div></div>' +\n"
     "      '</div>';\n"
     "    html += '<h6 class=\"mt-4\">Shard workload</h6>';\n"
     "    html += table(['Partition', 'Keyspace', 'Reads', 'Writes', 'Updates', 'Deletes', 'Avg read (ms)', 'Avg write (ms)'], shards.map(function (s) {\n"
@@ -869,7 +869,7 @@ static const char console_html[] =
     "    }));\n"
     "    c.innerHTML = html;\n"
     "    if (shards.length) {\n"
-    "      analyticsChart('zdb-chart-shards', 'bar', shards.map(function (s) { return s.partition + '/' + s.keyspace; }), [\n"
+    "      analyticsChart('edb-chart-shards', 'bar', shards.map(function (s) { return s.partition + '/' + s.keyspace; }), [\n"
     "        { label: 'Reads', data: shards.map(function (s) { return s.reads; }), backgroundColor: 'rgba(13,110,253,0.6)' },\n"
     "        { label: 'Writes', data: shards.map(function (s) { return s.writes; }), backgroundColor: 'rgba(25,135,84,0.6)' }\n"
     "      ], { responsive: true });\n"
@@ -877,7 +877,7 @@ static const char console_html[] =
     "    if (slow.length) {\n"
     "      var topSlow = slow.slice().sort(function (a, b) { return b.max_us - a.max_us; }).slice(0, 10);\n"
     "      var kindColour = { read: 'rgba(13,110,253,0.7)', write: 'rgba(25,135,84,0.7)', delete: 'rgba(255,193,7,0.7)', query: 'rgba(220,53,69,0.7)' };\n"
-    "      analyticsChart('zdb-chart-slow', 'bar', topSlow.map(function (s) { return '[' + s.kind + '] ' + s.partition + '/' + (s.keyspace || '*') + (s.filter ? ' [' + s.filter + ']' : ''); }), [\n"
+    "      analyticsChart('edb-chart-slow', 'bar', topSlow.map(function (s) { return '[' + s.kind + '] ' + s.partition + '/' + (s.keyspace || '*') + (s.filter ? ' [' + s.filter + ']' : ''); }), [\n"
     "        { label: 'Max (ms)', data: topSlow.map(function (s) { return (s.max_us / 1000).toFixed(2); }), backgroundColor: topSlow.map(function (s) { return kindColour[s.kind] || 'rgba(108,117,125,0.7)'; }) }\n"
     "      ], { indexAxis: 'y', responsive: true });\n"
     "    }\n"
@@ -887,11 +887,12 @@ static const char console_html[] =
     "  var c = document.getElementById('content');\n"
     "  c.innerHTML =\n"
     "    '<h5>Performance benchmark</h5>' +\n"
-    "    '<p class=\"text-muted small\">Creates a throwaway database and 10 partitions, times writes / gets / filtered queries / updates / deletes, then deletes everything. This can take a while at the default 100k records.</p>' +\n"
+    "    '<p class=\"text-muted small\">Creates a throwaway database and 10 partitions, times writes / gets / filtered queries / updates / deletes, then deletes everything. Partitions are spread across worker threads so shards are exercised concurrently. This can take a while at the default 100k records.</p>' +\n"
     "    '<div class=\"row g-2 mb-3 align-items-end\">' +\n"
     "    '<div class=\"col\"><label class=\"form-label small mb-1\">Records per partition</label><input id=\"bm-records\" class=\"form-control\" type=\"number\" value=\"100000\"></div>' +\n"
     "    '<div class=\"col\"><label class=\"form-label small mb-1\">Replication factor</label><input id=\"bm-rf\" class=\"form-control\" type=\"number\" value=\"1\"></div>' +\n"
     "    '<div class=\"col\"><label class=\"form-label small mb-1\">Cache size (KB; 0 = default)</label><input id=\"bm-cache\" class=\"form-control\" type=\"number\" value=\"0\"></div>' +\n"
+    "    '<div class=\"col\"><label class=\"form-label small mb-1\">Threads (0 = one per partition)</label><input id=\"bm-threads\" class=\"form-control\" type=\"number\" value=\"0\"></div>' +\n"
     "    '<div class=\"col\"><label class=\"form-label small mb-1\">Journal mode</label><select id=\"bm-journal\" class=\"form-select\"><option>DELETE</option><option selected>TRUNCATE</option><option>WAL</option></select></div>' +\n"
     "    '<div class=\"col-auto\"><button id=\"bm-run\" class=\"btn btn-primary\" onclick=\"runBenchmark()\">Run</button></div></div>' +\n"
     "    '<div id=\"bm-out\"></div>';\n"
@@ -904,6 +905,7 @@ static const char console_html[] =
     "  var body = { records: parseInt(id('bm-records'), 10) || 100000,\n"
     "    replication_factor: parseInt(id('bm-rf'), 10) || 1,\n"
     "    cache_size: parseInt(id('bm-cache'), 10) || 0,\n"
+    "    threads: parseInt(id('bm-threads'), 10) || 0,\n"
     "    journal_mode: id('bm-journal') };\n"
     "  api('POST', '/admin/benchmark', body).then(function (r) {\n"
     "    btn.disabled = false;\n"
@@ -911,7 +913,7 @@ static const char console_html[] =
     "    var d = r.json;\n"
     "    function row(name, ph) { return [name, ph.count, ph.seconds.toFixed(3), Math.round(ph.ops_per_sec).toLocaleString()]; }\n"
     "    var rows = [row('Writes', d.writes), row('Gets', d.gets), row('Queries', d.queries), row('Updates', d.updates), row('Deletes', d.deletes)];\n"
-    "    var html = '<div class=\"alert alert-success\">Benchmark complete (' + d.total_records.toLocaleString() + ' records, ' + d.partitions + ' partitions, RF ' + d.replication_factor + ', cache ' + d.cache_size + ', ' + d.journal_mode + '). Database deleted.</div>';\n"
+    "    var html = '<div class=\"alert alert-success\">Benchmark complete (' + d.total_records.toLocaleString() + ' records, ' + d.partitions + ' partitions, RF ' + d.replication_factor + ', cache ' + d.cache_size + ', ' + d.journal_mode + ', ' + d.threads + ' threads). Database deleted.</div>';\n"
     "    html += table(['Operation', 'Count', 'Seconds', 'Ops/sec'], rows);\n"
     "    document.getElementById('bm-out').innerHTML = html;\n"
     "  });\n"
@@ -958,7 +960,7 @@ static const char console_html[] =
     "</body>\n"
     "</html>\n";
 
-static bool console_handler(const zdb_http_request *req, zdb_http_response *res)
+static bool console_handler(const edb_http_request *req, edb_http_response *res)
 {
     (void)req;
     res->status = 200;
@@ -968,10 +970,10 @@ static bool console_handler(const zdb_http_request *req, zdb_http_response *res)
     return true;
 }
 
-bool zdb_admin_console_register(zdb_http_server *srv)
+bool edb_admin_console_register(edb_http_server *srv)
 {
     if (!srv) {
         return false;
     }
-    return zdb_http_add_handler(srv, "GET", "/admin", console_handler);
+    return edb_http_add_handler(srv, "GET", "/admin", console_handler);
 }

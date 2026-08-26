@@ -1,9 +1,9 @@
-/* zesty_repl.h - stage 5 replication: write fan-out, per-node change
+/* epsilon_repl.h - stage 5 replication: write fan-out, per-node change
  * caches and quorum reads on top of the stage 4 mesh.
  *
- * Write path (zdb_repl_write):
+ * Write path (edb_repl_write):
  *   1. apply the change locally through the registered apply handler,
- *   2. send it as a ZSTP_REPL frame to every other online peer (each
+ *   2. send it as a ESTP_REPL frame to every other online peer (each
  *      opens its own short-lived connection; LWW on the receiving side
  *      makes retries idempotent),
  *   3. cache the change persistently for every peer that did not
@@ -14,8 +14,8 @@
  *      come back online, so an unavailable quorum is temporary but
  *      still refuses the client write (no accept-and-queue).
  *
- * Read path (zdb_repl_read_*): offered when the database's replication
- * factor > 1. GET/all/ids/query fan out ZSTP_QUERY frames to online
+ * Read path (edb_repl_read_*): offered when the database's replication
+ * factor > 1. GET/all/ids/query fan out ESTP_QUERY frames to online
  * peers and merge responses by last-write-wins; only records that a
  * quorum of responding replicas agree on are returned. When no peer
  * responds the local view is served unchanged.
@@ -23,24 +23,24 @@
  * All functions are thread-safe.
  */
 
-#ifndef ZESTY_REPL_H
-#define ZESTY_REPL_H
+#ifndef EPSILON_REPL_H
+#define EPSILON_REPL_H
 
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "../engine/zesty_config.h"
-#include "zesty_cluster.h"
+#include "../engine/epsilon_config.h"
+#include "epsilon_cluster.h"
 
-typedef struct zdb_repl zdb_repl;
+typedef struct edb_repl edb_repl;
 
 /* Applies a replicated change document:
  *   {"op":"put","db":..,"partition":..,"keyspace":..,"id":..,
  *    "value":{..},"ttl_abs":-1|epoch,"ts":epoch,"origin":node_id}
  *   {"op":"delete",...same minus value/ttl...}
  * Returns true when the change is current locally afterwards.
- * ud is the user-data pointer passed to zdb_repl_set_handlers. */
-typedef bool (*zdb_repl_apply_fn)(void *ud, const cJSON *change);
+ * ud is the user-data pointer passed to edb_repl_set_handlers. */
+typedef bool (*edb_repl_apply_fn)(void *ud, const cJSON *change);
 
 /* Answers a quorum read request document:
  *   {"q":"get","db":..,"partition":..,"keyspace":..,"id":..}
@@ -50,32 +50,32 @@ typedef bool (*zdb_repl_apply_fn)(void *ud, const cJSON *change);
  *   all/query: {"rows":[{"id":..,"timestamp":..,"value":{..}},..]}
  *   ids:    {"ids":["a","b",..]}
  */
-typedef cJSON *(*zdb_repl_read_fn)(void *ud, const cJSON *request);
+typedef cJSON *(*edb_repl_read_fn)(void *ud, const cJSON *request);
 
 /* Starts the replication service over the given cluster mesh. data_dir
  * is where the persistent change log ("changes.sqlite") lives. Installs
  * a per-cluster dispatcher so inbound REPL/QUERY frames are answered. */
-zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
+edb_repl *edb_repl_start(edb_cluster *cluster, edb_config *cfg,
                          const char *data_dir);
-void zdb_repl_stop(zdb_repl *rp);
+void edb_repl_stop(edb_repl *rp);
 
 /* Registers the engine-backed handlers for this node. ud is passed
  * through to both callbacks on every invocation. Must be called before
  * the node receives peer REPL/QUERY frames. */
-void zdb_repl_set_handlers(zdb_repl *rp, zdb_repl_apply_fn apply,
-                           zdb_repl_read_fn read, void *ud);
+void edb_repl_set_handlers(edb_repl *rp, edb_repl_apply_fn apply,
+                           edb_repl_read_fn read, void *ud);
 
-/* Result of zdb_repl_write. */
+/* Result of edb_repl_write. */
 typedef enum {
-    ZDB_REPL_OK = 0,        /* applied locally + quorum acknowledged */
-    ZDB_REPL_LOCAL_FAIL,    /* local application failed */
-    ZDB_REPL_QUORUM_LOST    /* fewer than rf/2+1 holders reached */
-} zdb_repl_status;
+    EDB_REPL_OK = 0,        /* applied locally + quorum acknowledged */
+    EDB_REPL_LOCAL_FAIL,    /* local application failed */
+    EDB_REPL_QUORUM_LOST    /* fewer than rf/2+1 holders reached */
+} edb_repl_status;
 
-/* Replicates one change document (see zdb_repl_apply_fn for shape).
+/* Replicates one change document (see edb_repl_apply_fn for shape).
  * Applies locally, fans out, caches for unreachable peers. blocks until
  * acknowledgements arrive or the (short) fan-out deadline passes. */
-zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
+edb_repl_status edb_repl_write(edb_repl *rp, const char *db,
                                const char *change_json);
 
 /* Quorum read helpers; return freshly built cJSON results (array/object)
@@ -85,23 +85,23 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
 /* Single-record read: returns the agreed {"id","timestamp","value"}
  * object (caller frees), or NULL when no replica (including local)
  * holds a live record. */
-cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
+cJSON *edb_repl_read_get(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const char *id);
 
 /* Merged collection reads over live replicas; shapes match the local
  * engine calls (plain values / id strings). */
-cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
+cJSON *edb_repl_read_all(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters);
-cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
+cJSON *edb_repl_read_query(edb_repl *rp, const char *db,
                            const char *partition, const char *keyspace,
                            const cJSON *filters);
 
-/* Like zdb_repl_read_query but each row carries {"id","timestamp",
+/* Like edb_repl_read_query but each row carries {"id","timestamp",
  * "value"} so a partition-wide query can reorder merged keyspaces. */
-cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
+cJSON *edb_repl_read_query_meta(edb_repl *rp, const char *db,
                                 const char *partition, const char *keyspace,
                                 const cJSON *filters);
-char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
+char **edb_repl_read_ids(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters,
                          size_t *count_out);
 
@@ -112,26 +112,26 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
  * writers cache those changes in their local change log for us instead;
  * the deltas are replayed after the shard snapshot lands, guaranteeing
  * the snapshot overwrite never clobbers an already-applied change. */
-void zdb_repl_set_syncing(zdb_repl *rp, bool syncing);
+void edb_repl_set_syncing(edb_repl *rp, bool syncing);
 
 /* Number of cached changes this node still owes `node_id`. */
-size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id);
+size_t edb_repl_pending_for(edb_repl *rp, const char *node_id);
 
 /* Total number of cached changes this node still owes across all peers
  * (replication backlog). Used for cluster health/analytics reporting. */
-size_t zdb_repl_pending_total(zdb_repl *rp);
+size_t edb_repl_pending_total(edb_repl *rp);
 
 /* Force-drain this node's cached changes destined for `node_id` right
  * now (blocking, single-flight). Returns the number of changes still
  * queued afterwards (0 = fully caught up). Safe to call from any thread;
- * used by the FLUSH handler and by zdb_repl_catchup. */
-size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id);
+ * used by the FLUSH handler and by edb_repl_catchup. */
+size_t edb_repl_drain_peer(edb_repl *rp, const char *node_id);
 
 /* Flush every online peer's cached-change queue for this node, looping
  * until all report empty (or ~20s deadline). Returns true when fully
- * caught up. Fine-grained counterpart to zdb_repl_catchup for callers
+ * caught up. Fine-grained counterpart to edb_repl_catchup for callers
  * (tests, 6e) that need to interleave writes with the snapshot. */
-bool zdb_repl_flush(zdb_repl *rp);
+bool edb_repl_flush(edb_repl *rp);
 
 /* Catch up one shard on this node: take a snapshot of partition/keyspace
  * from owner_addr:owner_port, invalidate the local handle, then flush
@@ -140,9 +140,9 @@ bool zdb_repl_flush(zdb_repl *rp);
  * shard's peers have been drained (data is now at least as current as a
  * quorum). Sets syncing around the snapshot transfer so concurrent
  * writes are cached and replayed, never lost. */
-bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
+bool edb_repl_catchup(edb_repl *rp, const char *owner_addr, int owner_port,
                       const char *partition, const char *keyspace);
-bool zdb_repl_catchup_required(zdb_repl *rp, const char *owner_addr,
+bool edb_repl_catchup_required(edb_repl *rp, const char *owner_addr,
                                int owner_port, const char *partition,
                                const char *keyspace);
 

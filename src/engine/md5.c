@@ -122,7 +122,7 @@ static void md5_final(md5_ctx *ctx, uint8_t out[16])
     }
 }
 
-char *zdb_md5_hex(const void *data, size_t len, char out[33])
+char *edb_md5_hex(const void *data, size_t len, char out[33])
 {
     md5_ctx ctx;
     uint8_t digest[16];

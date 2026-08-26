@@ -1,13 +1,13 @@
-/* zestyd - ZestyDB server entrypoint.
+/* epsilond - EpsilonDB server entrypoint.
  *
- * Usage: zestyd [-p port] [-b bind_addr] [-d data_dir] [-a admin_dir]
+ * Usage: epsilond [-p port] [-b bind_addr] [-d data_dir] [-a admin_dir]
  *               [-s admin_socket] [-n peer_port] [-A advertise_addr]
  *
  * Defaults: port 8123, bind 0.0.0.0, data dir ./data, admin ./admin,
- *           admin socket ./zesty-admin.sock, clustering disabled.
+ *           admin socket ./epsilon-admin.sock, clustering disabled.
  *
  * The HTTP port serves client REST traffic (authenticated). The Unix
- * domain admin socket serves local management traffic (zestyctl): no
+ * domain admin socket serves local management traffic (epsilonctl): no
  * authentication, full admin rights. With -n the node also serves its
  * raw peer socket and joins/forms a cluster mesh (stage 4).
  */
@@ -20,14 +20,14 @@
 #include <unistd.h>
 
 #include "admin/admin_console.h"
-#include "api/zesty_api.h"
-#include "engine/zesty_config.h"
-#include "httpd/zesty_http.h"
-#include "socket/zesty_cluster.h"
-#include "zesty_log.h"
+#include "api/epsilon_api.h"
+#include "engine/epsilon_config.h"
+#include "httpd/epsilon_http.h"
+#include "socket/epsilon_cluster.h"
+#include "epsilon_log.h"
 
-#define DEFAULT_ADMIN_SOCK "zesty-admin.sock"
-#define DEFAULT_LOG_PATH   "/var/log/zestydb/zestydb.log"
+#define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
+#define DEFAULT_LOG_PATH   "/var/log/epsilondb/epsilondb.log"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -58,12 +58,14 @@ static void print_banner(void)
     const char *r = use_colour() ? C_RESET : "";
 
     printf("%s%s", b, g);
-    printf("   ███████╗███████╗███████╗████████╗██╗   ██╗██████╗ ██████╗\n");
-    printf("   ╚══███╔╝██╔════╝██╔════╝╚══██╔══╝╚██╗ ██╔╝██╔══██╗██╔══██╗\n");
-    printf("     ███╔╝ ███████╗███████╗   ██║    ╚████╔╝ ██║  ██║██████╔╝\n");
-    printf("    ███╔╝  ██╔════╝╚════██║   ██║     ╚██╔╝  ██║  ██║██╔══██╗\n");
-    printf("   ███████╗███████║███████║   ██║      ██║   ██████╔╝██████╔╝\n");
-    printf("   ╚══════╝╚══════╝╚══════╝   ╚═╝      ╚═╝   ╚═════╝ ╚═════╝\n");
+    printf("  ______           _ _             _____  ____  \n");
+    printf(" |  ____|         (_) |           |  __ \\|  _ \\ \n");
+    printf(" | |__   _ __  ___ _| | ___  _ __ | |  | | |_) |\n");
+    printf(" |  __| | '_ \\/ __| | |/ _ \\| '_ \\| |  | |  _ < \n");
+    printf(" | |____| |_) \\__ \\ | | (_) | | | | |__| | |_) |\n");
+    printf(" |______| .__/|___/_|_|\\___/|_| |_|_____/|____/ \n");
+    printf("        | |                                     \n");
+    printf("        |_|                                     \n");
     printf("%s%s", y, r);
     printf("        distributed key/value database server\n");
     printf("%s", r);
@@ -71,7 +73,7 @@ static void print_banner(void)
 
 static void print_usage(const char *prog)
 {
-    printf("ZestyDB - distributed key/value database server\n");
+    printf("EpsilonDB - distributed key/value database server\n");
     printf("\n");
     printf("Usage: %s [options]\n", prog);
     printf("\n");
@@ -79,8 +81,8 @@ static void print_usage(const char *prog)
     printf("  -p, --port <port>       HTTP REST API port (default: 8123)\n");
     printf("  -b, --bind <addr>       address to bind the HTTP port to\n");
     printf("                          (default: 0.0.0.0, all interfaces)\n");
-    printf("  -s, --socket <path>     Unix admin socket for zestyctl (trusted,\n");
-    printf("                          no auth; default: ./zesty-admin.sock)\n");
+    printf("  -s, --socket <path>     Unix admin socket for epsilonctl (trusted,\n");
+    printf("                          no auth; default: ./epsilon-admin.sock)\n");
     printf("\n");
     printf("Clustering (node-to-node mesh):\n");
     printf("  -n, --peer-port <port>  enable clustering and bind this raw peer\n");
@@ -96,7 +98,7 @@ static void print_usage(const char *prog)
     printf("\n");
     printf("Logging:\n");
     printf("  -l, --log <file>        log file path\n");
-    printf("                          (default: /var/log/zestydb/zestydb.log;\n");
+    printf("                          (default: /var/log/epsilondb/epsilondb.log;\n");
     printf("                          falls back to console if not writable)\n");
     printf("\n");
     printf("Misc:\n");
@@ -150,141 +152,141 @@ int main(int argc, char **argv)
         }
     }
 
-    zdb_log_open(log_path);
+    edb_log_open(log_path);
     print_banner();
 
-    zdb_engine *engine = zdb_engine_open(data_dir);
+    edb_engine *engine = edb_engine_open(data_dir);
     if (!engine) {
-        zdb_log("ERROR", "failed to open data directory '%s'", data_dir);
-        zdb_log_close();
+        edb_log("ERROR", "failed to open data directory '%s'", data_dir);
+        edb_log_close();
         return 1;
     }
-    zdb_config *config = zdb_config_open(engine);
+    edb_config *config = edb_config_open(engine);
     if (!config) {
-        zdb_log("ERROR", "failed to open config store");
-        zdb_engine_close(engine);
-        zdb_log_close();
+        edb_log("ERROR", "failed to open config store");
+        edb_engine_close(engine);
+        edb_log_close();
         return 1;
     }
 
     /* validate ports before anything binds */
     if (port < 1 || port > 65535) {
-        zdb_log("ERROR", "invalid port %d", port);
-        zdb_config_close(config);
-        zdb_engine_close(engine);
-        zdb_log_close();
+        edb_log("ERROR", "invalid port %d", port);
+        edb_config_close(config);
+        edb_engine_close(engine);
+        edb_log_close();
         return 1;
     }
     if (peer_port < 0 || peer_port > 65535) {
-        zdb_log("ERROR", "invalid peer port %d", peer_port);
-        zdb_config_close(config);
-        zdb_engine_close(engine);
-        zdb_log_close();
+        edb_log("ERROR", "invalid peer port %d", peer_port);
+        edb_config_close(config);
+        edb_engine_close(engine);
+        edb_log_close();
         return 1;
     }
 
-    zdb_cluster *cluster = NULL;
-    zdb_repl *repl = NULL;
-    char node_id[ZDB_NODE_ID_MAX] = "";
+    edb_cluster *cluster = NULL;
+    edb_repl *repl = NULL;
+    char node_id[EDB_NODE_ID_MAX] = "";
     if (peer_port > 0) {
-        cluster = zdb_cluster_start(config, advertise_addr, peer_port,
+        cluster = edb_cluster_start(config, advertise_addr, peer_port,
                                     node_id);
         if (!cluster) {
-            zdb_log("ERROR", "failed to start cluster service on peer port %d",
+            edb_log("ERROR", "failed to start cluster service on peer port %d",
                  peer_port);
-            zdb_config_close(config);
-            zdb_engine_close(engine);
-            zdb_log_close();
+            edb_config_close(config);
+            edb_engine_close(engine);
+            edb_log_close();
             return 1;
         }
-        zdb_log("INFO", "cluster node %s advertising %s:%d (peer port %d)",
+        edb_log("INFO", "cluster node %s advertising %s:%d (peer port %d)",
              node_id, advertise_addr, peer_port, peer_port);
 
         /* re-enable mesh encryption from the persisted key (restart) */
         {
             uint8_t enc_key[32];
             uint8_t mac_key[32];
-            if (zdb_cluster_load_keys(data_dir, enc_key, mac_key)) {
-                zstp_set_mesh_key(enc_key, mac_key);
+            if (edb_cluster_load_keys(data_dir, enc_key, mac_key)) {
+                estp_set_mesh_key(enc_key, mac_key);
             }
         }
 
         /* stage 5 replication on top of the mesh */
-        repl = zdb_repl_start(cluster, config, data_dir);
+        repl = edb_repl_start(cluster, config, data_dir);
         if (!repl) {
-            zdb_log("ERROR", "failed to start replication service");
-            zdb_cluster_stop(cluster);
-            zdb_config_close(config);
-            zdb_engine_close(engine);
-            zdb_log_close();
+            edb_log("ERROR", "failed to start replication service");
+            edb_cluster_stop(cluster);
+            edb_config_close(config);
+            edb_engine_close(engine);
+            edb_log_close();
             return 1;
         }
     }
-    zdb_api_set_cluster(cluster);
-    zdb_api_set_repl(repl);
+    edb_api_set_cluster(cluster);
+    edb_api_set_repl(repl);
 
-    zdb_http_server *srv = zdb_http_start(bind_addr, port);
+    edb_http_server *srv = edb_http_start(bind_addr, port);
     if (!srv) {
-        zdb_log("ERROR", "failed to bind HTTP port %d", port);
-        zdb_repl_stop(repl);
-        zdb_cluster_stop(cluster);
-        zdb_config_close(config);
-        zdb_engine_close(engine);
-        zdb_log_close();
+        edb_log("ERROR", "failed to bind HTTP port %d", port);
+        edb_repl_stop(repl);
+        edb_cluster_stop(cluster);
+        edb_config_close(config);
+        edb_engine_close(engine);
+        edb_log_close();
         return 1;
     }
 
-    if (!zdb_admin_console_register(srv)) {
-        zdb_log("WARN", "failed to register admin console");
+    if (!edb_admin_console_register(srv)) {
+        edb_log("WARN", "failed to register admin console");
     }
     (void)admin_dir;
 
-    if (!zdb_api_register(srv, engine, config)) {
-        zdb_log("ERROR", "failed to register API routes");
-        zdb_http_stop(srv);
-        zdb_repl_stop(repl);
-        zdb_cluster_stop(cluster);
-        zdb_config_close(config);
-        zdb_engine_close(engine);
-        zdb_log_close();
+    if (!edb_api_register(srv, engine, config)) {
+        edb_log("ERROR", "failed to register API routes");
+        edb_http_stop(srv);
+        edb_repl_stop(repl);
+        edb_cluster_stop(cluster);
+        edb_config_close(config);
+        edb_engine_close(engine);
+        edb_log_close();
         return 1;
     }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    /* local admin socket: zestyctl connects here, trusted, no auth */
-    if (admin_sock && !zdb_http_start_admin(srv, admin_sock)) {
-        zdb_log("WARN", "admin socket '%s' unavailable",
+    /* local admin socket: epsilonctl connects here, trusted, no auth */
+    if (admin_sock && !edb_http_start_admin(srv, admin_sock)) {
+        edb_log("WARN", "admin socket '%s' unavailable",
              admin_sock);
     }
 
     /* workload/performance analytics recorder */
-    zdb_api_analytics_start(config, node_id);
+    edb_api_analytics_start(config, node_id);
 
-    zdb_log("INFO", "listening on port %d, data in '%s', admin socket '%s'",
+    edb_log("INFO", "listening on port %d, data in '%s', admin socket '%s'",
          port, data_dir, admin_sock ? admin_sock : "disabled");
 
     /* The accept loop runs inside its own thread started by
-     * zdb_http_start's design; wait here for shutdown. */
+     * edb_http_start's design; wait here for shutdown. */
     int tick = 0;
     while (!g_stop) {
         if (++tick % 10 == 0) {
-            zdb_log_rotate_if_needed();
+            edb_log_rotate_if_needed();
         }
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
 
-    zdb_log("INFO", "shutting down");
-    zdb_http_stop(srv);
-    zdb_api_analytics_stop();
-    zdb_api_set_cluster(NULL);
-    zdb_api_set_repl(NULL);
-    zdb_repl_stop(repl);
-    zdb_cluster_stop(cluster);
-    zdb_config_close(config);
-    zdb_engine_close(engine);
-    zdb_log_close();
+    edb_log("INFO", "shutting down");
+    edb_http_stop(srv);
+    edb_api_analytics_stop();
+    edb_api_set_cluster(NULL);
+    edb_api_set_repl(NULL);
+    edb_repl_stop(repl);
+    edb_cluster_stop(cluster);
+    edb_config_close(config);
+    edb_engine_close(engine);
+    edb_log_close();
     return 0;
 }

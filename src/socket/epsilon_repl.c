@@ -1,11 +1,11 @@
-/* zesty_repl.c - stage 5 replication implementation. See zesty_repl.h.
+/* epsilon_repl.c - stage 5 replication implementation. See epsilon_repl.h.
  *
  * Transport: every fan-out message uses its own short-lived peer
  * connection (dial, HELLO, payload frame, reply frame, close). This
  * keeps the data plane off the mesh connection objects, whose lifecycle
  * is owned by the stage 4 reader threads. Inbound REPL/QUERY frames on
  * mesh connections are answered through the dispatcher hook installed
- * by zdb_repl_start, so both transports work.
+ * by edb_repl_start, so both transports work.
  *
  * Change cache: a dedicated sqlite database "changes.sqlite" in the
  * data directory records every change that could not be acknowledged by
@@ -16,7 +16,7 @@
  * replays idempotent.
  */
 
-#include "zesty_repl.h"
+#include "epsilon_repl.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -30,11 +30,11 @@
 
 #include "../../vendor/cjson/cJSON.h"
 #include "../engine/md5.h"
-#include "../engine/zesty_engine.h"
+#include "../engine/epsilon_engine.h"
 #include "../sqlite/sqlite3.h"
-#include "../zesty_log.h"
-#include "zstp_wire.h"
-#include "zesty_snap.h"
+#include "../epsilon_log.h"
+#include "estp_wire.h"
+#include "epsilon_snap.h"
 
 #define MAX_PEERS_SNAPSHOT 64
 #define REPL_CONNECT_TIMEOUT_MS 1500
@@ -81,12 +81,12 @@ static void set_socket_timeouts(int fd, int ms)
 
 /* One request/reply exchange on a private connection. Returns the
  * reply type and malloc'd payload, or -1/NULL on any failure. */
-static int rpc_once(const char *addr, int port, zstp_type send_type,
-                    const char *payload, zstp_type want_type,
+static int rpc_once(const char *addr, int port, estp_type send_type,
+                    const char *payload, estp_type want_type,
                     char **reply_out)
 {
     *reply_out = NULL;
-    int fd = zstp_dial(addr, port);
+    int fd = estp_dial(addr, port);
     if (fd < 0) {
         return -1;
     }
@@ -103,13 +103,13 @@ static int rpc_once(const char *addr, int port, zstp_type send_type,
     char *hello_str = json_print(hello);
     cJSON_Delete(hello);
     if (!hello_str ||
-        zstp_send_frame(fd, ZSTP_HELLO, hello_str, NULL) != 0) {
+        estp_send_frame(fd, ESTP_HELLO, hello_str, NULL) != 0) {
         free(hello_str);
         goto done;
     }
     free(hello_str);
 
-    if (zstp_send_frame(fd, send_type, payload, NULL) != 0) {
+    if (estp_send_frame(fd, send_type, payload, NULL) != 0) {
         goto done;
     }
 
@@ -121,7 +121,7 @@ static int rpc_once(const char *addr, int port, zstp_type send_type,
             goto done;
         }
         char *in = NULL;
-        int t = zstp_recv_frame(fd, &in);
+        int t = estp_recv_frame(fd, &in);
         if (t < 0) {
             free(in);
             goto done;
@@ -196,7 +196,7 @@ static bool cache_open(change_cache *cc, const char *data_dir)
                      "DROP TABLE PendingChanges;"
                      "ALTER TABLE PendingChangesV2 RENAME TO PendingChanges;",
                      NULL, NULL, &err) != SQLITE_OK) {
-        zdb_log("ERROR", "change cache init failed: %s",
+        edb_log("ERROR", "change cache init failed: %s",
                 err ? err : "?");
         sqlite3_free(err);
         sqlite3_close(cc->db);
@@ -241,7 +241,7 @@ static void cache_append(change_cache *cc, const char *target,
         sqlite3_bind_text(stmt, 3, payload, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, epoch_now());
         if (sqlite3_step(stmt) != SQLITE_DONE) {
-            zdb_log("ERROR", "change cache insert failed: %s",
+            edb_log("ERROR", "change cache insert failed: %s",
                     sqlite3_errmsg(cc->db));
         }
     }
@@ -275,31 +275,31 @@ static void cache_remove(change_cache *cc, const char *target,
 /* ------------------------------------------------------------------ */
 /* replication service state                                           */
 
-struct zdb_repl {
-    zdb_cluster *cluster;
-    zdb_config *cfg;
-    zdb_engine *cfg_engine;   /* engine behind cfg, for direct calls */
+struct edb_repl {
+    edb_cluster *cluster;
+    edb_config *cfg;
+    edb_engine *cfg_engine;   /* engine behind cfg, for direct calls */
 
     change_cache cache;
 
-    zdb_repl_apply_fn apply;
-    zdb_repl_read_fn read;
+    edb_repl_apply_fn apply;
+    edb_repl_read_fn read;
     void *ud;
 
-    char self_id[ZDB_NODE_ID_MAX];
+    char self_id[EDB_NODE_ID_MAX];
     char data_dir[512];
     long long change_seq;
 
     bool running;
     pthread_t maint_thread;
 
-    /* stage 6c: syncing gate (see zdb_repl_set_syncing) */
+    /* stage 6c: syncing gate (see edb_repl_set_syncing) */
     pthread_mutex_t sync_lock;
     bool syncing;
 
     /* per-peer replay bookkeeping, guarded by replay_lock */
     pthread_mutex_t replay_lock;
-    char replaying[ZDB_NODE_ID_MAX];   /* node currently being drained */
+    char replaying[EDB_NODE_ID_MAX];   /* node currently being drained */
 };
 
 /* ------------------------------------------------------------------ */
@@ -325,14 +325,14 @@ static bool ack_ok(const char *reply)
 static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
                           int *reply_type, char **reply_json)
 {
-    zdb_repl *rp = ctx;
+    edb_repl *rp = ctx;
     *reply_json = NULL;
     cJSON *req = cJSON_Parse(payload);
     if (!req) {
         return false;
     }
 
-    if (msg_type == ZSTP_REPL && rp && rp->apply) {
+    if (msg_type == ESTP_REPL && rp && rp->apply) {
         /* stage 6c: while this node is syncing shard snapshots, refuse
          * incoming writes so the sender caches them for later replay */
         pthread_mutex_lock(&rp->sync_lock);
@@ -349,18 +349,18 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
             return false;
         }
         cJSON_AddBoolToObject(ack, "ok", ok);
-        *reply_type = ZSTP_ACK;
+        *reply_type = ESTP_ACK;
         *reply_json = json_print(ack);
         cJSON_Delete(ack);
         return *reply_json != NULL;
     }
 
-    if (msg_type == ZSTP_FLUSH && rp) {
+    if (msg_type == ESTP_FLUSH && rp) {
         /* stage 6c: a peer asks us to flush our cached changes for it.
          * Drain synchronously and report how many remain. */
         const cJSON *jt =
             cJSON_GetObjectItemCaseSensitive(req, "target");
-        char target[ZDB_NODE_ID_MAX] = "";
+        char target[EDB_NODE_ID_MAX] = "";
         if (cJSON_IsString(jt) && jt->valuestring) {
             snprintf(target, sizeof(target), "%.63s", jt->valuestring);
         }
@@ -368,7 +368,7 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
 
         size_t remaining = 0;
         if (target[0]) {
-            remaining = zdb_repl_drain_peer(rp, target);
+            remaining = edb_repl_drain_peer(rp, target);
         }
         cJSON *ack = cJSON_CreateObject();
         if (!ack) {
@@ -376,13 +376,13 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
         }
         cJSON_AddBoolToObject(ack, "ok", remaining == 0);
         cJSON_AddNumberToObject(ack, "pending", (double)remaining);
-        *reply_type = ZSTP_ACK;
+        *reply_type = ESTP_ACK;
         *reply_json = json_print(ack);
         cJSON_Delete(ack);
         return *reply_json != NULL;
     }
 
-    if (msg_type == ZSTP_QUERY && rp && rp->read) {
+    if (msg_type == ESTP_QUERY && rp && rp->read) {
         cJSON *res = rp->read(rp->ud, req);
         cJSON_Delete(req);
         if (!res) {
@@ -391,7 +391,7 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
                 cJSON_AddNullToObject(res, "row");
             }
         }
-        *reply_type = ZSTP_RESULT;
+        *reply_type = ESTP_RESULT;
         *reply_json = json_print(res);
         cJSON_Delete(res);
         return *reply_json != NULL;
@@ -406,7 +406,7 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
 
 /* Extracts db/partition/keyspace/id plus put-specific fields from a
  * change document and applies it to the local engine. */
-static bool apply_change_local(zdb_repl *rp, const cJSON *change)
+static bool apply_change_local(edb_repl *rp, const cJSON *change)
 {
     const cJSON *operation = cJSON_GetObjectItemCaseSensitive(change, "op");
     const cJSON *partition =
@@ -436,44 +436,44 @@ static bool apply_change_local(zdb_repl *rp, const cJSON *change)
         long long absolute_ttl = cJSON_IsNumber(ttl)
                                      ? (long long)ttl->valuedouble
                                      : -1;
-        bool ok = zdb_replica_put_origin(
+        bool ok = edb_replica_put_origin(
             rp->cfg_engine, partition->valuestring, keyspace->valuestring,
             id->valuestring, encoded, absolute_ttl, modified, origin);
         free(encoded);
         return ok;
     }
     return strcmp(operation->valuestring, "delete") == 0 &&
-           zdb_replica_delete_origin(
+           edb_replica_delete_origin(
                rp->cfg_engine, partition->valuestring, keyspace->valuestring,
                id->valuestring, modified, origin);
 }
 
-static int replication_factor(zdb_repl *rp, const char *db)
+static int replication_factor(edb_repl *rp, const char *db)
 {
-    zdb_database_info info;
-    if (rp && rp->cfg && zdb_database_get(rp->cfg, db, &info) &&
+    edb_database_info info;
+    if (rp && rp->cfg && edb_database_get(rp->cfg, db, &info) &&
         info.replication_factor > 0) {
         return info.replication_factor;
     }
     return 1;
 }
 
-static size_t holder_ids(zdb_repl *rp, const char *partition,
+static size_t holder_ids(edb_repl *rp, const char *partition,
                          const char *keyspace, int rf,
-                         char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX])
+                         char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX])
 {
     char path[1024];
     char key[33];
-    if (!zdb_shard_path(rp->cfg_engine, partition, keyspace, path,
+    if (!edb_shard_path(rp->cfg_engine, partition, keyspace, path,
                         sizeof(path), key)) {
         return 0;
     }
-    char candidates[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
-    size_t count = zdb_cluster_holders(rp->cluster, key, candidates,
+    char candidates[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX];
+    size_t count = edb_cluster_holders(rp->cluster, key, candidates,
                                        MAX_PEERS_SNAPSHOT);
-    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    edb_peer_info peers[MAX_PEERS_SNAPSHOT];
     size_t npeers =
-        zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+        edb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
     size_t used = 0;
     for (int online_pass = 1; online_pass >= 0 && used < (size_t)rf;
          online_pass--) {
@@ -487,7 +487,7 @@ static size_t holder_ids(zdb_repl *rp, const char *partition,
             if (online != (online_pass != 0)) {
                 continue;
             }
-            snprintf(holders[used], ZDB_NODE_ID_MAX, "%s", candidates[i]);
+            snprintf(holders[used], EDB_NODE_ID_MAX, "%s", candidates[i]);
             used++;
         }
     }
@@ -495,7 +495,7 @@ static size_t holder_ids(zdb_repl *rp, const char *partition,
 }
 
 static bool id_in_holders(const char *id,
-                          char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX],
+                          char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX],
                           size_t count)
 {
     for (size_t i = 0; i < count; i++) {
@@ -507,15 +507,15 @@ static bool id_in_holders(const char *id,
 }
 
 
-zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
+edb_repl_status edb_repl_write(edb_repl *rp, const char *db,
                                const char *change_json)
 {
     if (!rp || !db || !change_json) {
-        return ZDB_REPL_LOCAL_FAIL;
+        return EDB_REPL_LOCAL_FAIL;
     }
     cJSON *change = cJSON_Parse(change_json);
     if (!change) {
-        return ZDB_REPL_LOCAL_FAIL;
+        return EDB_REPL_LOCAL_FAIL;
     }
     const cJSON *partition =
         cJSON_GetObjectItemCaseSensitive(change, "partition");
@@ -524,7 +524,7 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
     if (!cJSON_IsString(partition) || !partition->valuestring ||
         !cJSON_IsString(keyspace) || !keyspace->valuestring) {
         cJSON_Delete(change);
-        return ZDB_REPL_LOCAL_FAIL;
+        return EDB_REPL_LOCAL_FAIL;
     }
 
     pthread_mutex_lock(&rp->replay_lock);
@@ -540,23 +540,23 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
     char *payload = json_print(change);
     if (!payload) {
         cJSON_Delete(change);
-        return ZDB_REPL_LOCAL_FAIL;
+        return EDB_REPL_LOCAL_FAIL;
     }
 
     int rf = replication_factor(rp, db);
-    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX];
     size_t nholders = holder_ids(rp, partition->valuestring,
                                  keyspace->valuestring, rf, holders);
     if (nholders == 0) {
-        snprintf(holders[0], ZDB_NODE_ID_MAX, "%s", rp->self_id);
+        snprintf(holders[0], EDB_NODE_ID_MAX, "%s", rp->self_id);
         nholders = 1;
     }
     int required = (int)nholders / 2 + 1;
     bool self_holder = id_in_holders(rp->self_id, holders, nholders);
 
-    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    edb_peer_info peers[MAX_PEERS_SNAPSHOT];
     size_t npeers =
-        zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+        edb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
     bool delivered[MAX_PEERS_SNAPSHOT] = {0};
     int acknowledgements = self_holder ? 1 : 0;
 
@@ -569,9 +569,9 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
             continue;
         }
         char *reply = NULL;
-        int type = rpc_once(peers[i].addr, peers[i].port, ZSTP_REPL, payload,
-                            ZSTP_ACK, &reply);
-        if (type == ZSTP_ACK && ack_ok(reply)) {
+        int type = rpc_once(peers[i].addr, peers[i].port, ESTP_REPL, payload,
+                            ESTP_ACK, &reply);
+        if (type == ESTP_ACK && ack_ok(reply)) {
             delivered[i] = true;
             if (id_in_holders(peers[i].id, holders, nholders)) {
                 acknowledgements++;
@@ -581,7 +581,7 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
     }
 
     if (acknowledgements < required) {
-        zdb_log("WARN",
+        edb_log("WARN",
                 "quorum lost writing '%s': %d/%d holders reached",
                 db, acknowledgements, required);
         for (size_t i = 0; i < npeers; i++) {
@@ -595,7 +595,7 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
         }
         free(payload);
         cJSON_Delete(change);
-        return ZDB_REPL_QUORUM_LOST;
+        return EDB_REPL_QUORUM_LOST;
     }
 
     if (!apply_change_local(rp, change)) {
@@ -610,7 +610,7 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
         }
         free(payload);
         cJSON_Delete(change);
-        return ZDB_REPL_LOCAL_FAIL;
+        return EDB_REPL_LOCAL_FAIL;
     }
     cJSON_Delete(change);
 
@@ -624,20 +624,20 @@ zdb_repl_status zdb_repl_write(zdb_repl *rp, const char *db,
         }
     }
     free(payload);
-    return ZDB_REPL_OK;
+    return EDB_REPL_OK;
 }
 
 /* ------------------------------------------------------------------ */
 /* replay                                                              */
 
 /* Sends one cached change right now. Returns true when acknowledged. */
-static bool deliver_cached(zdb_repl *rp, const zdb_peer_info *peer,
+static bool deliver_cached(edb_repl *rp, const edb_peer_info *peer,
                            const char *cid, const char *payload)
 {
     char *reply = NULL;
-    int t = rpc_once(peer->addr, peer->port, ZSTP_REPL, payload, ZSTP_ACK,
+    int t = rpc_once(peer->addr, peer->port, ESTP_REPL, payload, ESTP_ACK,
                      &reply);
-    bool ok = (t == ZSTP_ACK) && ack_ok(reply);
+    bool ok = (t == ESTP_ACK) && ack_ok(reply);
     free(reply);
     if (ok) {
         cache_remove(&rp->cache, peer->id, cid);
@@ -647,7 +647,7 @@ static bool deliver_cached(zdb_repl *rp, const zdb_peer_info *peer,
 }
 
 typedef struct {
-    char target[ZDB_NODE_ID_MAX];
+    char target[EDB_NODE_ID_MAX];
     char cid[96];
     char *payload;   /* malloc'd */
 } pending_row;
@@ -706,10 +706,10 @@ static void free_rows(pending_row *rows, size_t count)
 
 /* Resolves a node id to its current dialable peer info. Returns false
  * when unknown or not dialable. */
-static bool find_peer(zdb_repl *rp, const char *node_id, zdb_peer_info *out)
+static bool find_peer(edb_repl *rp, const char *node_id, edb_peer_info *out)
 {
-    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-    size_t n = zdb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
+    edb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    size_t n = edb_cluster_peers(rp->cluster, peers, MAX_PEERS_SNAPSHOT);
     for (size_t i = 0; i < n; i++) {
         if (strcmp(peers[i].id, node_id) == 0 &&
             peers[i].addr[0] != '\0' && peers[i].port > 0) {
@@ -720,7 +720,7 @@ static bool find_peer(zdb_repl *rp, const char *node_id, zdb_peer_info *out)
     return false;
 }
 
-size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id)
+size_t edb_repl_pending_for(edb_repl *rp, const char *node_id)
 {
     if (!rp || !node_id) {
         return 0;
@@ -746,7 +746,7 @@ size_t zdb_repl_pending_for(zdb_repl *rp, const char *node_id)
     return count;
 }
 
-size_t zdb_repl_pending_total(zdb_repl *rp)
+size_t edb_repl_pending_total(edb_repl *rp)
 {
     if (!rp || !rp->cache.db) {
         return 0;
@@ -766,7 +766,7 @@ size_t zdb_repl_pending_total(zdb_repl *rp)
     return count;
 }
 
-size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id)
+size_t edb_repl_drain_peer(edb_repl *rp, const char *node_id)
 {
     if (!rp || !node_id) {
         return 0;
@@ -777,17 +777,17 @@ size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id)
     if (rp->replaying[0] != '\0' &&
         strcmp(rp->replaying, node_id) == 0) {
         pthread_mutex_unlock(&rp->replay_lock);
-        return zdb_repl_pending_for(rp, node_id);
+        return edb_repl_pending_for(rp, node_id);
     }
     snprintf(rp->replaying, sizeof(rp->replaying), "%s", node_id);
     pthread_mutex_unlock(&rp->replay_lock);
 
-    zdb_peer_info peer;
+    edb_peer_info peer;
     if (!find_peer(rp, node_id, &peer)) {
         pthread_mutex_lock(&rp->replay_lock);
         rp->replaying[0] = '\0';
         pthread_mutex_unlock(&rp->replay_lock);
-        return zdb_repl_pending_for(rp, node_id);
+        return edb_repl_pending_for(rp, node_id);
     }
 
     /* drain in batches until the queue is empty or delivery stalls */
@@ -817,12 +817,12 @@ size_t zdb_repl_drain_peer(zdb_repl *rp, const char *node_id)
     pthread_mutex_lock(&rp->replay_lock);
     rp->replaying[0] = '\0';
     pthread_mutex_unlock(&rp->replay_lock);
-    return zdb_repl_pending_for(rp, node_id);
+    return edb_repl_pending_for(rp, node_id);
 }
 
 /* Drains the queue for one peer. Single-flight per peer via
  * rp->replaying. Runs on the maintenance thread only. */
-static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
+static void replay_for_peer(edb_repl *rp, const edb_peer_info *peer)
 {
     pthread_mutex_lock(&rp->replay_lock);
     if (strcmp(rp->replaying, peer->id) == 0) {
@@ -847,7 +847,7 @@ static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
     }
     free_rows(rows, count);
     if (count && delivered == count) {
-        zdb_log("INFO", "replayed %zu cached changes to %s", delivered,
+        edb_log("INFO", "replayed %zu cached changes to %s", delivered,
                 peer->id);
     }
 
@@ -858,7 +858,7 @@ static void replay_for_peer(zdb_repl *rp, const zdb_peer_info *peer)
 
 static void *repl_maint_main(void *arg)
 {
-    zdb_repl *rp = arg;
+    edb_repl *rp = arg;
     for (;;) {
         pthread_mutex_lock(&rp->sync_lock);
         bool running = rp->running;
@@ -867,8 +867,8 @@ static void *repl_maint_main(void *arg)
             break;
         }
         sleep_ms(REPL_TICK_MS);
-        zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-        size_t count = zdb_cluster_peers(rp->cluster, peers,
+        edb_peer_info peers[MAX_PEERS_SNAPSHOT];
+        size_t count = edb_cluster_peers(rp->cluster, peers,
                                          MAX_PEERS_SNAPSHOT);
         for (size_t i = 0; i < count; i++) {
             if (peers[i].online && strcmp(peers[i].id, rp->self_id) != 0) {
@@ -890,7 +890,7 @@ static void *repl_maint_main(void *arg)
 #define MAX_REPLIES 16
 
 typedef struct {
-    const zdb_peer_info *peer;
+    const edb_peer_info *peer;
     const char *payload;
     cJSON *reply;
 } query_job;
@@ -899,15 +899,15 @@ static void *query_worker(void *arg)
 {
     query_job *job = arg;
     char *reply = NULL;
-    if (rpc_once(job->peer->addr, job->peer->port, ZSTP_QUERY,
-                 job->payload, ZSTP_RESULT, &reply) == ZSTP_RESULT) {
+    if (rpc_once(job->peer->addr, job->peer->port, ESTP_QUERY,
+                 job->payload, ESTP_RESULT, &reply) == ESTP_RESULT) {
         job->reply = reply ? cJSON_Parse(reply) : NULL;
     }
     free(reply);
     return NULL;
 }
 
-static size_t query_all(zdb_repl *rp, const cJSON *request,
+static size_t query_all(edb_repl *rp, const cJSON *request,
                         cJSON **replies, size_t cap)
 {
     char *payload = json_print(request);
@@ -924,13 +924,13 @@ static size_t query_all(zdb_repl *rp, const cJSON *request,
         free(payload);
         return 0;
     }
-    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX];
     size_t nholders = holder_ids(rp, partition->valuestring,
                                  keyspace->valuestring,
                                  replication_factor(rp, database->valuestring),
                                  holders);
-    zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-    size_t npeers = zdb_cluster_peers(rp->cluster, peers,
+    edb_peer_info peers[MAX_PEERS_SNAPSHOT];
+    size_t npeers = edb_cluster_peers(rp->cluster, peers,
                                       MAX_PEERS_SNAPSHOT);
     query_job jobs[MAX_REPLIES];
     pthread_t threads[MAX_REPLIES];
@@ -972,7 +972,7 @@ static void value_fingerprint(const cJSON *value, char out[33])
         out[0] = '\0';
         return;
     }
-    zdb_md5_hex(vs, strlen(vs), out);
+    edb_md5_hex(vs, strlen(vs), out);
     free(vs);
 }
 
@@ -1246,20 +1246,20 @@ static cJSON *make_request(const char *q, const char *db,
 }
 
 /* True when quorum reads should engage: clustered, rf > 1. */
-static bool quorum_applies(zdb_repl *rp, const char *db)
+static bool quorum_applies(edb_repl *rp, const char *db)
 {
     if (!rp || !rp->cluster || !rp->read) {
         return false;
     }
-    zdb_database_info info;
-    return zdb_database_get(rp->cfg, db, &info) &&
+    edb_database_info info;
+    return edb_database_get(rp->cfg, db, &info) &&
            info.replication_factor > 1;
 }
 
-static int read_quorum(zdb_repl *rp, const char *db, const char *partition,
+static int read_quorum(edb_repl *rp, const char *db, const char *partition,
                        const char *keyspace, bool *self_holder)
 {
-    char holders[MAX_PEERS_SNAPSHOT][ZDB_NODE_ID_MAX];
+    char holders[MAX_PEERS_SNAPSHOT][EDB_NODE_ID_MAX];
     size_t count = holder_ids(rp, partition, keyspace,
                               replication_factor(rp, db), holders);
     if (count == 0) {
@@ -1293,7 +1293,7 @@ static char **strings_from_json(const cJSON *array, size_t *count_out)
         }
         strings[*count_out] = strdup(item->valuestring);
         if (!strings[*count_out]) {
-            zdb_free_strings(strings);
+            edb_free_strings(strings);
             *count_out = 0;
             return NULL;
         }
@@ -1306,7 +1306,7 @@ static char **strings_from_json(const cJSON *array, size_t *count_out)
     return strings;
 }
 
-cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
+cJSON *edb_repl_read_get(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const char *id)
 {
     bool self_holder = true;
@@ -1315,7 +1315,7 @@ cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
                        : 1;
     long long local_ts = 0;
     cJSON *local = (rp && rp->cfg_engine && self_holder)
-                       ? zdb_get_ts(rp->cfg_engine, partition, keyspace,
+                       ? edb_get_ts(rp->cfg_engine, partition, keyspace,
                                     id, &local_ts)
                        : NULL;
     if (!quorum_applies(rp, db)) {
@@ -1437,11 +1437,11 @@ cJSON *zdb_repl_read_get(zdb_repl *rp, const char *db, const char *partition,
     return result;
 }
 
-cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
+cJSON *edb_repl_read_all(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters)
 {
     if (!quorum_applies(rp, db)) {
-        return rp ? zdb_all(rp->cfg_engine, partition, keyspace, filters)
+        return rp ? edb_all(rp->cfg_engine, partition, keyspace, filters)
                   : NULL;
     }
 
@@ -1456,7 +1456,7 @@ cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
     int required = read_quorum(rp, db, partition, keyspace, &self_holder);
 
     cJSON *local_rows = self_holder
-                            ? zdb_all_ts(rp->cfg_engine, partition, keyspace,
+                            ? edb_all_ts(rp->cfg_engine, partition, keyspace,
                                          filters)
                             : NULL;
     if (local_rows) {
@@ -1494,13 +1494,13 @@ cJSON *zdb_repl_read_all(zdb_repl *rp, const char *db, const char *partition,
     return merged ? merged : cJSON_CreateArray();
 }
 
-char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
+char **edb_repl_read_ids(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters,
                          size_t *count_out)
 {
     *count_out = 0;
     if (!quorum_applies(rp, db)) {
-        return rp ? zdb_ids(rp->cfg_engine, partition, keyspace, filters,
+        return rp ? edb_ids(rp->cfg_engine, partition, keyspace, filters,
                             count_out)
                   : NULL;
     }
@@ -1520,7 +1520,7 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
     int required = read_quorum(rp, db, partition, keyspace, &self_holder);
 
     if (self_holder) {
-        lists[n] = zdb_ids(rp->cfg_engine, partition, keyspace, filters,
+        lists[n] = edb_ids(rp->cfg_engine, partition, keyspace, filters,
                            &counts[n]);
         if (!lists[n]) {
             counts[n] = 0;
@@ -1546,13 +1546,13 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
 
     if ((int)n < required) {
         for (size_t i = 0; i < n; i++) {
-            zdb_free_strings(lists[i]);
+            edb_free_strings(lists[i]);
         }
         return NULL;
     }
     cJSON *agreed = merge_agreed_ids(lists, counts, n, required);
     for (size_t i = 0; i < n; i++) {
-        zdb_free_strings(lists[i]);
+        edb_free_strings(lists[i]);
     }
     if (!agreed) {
         return NULL;
@@ -1577,12 +1577,12 @@ char **zdb_repl_read_ids(zdb_repl *rp, const char *db, const char *partition,
     return out;
 }
 
-cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
+cJSON *edb_repl_read_query(edb_repl *rp, const char *db,
                            const char *partition, const char *keyspace,
                            const cJSON *filters)
 {
     if (!quorum_applies(rp, db)) {
-        return rp ? zdb_query(rp->cfg_engine, partition, keyspace, filters)
+        return rp ? edb_query(rp->cfg_engine, partition, keyspace, filters)
                   : NULL;
     }
 
@@ -1599,7 +1599,7 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
     bool self_holder = false;
     int required = read_quorum(rp, db, partition, keyspace, &self_holder);
     cJSON *local_rows = self_holder
-                            ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+                            ? edb_query_ts(rp->cfg_engine, partition, keyspace,
                                            filters)
                             : NULL;
     if (local_rows) {
@@ -1632,15 +1632,15 @@ cJSON *zdb_repl_read_query(zdb_repl *rp, const char *db,
     return merged ? merged : cJSON_CreateArray();
 }
 
-/* Like zdb_repl_read_query but returns timestamp-tagged rows
+/* Like edb_repl_read_query but returns timestamp-tagged rows
  * {"id","timestamp","value"} so a partition-wide query can merge several
  * keyspaces and reorder them afterwards. */
-cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
+cJSON *edb_repl_read_query_meta(edb_repl *rp, const char *db,
                                 const char *partition, const char *keyspace,
                                 const cJSON *filters)
 {
     if (!quorum_applies(rp, db)) {
-        return rp ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+        return rp ? edb_query_ts(rp->cfg_engine, partition, keyspace,
                                  filters)
                   : NULL;
     }
@@ -1658,7 +1658,7 @@ cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
     bool self_holder = false;
     int required = read_quorum(rp, db, partition, keyspace, &self_holder);
     cJSON *local_rows = self_holder
-                            ? zdb_query_ts(rp->cfg_engine, partition, keyspace,
+                            ? edb_query_ts(rp->cfg_engine, partition, keyspace,
                                            filters)
                             : NULL;
     if (local_rows) {
@@ -1694,7 +1694,7 @@ cJSON *zdb_repl_read_query_meta(zdb_repl *rp, const char *db,
 /* ------------------------------------------------------------------ */
 /* stage 6c: delta catch-up                                            */
 
-void zdb_repl_set_syncing(zdb_repl *rp, bool syncing)
+void edb_repl_set_syncing(edb_repl *rp, bool syncing)
 {
     if (!rp) {
         return;
@@ -1708,15 +1708,15 @@ void zdb_repl_set_syncing(zdb_repl *rp, bool syncing)
  * drain its cached changes for us; loops until all report an empty
  * queue or the deadline passes. Returns true when every peer reported
  * pending == 0. */
-bool zdb_repl_flush(zdb_repl *rp)
+bool edb_repl_flush(edb_repl *rp)
 {
     if (!rp) {
         return false;
     }
     long long deadline = mono_ms() + 20000;
     for (;;) {
-        zdb_peer_info peers[MAX_PEERS_SNAPSHOT];
-        size_t count = zdb_cluster_peers(rp->cluster, peers,
+        edb_peer_info peers[MAX_PEERS_SNAPSHOT];
+        size_t count = edb_cluster_peers(rp->cluster, peers,
                                          MAX_PEERS_SNAPSHOT);
         bool all_empty = true;
         for (size_t i = 0; i < count; i++) {
@@ -1731,10 +1731,10 @@ bool zdb_repl_flush(zdb_repl *rp)
             snprintf(request, sizeof(request), "{\"target\":\"%.63s\"}",
                      rp->self_id);
             char *reply = NULL;
-            int type = rpc_once(peers[i].addr, peers[i].port, ZSTP_FLUSH,
-                                request, ZSTP_ACK, &reply);
+            int type = rpc_once(peers[i].addr, peers[i].port, ESTP_FLUSH,
+                                request, ESTP_ACK, &reply);
             bool valid_empty = false;
-            if (type == ZSTP_ACK && reply) {
+            if (type == ESTP_ACK && reply) {
                 cJSON *doc = cJSON_Parse(reply);
                 const cJSON *ok = doc
                                       ? cJSON_GetObjectItemCaseSensitive(doc,
@@ -1762,7 +1762,7 @@ bool zdb_repl_flush(zdb_repl *rp)
     }
 }
 
-static bool repl_catchup(zdb_repl *rp, const char *owner_addr,
+static bool repl_catchup(edb_repl *rp, const char *owner_addr,
                          int owner_port, const char *partition,
                          const char *keyspace, bool source_required)
 {
@@ -1770,37 +1770,37 @@ static bool repl_catchup(zdb_repl *rp, const char *owner_addr,
         return false;
     }
 
-    zdb_repl_set_syncing(rp, true);
+    edb_repl_set_syncing(rp, true);
     char key[33];
     char path[1024];
-    if (!zdb_shard_path(rp->cfg_engine, partition, keyspace, path,
+    if (!edb_shard_path(rp->cfg_engine, partition, keyspace, path,
                         sizeof(path), key)) {
-        zdb_repl_set_syncing(rp, false);
+        edb_repl_set_syncing(rp, false);
         return false;
     }
     int snapshot_rc = source_required
-                          ? zdb_snap_fetch_required(owner_addr, owner_port, key,
+                          ? edb_snap_fetch_required(owner_addr, owner_port, key,
                                                     rp->data_dir)
-                          : zdb_snap_fetch(owner_addr, owner_port, key,
+                          : edb_snap_fetch(owner_addr, owner_port, key,
                                            rp->data_dir);
     if (snapshot_rc != 0 ||
-        !zdb_shard_invalidate(rp->cfg_engine, partition, keyspace)) {
-        zdb_repl_set_syncing(rp, false);
+        !edb_shard_invalidate(rp->cfg_engine, partition, keyspace)) {
+        edb_repl_set_syncing(rp, false);
         return false;
     }
 
-    zdb_repl_set_syncing(rp, false);
-    return zdb_repl_flush(rp);
+    edb_repl_set_syncing(rp, false);
+    return edb_repl_flush(rp);
 }
 
-bool zdb_repl_catchup(zdb_repl *rp, const char *owner_addr, int owner_port,
+bool edb_repl_catchup(edb_repl *rp, const char *owner_addr, int owner_port,
                       const char *partition, const char *keyspace)
 {
     return repl_catchup(rp, owner_addr, owner_port, partition, keyspace,
                         false);
 }
 
-bool zdb_repl_catchup_required(zdb_repl *rp, const char *owner_addr,
+bool edb_repl_catchup_required(edb_repl *rp, const char *owner_addr,
                                int owner_port, const char *partition,
                                const char *keyspace)
 {
@@ -1811,8 +1811,8 @@ bool zdb_repl_catchup_required(zdb_repl *rp, const char *owner_addr,
 /* ------------------------------------------------------------------ */
 /* lifecycle                                                           */
 
-void zdb_repl_set_handlers(zdb_repl *rp, zdb_repl_apply_fn apply,
-                           zdb_repl_read_fn read, void *ud)
+void edb_repl_set_handlers(edb_repl *rp, edb_repl_apply_fn apply,
+                           edb_repl_read_fn read, void *ud)
 {
     if (!rp) {
         return;
@@ -1822,41 +1822,41 @@ void zdb_repl_set_handlers(zdb_repl *rp, zdb_repl_apply_fn apply,
     rp->ud = ud;
 }
 
-zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
+edb_repl *edb_repl_start(edb_cluster *cluster, edb_config *cfg,
                          const char *data_dir)
 {
     if (!cluster || !cfg || !data_dir) {
         return NULL;
     }
-    zdb_repl *rp = calloc(1, sizeof(*rp));
+    edb_repl *rp = calloc(1, sizeof(*rp));
     if (!rp) {
         return NULL;
     }
     rp->cluster = cluster;
     rp->cfg = cfg;
-    rp->cfg_engine = zdb_config_engine(cfg);
+    rp->cfg_engine = edb_config_engine(cfg);
     snprintf(rp->self_id, sizeof(rp->self_id), "%s",
-             zdb_cluster_self_id(cluster));
+             edb_cluster_self_id(cluster));
     snprintf(rp->data_dir, sizeof(rp->data_dir), "%s", data_dir);
     pthread_mutex_init(&rp->sync_lock, NULL);
     pthread_mutex_init(&rp->replay_lock, NULL);
     rp->syncing = false;
 
     if (!cache_open(&rp->cache, data_dir)) {
-        zdb_log("WARN", "change cache unavailable; writes will not"
+        edb_log("WARN", "change cache unavailable; writes will not"
                         " be cached for offline nodes");
     }
 
     /* install the per-cluster dispatcher before the maintenance thread
      * starts servicing frames */
-    zdb_cluster_set_dispatcher(cluster, repl_dispatch, rp);
+    edb_cluster_set_dispatcher(cluster, repl_dispatch, rp);
 
     /* set running before the thread starts: the loop checks it first
      * thing and would exit immediately on a lost race otherwise */
     rp->running = true;
     if (pthread_create(&rp->maint_thread, NULL, repl_maint_main, rp) != 0) {
         rp->running = false;
-        zdb_cluster_set_dispatcher(cluster, NULL, NULL);
+        edb_cluster_set_dispatcher(cluster, NULL, NULL);
         cache_close(&rp->cache);
         pthread_mutex_destroy(&rp->sync_lock);
         pthread_mutex_destroy(&rp->replay_lock);
@@ -1867,7 +1867,7 @@ zdb_repl *zdb_repl_start(zdb_cluster *cluster, zdb_config *cfg,
     return rp;
 }
 
-void zdb_repl_stop(zdb_repl *rp)
+void edb_repl_stop(edb_repl *rp)
 {
     if (!rp) {
         return;
@@ -1876,7 +1876,7 @@ void zdb_repl_stop(zdb_repl *rp)
     rp->running = false;
     pthread_mutex_unlock(&rp->sync_lock);
     pthread_join(rp->maint_thread, NULL);
-    zdb_cluster_set_dispatcher(rp->cluster, NULL, NULL);
+    edb_cluster_set_dispatcher(rp->cluster, NULL, NULL);
     cache_close(&rp->cache);
     pthread_mutex_destroy(&rp->sync_lock);
     pthread_mutex_destroy(&rp->replay_lock);

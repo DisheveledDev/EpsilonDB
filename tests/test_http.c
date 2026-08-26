@@ -1,5 +1,5 @@
 /* Integration tests for the stage 3 REST API.
- * Starts a real zestyd instance on an ephemeral port and talks HTTP over
+ * Starts a real epsilond instance on an ephemeral port and talks HTTP over
  * real sockets. */
 
 #include <arpa/inet.h>

@@ -1,6 +1,6 @@
-#include "zesty_http.h"
+#include "epsilon_http.h"
 
-#include "../zesty_log.h"
+#include "../epsilon_log.h"
 #include <arpa/inet.h>
 #include <sys/un.h>
 #include <ctype.h>
@@ -22,21 +22,21 @@
 #include <strings.h>
 #include <stdarg.h>
 
-#define ZDB_HTTP_BACKLOG 64
-#define ZDB_HTTP_MAX_HEADER_BYTES (32 * 1024)
-#define ZDB_HTTP_MAX_BODY_BYTES (16 * 1024 * 1024)
-#define ZDB_HTTP_RECV_TIMEOUT_SEC 30
-#define ZDB_HTTP_MAX_ROUTES 32
-#define ZDB_HTTP_MAX_WORKERS 128
-#define ZDB_HTTP_REQUEST_TIMEOUT_MS 30000
+#define EDB_HTTP_BACKLOG 64
+#define EDB_HTTP_MAX_HEADER_BYTES (32 * 1024)
+#define EDB_HTTP_MAX_BODY_BYTES (16 * 1024 * 1024)
+#define EDB_HTTP_RECV_TIMEOUT_SEC 30
+#define EDB_HTTP_MAX_ROUTES 32
+#define EDB_HTTP_MAX_WORKERS 128
+#define EDB_HTTP_REQUEST_TIMEOUT_MS 30000
 
 typedef struct {
     char method[16];
     char prefix[256];
-    zdb_http_handler handler;
+    edb_http_handler handler;
 } http_route;
 
-struct zdb_http_server {
+struct edb_http_server {
     int listen_fd;
     bool running;
 
@@ -50,7 +50,7 @@ struct zdb_http_server {
     size_t naccept_threads;
     size_t nworkers;
     struct conn_ctx *workers;
-    http_route routes[ZDB_HTTP_MAX_ROUTES];
+    http_route routes[EDB_HTTP_MAX_ROUTES];
     int nroutes;
 
     int static_route;             /* index into routes, -1 if none */
@@ -58,7 +58,7 @@ struct zdb_http_server {
 };
 
 typedef struct conn_ctx {
-    zdb_http_server *srv;
+    edb_http_server *srv;
     int fd;
     bool trusted;
     struct conn_ctx *next;
@@ -67,7 +67,7 @@ typedef struct conn_ctx {
 /* ------------------------------------------------------------------ */
 /* response helpers                                                    */
 
-char *zdb_http_body_printf(size_t *len_out, const char *fmt, ...)
+char *edb_http_body_printf(size_t *len_out, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -92,17 +92,17 @@ char *zdb_http_body_printf(size_t *len_out, const char *fmt, ...)
     return buf;
 }
 
-void zdb_http_set_json(zdb_http_response *res, int status, char *body)
+void edb_http_set_json(edb_http_response *res, int status, char *body)
 {
     res->status = status;
     res->content_type = "application/json";
-    res->body = body ? body : zdb_http_body_printf(&res->body_len, "");
+    res->body = body ? body : edb_http_body_printf(&res->body_len, "");
     res->body_len = body && res->body == body
                         ? strlen(body)
                         : res->body_len;
 }
 
-const char *zdb_http_header(const zdb_http_request *req, const char *name)
+const char *edb_http_header(const edb_http_request *req, const char *name)
 {
     for (int i = 0; i < req->nheaders; i++) {
         if (strcasecmp(req->header_names[i], name) == 0) {
@@ -144,7 +144,7 @@ static const char *status_text(int status)
     }
 }
 
-static void write_response(int fd, const zdb_http_response *res,
+static void write_response(int fd, const edb_http_response *res,
                            bool keep_alive)
 {
     char head[512];
@@ -266,11 +266,11 @@ static char *buf_find(const char *hay, size_t hay_len, const char *needle,
 }
 
 static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
-                               zdb_http_request *req)
+                               edb_http_request *req)
 {
     memset(req, 0, sizeof(*req));
     size_t header_total = 0;
-    long long deadline = mono_ms() + ZDB_HTTP_REQUEST_TIMEOUT_MS;
+    long long deadline = mono_ms() + EDB_HTTP_REQUEST_TIMEOUT_MS;
 
     char *head_end = NULL;
     for (;;) {
@@ -283,7 +283,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
         if (head_end) {
             break;
         }
-        if (header_total > ZDB_HTTP_MAX_HEADER_BYTES) {
+        if (header_total > EDB_HTTP_MAX_HEADER_BYTES) {
             return false;
         }
         if (!recv_append(rb, fd, &header_total, deadline)) {
@@ -297,7 +297,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
     } else {
         head_len = (size_t)(head_end - (rb->buf + *pos)) + 2;
     }
-    if (head_len > ZDB_HTTP_MAX_HEADER_BYTES) {
+    if (head_len > EDB_HTTP_MAX_HEADER_BYTES) {
         return false;
     }
 
@@ -333,7 +333,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
     while ((eol = strchr(cursor, '\n')) != NULL && cursor[0] != '\r' &&
            cursor[0] != '\n') {
         *eol = '\0';
-        if (req->nheaders >= ZDB_HTTP_MAX_HEADERS) {
+        if (req->nheaders >= EDB_HTTP_MAX_HEADERS) {
             return false;   /* overfull header table would desync the
                              * framing (Content-Length could be dropped) */
         }
@@ -355,7 +355,7 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
             cl_count++;
         }
     }
-    const char *cl = zdb_http_header(req, "Content-Length");
+    const char *cl = edb_http_header(req, "Content-Length");
     if (cl) {
         if (cl_count > 1) {
             return false;   /* conflicting framing: reject */
@@ -373,20 +373,20 @@ static bool parse_request_full(recv_buf *rb, int fd, size_t *pos,
         char *end = NULL;
         unsigned long long parsed = strtoull(cl, &end, 10);
         if (errno == ERANGE || !end || *end != '\0' ||
-            parsed > ZDB_HTTP_MAX_BODY_BYTES) {
+            parsed > EDB_HTTP_MAX_BODY_BYTES) {
             return false;
         }
         content_length = (size_t)parsed;
     }
     /* chunked bodies are not supported: rejecting up front keeps the
      * connection framing unambiguous (no smuggling via TE vs CL) */
-    if (zdb_http_header(req, "Transfer-Encoding")) {
+    if (edb_http_header(req, "Transfer-Encoding")) {
         return false;
     }
 
     /* body starts after headers; may need more data */
-    size_t name_offsets[ZDB_HTTP_MAX_HEADERS];
-    size_t value_offsets[ZDB_HTTP_MAX_HEADERS];
+    size_t name_offsets[EDB_HTTP_MAX_HEADERS];
+    size_t value_offsets[EDB_HTTP_MAX_HEADERS];
     for (int i = 0; i < req->nheaders; i++) {
         name_offsets[i] = (size_t)(req->header_names[i] - rb->buf);
         value_offsets[i] = (size_t)(req->header_values[i] - rb->buf);
@@ -456,9 +456,9 @@ static bool guess_content_type(const char *path, char *out, size_t cap)
     return true;
 }
 
-static void serve_static_file(zdb_http_server *srv,
-                              const zdb_http_request *req,
-                              zdb_http_response *res, bool *handled)
+static void serve_static_file(edb_http_server *srv,
+                              const edb_http_request *req,
+                              edb_http_response *res, bool *handled)
 {
     *handled = false;
     const char *prefix = srv->routes[srv->static_route].prefix;
@@ -489,14 +489,14 @@ static void serve_static_file(zdb_http_server *srv,
     if (!f) {
         res->status = 404;
         res->content_type = "text/plain";
-        res->body = zdb_http_body_printf(&res->body_len, "not found\n");
+        res->body = edb_http_body_printf(&res->body_len, "not found\n");
         *handled = true;
         return;
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz < 0 || sz > (long)ZDB_HTTP_MAX_BODY_BYTES) {
+    if (sz < 0 || sz > (long)EDB_HTTP_MAX_BODY_BYTES) {
         fclose(f);
         res->status = sz < 0 ? 500 : 404;
         *handled = true;
@@ -530,9 +530,9 @@ static void serve_static_file(zdb_http_server *srv,
 static void *conn_main(void *arg)
 {
     conn_ctx *ctx = arg;
-    zdb_http_server *srv = ctx->srv;
+    edb_http_server *srv = ctx->srv;
     int fd = ctx->fd;
-    struct timeval tv = { .tv_sec = ZDB_HTTP_RECV_TIMEOUT_SEC, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = EDB_HTTP_RECV_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int one = 1;
@@ -550,13 +550,13 @@ static void *conn_main(void *arg)
             break;
         }
 
-        zdb_http_request req;
+        edb_http_request req;
         if (!parse_request_full(&rb, fd, &pos, &req)) {
             break;
         }
         req.trusted = ctx->trusted;
 
-        zdb_http_response res = { .status = 500 };
+        edb_http_response res = { .status = 500 };
         res.content_type = "application/json";
 
         int best = -1;
@@ -590,12 +590,12 @@ static void *conn_main(void *arg)
         if (!handled) {
             res.status = 404;
             res.content_type = "application/json";
-            res.body = zdb_http_body_printf(
+            res.body = edb_http_body_printf(
                 &res.body_len,
                 "{\"error\":\"not found\",\"path\":\"%s\"}", req.path);
         }
 
-        const char *conn_hdr = zdb_http_header(&req, "Connection");
+        const char *conn_hdr = edb_http_header(&req, "Connection");
         if (conn_hdr && strcasecmp(conn_hdr, "close") == 0) {
             keep_alive = false;
         }
@@ -635,7 +635,7 @@ static void *conn_main(void *arg)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    zdb_http_server *srv;
+    edb_http_server *srv;
     int listen_fd;
     bool trusted;
 } accept_job;
@@ -644,7 +644,7 @@ static void *accept_main(void *arg)
 {
     accept_job job = *(accept_job *)arg;
     free(arg);
-    zdb_http_server *srv = job.srv;
+    edb_http_server *srv = job.srv;
 
     for (;;) {
         pthread_mutex_lock(&srv->state_lock);
@@ -667,7 +667,7 @@ static void *accept_main(void *arg)
             if (errno == EINTR || errno == ECONNABORTED) {
                 continue;
             }
-            zdb_log("WARN", "accept failed: %s", strerror(errno));
+            edb_log("WARN", "accept failed: %s", strerror(errno));
             continue;
         }
 
@@ -681,7 +681,7 @@ static void *accept_main(void *arg)
         ctx->trusted = job.trusted;
 
         pthread_mutex_lock(&srv->state_lock);
-        if (!srv->running || srv->nworkers >= ZDB_HTTP_MAX_WORKERS) {
+        if (!srv->running || srv->nworkers >= EDB_HTTP_MAX_WORKERS) {
             bool stopping = !srv->running;
             pthread_mutex_unlock(&srv->state_lock);
             close(fd);
@@ -720,7 +720,7 @@ static void *accept_main(void *arg)
     return NULL;
 }
 
-static bool spawn_acceptor(zdb_http_server *srv, int listen_fd, bool trusted)
+static bool spawn_acceptor(edb_http_server *srv, int listen_fd, bool trusted)
 {
     if (srv->naccept_threads >=
         sizeof(srv->accept_threads) / sizeof(srv->accept_threads[0])) {
@@ -743,19 +743,19 @@ static bool spawn_acceptor(zdb_http_server *srv, int listen_fd, bool trusted)
     return true;
 }
 
-bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
+bool edb_http_start_admin(edb_http_server *srv, const char *sock_path)
 {
     if (!srv || !sock_path || !*sock_path || srv->admin_fd >= 0) {
         return false;
     }
     if (strlen(sock_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        zdb_log("ERROR", "admin socket path too long: %s", sock_path);
+        edb_log("ERROR", "admin socket path too long: %s", sock_path);
         return false;
     }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        zdb_log("ERROR", "admin socket() failed: %s", strerror(errno));
+        edb_log("ERROR", "admin socket() failed: %s", strerror(errno));
         return false;
     }
 
@@ -764,8 +764,8 @@ bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-        listen(fd, ZDB_HTTP_BACKLOG) != 0) {
-        zdb_log("ERROR", "admin bind/listen on '%s' failed: %s",
+        listen(fd, EDB_HTTP_BACKLOG) != 0) {
+        edb_log("ERROR", "admin bind/listen on '%s' failed: %s",
                 sock_path, strerror(errno));
         close(fd);
         return false;
@@ -781,11 +781,11 @@ bool zdb_http_start_admin(zdb_http_server *srv, const char *sock_path)
     return true;
 }
 
-zdb_http_server *zdb_http_start(const char *bind_addr, int port)
+edb_http_server *edb_http_start(const char *bind_addr, int port)
 {
     signal(SIGPIPE, SIG_IGN);
 
-    zdb_http_server *srv = calloc(1, sizeof(*srv));
+    edb_http_server *srv = calloc(1, sizeof(*srv));
     if (!srv) {
         return NULL;
     }
@@ -815,8 +815,8 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
         addr.sin_addr.s_addr = INADDR_ANY;
     }
     if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-        listen(srv->listen_fd, ZDB_HTTP_BACKLOG) != 0) {
-        zdb_log("ERROR", "http bind/listen on port %d failed: %s",
+        listen(srv->listen_fd, EDB_HTTP_BACKLOG) != 0) {
+        edb_log("ERROR", "http bind/listen on port %d failed: %s",
                 port, strerror(errno));
         close(srv->listen_fd);
         pthread_cond_destroy(&srv->workers_done);
@@ -827,7 +827,7 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
     }
 
     if (!spawn_acceptor(srv, srv->listen_fd, false)) {
-        zdb_log("ERROR", "failed to start accept thread");
+        edb_log("ERROR", "failed to start accept thread");
         close(srv->listen_fd);
         pthread_cond_destroy(&srv->workers_done);
         pthread_mutex_destroy(&srv->state_lock);
@@ -838,11 +838,11 @@ zdb_http_server *zdb_http_start(const char *bind_addr, int port)
     return srv;
 }
 
-bool zdb_http_add_handler(zdb_http_server *srv, const char *method,
-                          const char *prefix, zdb_http_handler handler)
+bool edb_http_add_handler(edb_http_server *srv, const char *method,
+                          const char *prefix, edb_http_handler handler)
 {
     if (!srv || !method || !prefix || !handler ||
-        srv->nroutes >= ZDB_HTTP_MAX_ROUTES) {
+        srv->nroutes >= EDB_HTTP_MAX_ROUTES) {
         return false;
     }
     pthread_mutex_lock(&srv->routes_lock);
@@ -854,7 +854,7 @@ bool zdb_http_add_handler(zdb_http_server *srv, const char *method,
     return true;
 }
 
-bool zdb_http_serve_static(zdb_http_server *srv, const char *prefix,
+bool edb_http_serve_static(edb_http_server *srv, const char *prefix,
                            const char *root_dir)
 {
     if (!srv || !prefix || !root_dir || srv->static_route >= 0 ||
@@ -863,7 +863,7 @@ bool zdb_http_serve_static(zdb_http_server *srv, const char *prefix,
         return false;
     }
     pthread_mutex_lock(&srv->routes_lock);
-    if (srv->nroutes >= ZDB_HTTP_MAX_ROUTES) {
+    if (srv->nroutes >= EDB_HTTP_MAX_ROUTES) {
         pthread_mutex_unlock(&srv->routes_lock);
         return false;
     }
@@ -878,7 +878,7 @@ bool zdb_http_serve_static(zdb_http_server *srv, const char *prefix,
     return true;
 }
 
-void zdb_http_stop(zdb_http_server *srv)
+void edb_http_stop(edb_http_server *srv)
 {
     if (!srv) {
         return;

@@ -2,7 +2,7 @@
  * POST /admin/join (HTTP), receives the shards the new target structure
  * assigns to it, reports compliance, and the leader promotes the wave.
  *
- * Not self-contained: tests/test_join_run.sh spawns two real zestyd
+ * Not self-contained: tests/test_join_run.sh spawns two real epsilond
  * processes (seed + joiner) and passes their HTTP/peer ports here.
  *
  * The seed runs replication factor 1 so writes succeed with a single

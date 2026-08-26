@@ -1,12 +1,12 @@
-# ZestyDB
+# EpsilonDB
 
 A standalone distributed key/value database server in ANSI C, modeled on
 the Switchblade Swift library. One SQLite file per `(partition, keyspace)`
-shard, a REST API for clients, an admin API plus `zestyctl` CLI for
+shard, a REST API for clients, an admin API plus `epsilonctl` CLI for
 operations, and a peer-to-peer mesh that replicates and rebalances shards
 across nodes.
 
-ZestyDB is a **multi-master, scale-out** key/value store: every node is a
+EpsilonDB is a **multi-master, scale-out** key/value store: every node is a
 full peer that can accept writes and answer any query. Data is sharded
 across a hash space that grows with the cluster, so adding a node adds
 storage *and* query processing power. It deploys as a single self-contained
@@ -14,7 +14,7 @@ binary, needs no external services, and ships with built-in workload
 analytics, slow-query profiling, and a performance benchmark so you can
 watch it perform as you grow it.
 
-## Why ZestyDB
+## Why EpsilonDB
 
 - **Multi-master** — no single writer, no single point of failure. Any node
   accepts writes; they fan out to replicas and commit when a quorum of
@@ -50,7 +50,7 @@ watch it perform as you grow it.
   offline nodes replay missed changes). Per-partition tuning: SQLite cache
   size, journal mode (DELETE/TRUNCATE/WAL, default TRUNCATE), and
   VACUUM/REINDEX intervals, applied on shard open and on update.
-- **Clustering**: permanent TCP mesh between peers (ZSTP protocol),
+- **Clustering**: permanent TCP mesh between peers (ESTP protocol),
   heartbeat-based membership, deterministic leader election
   (lexicographically smallest online node id), contiguous hash-range
   placement of shards.
@@ -72,9 +72,11 @@ watch it perform as you grow it.
   is available from any node. Slow operations are keyed by
   partition/keyspace (and filter key for queries) - filter *values* are
   never recorded.
-- **Performance benchmark**: `zestyctl bench` or the admin console creates a
+- **Performance benchmark**: `epsilonctl bench` or the admin console creates a
   throwaway database and 10 partitions, times writes/gets/filtered
   queries/updates/deletes, reports ops/sec, and deletes it all afterwards.
+  Partitions are spread across worker threads (one per partition by
+  default), so every shard is read/written independently and concurrently.
 - **Auth**: Bearer token or `authorization` key; the token is the
   username. Per-partition create/update/read/delete group bitmasks
   (mask 0 = allow all groups). Before the first user exists,
@@ -83,7 +85,7 @@ watch it perform as you grow it.
 
 ## High-performance, scale-out model
 
-ZestyDB treats every node as an equal. There is no primary/replica split
+EpsilonDB treats every node as an equal. There is no primary/replica split
 and no hot master: the cluster elects a leader only to coordinate
 rebalancing, never to gate ordinary reads and writes.
 
@@ -118,7 +120,7 @@ nodes elect a new one and carry on.
 ## Why SQLite
 
 Each shard is a single SQLite database file, and that choice is deliberate:
-SQLite's design maps almost one-to-one onto what a ZestyDB shard needs, so
+SQLite's design maps almost one-to-one onto what a EpsilonDB shard needs, so
 we get a battle-tested storage layer instead of writing one ourselves.
 
 **One file per shard.** A shard is `(partition, keyspace)` — small,
@@ -129,7 +131,7 @@ move is deleting one file. Because every shard is small and independent,
 each file's overhead and blast radius is bounded: a corrupt or full disk
 affects one shard, never the cluster.
 
-**Filtering, in the database.** ZestyDB's typed JSON filters (dotted paths,
+**Filtering, in the database.** EpsilonDB's typed JSON filters (dotted paths,
 `eq`/`ne`/`gt`/`gte`/`lt`/`lte`, type-aware values) are evaluated directly
 against the stored document by SQLite's JSON1 functions, close to the data.
 A raw key/value store would force us to scan and parse every document in our
@@ -158,10 +160,10 @@ a shard already has exactly one writer at a time by design.
 engine in the world — inside phones, browsers, embedded devices and servers —
 and is tested to an unusual degree (the SQLite team reports 100% MC/DC branch
 coverage, with far more test code than library code). It is vendored here as a
-single amalgamation compiled straight into `zestyd`, so there is no external
+single amalgamation compiled straight into `epsilond`, so there is no external
 dependency, no version skew, and no runtime to monitor. The result is a
 storage layer that has been exercised on billions of devices and keeps
-ZestyDB's own footprint small and dependable.
+EpsilonDB's own footprint small and dependable.
 
 ## Build
 
@@ -169,7 +171,7 @@ Requires a C11 compiler, POSIX.1-2008 (pthreads). No external
 dependencies: SQLite and cJSON are vendored under `src/sqlite/` and
 `vendor/cjson/`.
 
-    make            # builds bin/zestyd, bin/zestyctl, bin/libzesty.a
+    make            # builds bin/epsilond, bin/epsilonctl, bin/libepsilon.a
     make test       # full suite (engine, config, http, cluster,
                     # replication, structure, snapshot, delta, rebalance,
                     # live join, chaos); takes a few minutes
@@ -187,14 +189,14 @@ self-contained apart from the OS-provided libSystem.
 
 Start a single server:
 
-    bin/zestyd -p 8123 -d ./data
+    bin/epsilond -p 8123 -d ./data
 
 Options: `-p port` (HTTP, default 8123), `-b addr` (bind address),
 `-d dir` (data dir), `-s path` (Unix admin socket, default
-`./zesty-admin.sock`). Add `-n port` to enable clustering (peer port) and
+`./epsilon-admin.sock`). Add `-n port` to enable clustering (peer port) and
 `-A addr` to override the advertised address.
 
-The server writes a timestamped log to `/var/log/zestydb/zestydb.log`
+The server writes a timestamped log to `/var/log/epsilondb/epsilondb.log`
 (create the directory first, or run with privileges to write there). Use
 `-l path` to override the log file; when the file cannot be opened the
 server falls back to logging on the console. The log is rotated once per
@@ -203,9 +205,9 @@ day (renamed with a date suffix and gzip-compressed).
 ## Admin console
 
 The embedded Bootstrap web console is served at `/admin` straight from the
-`zestyd` binary. On first run it shows a setup form that creates the `admin`
+`epsilond` binary. On first run it shows a setup form that creates the `admin`
 user with a password; afterwards it presents a login form. The console then
-exposes the same operations as `zestyctl` (status, databases, groups, users,
+exposes the same operations as `epsilonctl` (status, databases, groups, users,
 partitions, keyspaces, settings, data, analytics, benchmark, and cluster)
 backed by the JSON API.
 
@@ -224,7 +226,7 @@ the jsDelivr CDN (the default Bootstrap theme). Use a TLS-terminating reverse
 proxy in front of the HTTP port in production.
 
 The Unix admin socket speaks HTTP without authentication and is what
-`zestyctl` uses by default (full local admin rights).
+`epsilonctl` uses by default (full local admin rights).
 
 ## Monitoring
 
@@ -234,9 +236,12 @@ through the system store, so any node can show the whole cluster's metrics:
 - `GET /admin/analytics` (or the Analytics tab) aggregates per-node
   snapshots into reads/writes/updates/deletes per partition/keyspace,
   slowest operations with latency, and the pending-replication backlog.
-- `zestyctl bench [records] [rf] [cache_size] [journal_mode]` runs the
-  throwaway benchmark and prints writes/s, gets/s, queries/s, updates/s
-  and deletes/s.
+- `epsilonctl bench [records] [rf] [cache_size] [journal_mode] [threads]`
+  runs the throwaway benchmark and prints writes/s, gets/s, queries/s,
+  updates/s and deletes/s. The optional trailing `threads` argument
+  controls how many worker threads the partitions are spread across
+  (0 = one thread per partition); the reported count in the result
+  reflects the threads actually used.
 
 Snapshots are refreshed every 10 seconds and carry a 30-minute TTL, so a
 departed node simply ages out of the picture.
@@ -263,15 +268,15 @@ departed node simply ages out of the picture.
 
 Or with the CLI (talks to the local admin socket):
 
-    bin/zestyctl status
-    bin/zestyctl create database app 1
-    bin/zestyctl put app/main/kv/user-1        # reads JSON from stdin
-    bin/zestyctl get app/main/kv/user-1
-    bin/zestyctl all app/main/kv \
+    bin/epsilonctl status
+    bin/epsilonctl create database app 1
+    bin/epsilonctl put app/main/kv/user-1        # reads JSON from stdin
+    bin/epsilonctl get app/main/kv/user-1
+    bin/epsilonctl all app/main/kv \
       --filter '{"key":"age","operator":"gte","value":18}'
-    bin/zestyctl list databases|groups|users|partitions|settings|nodes
-    bin/zestyctl cluster
-    bin/zestyctl bench 100000 1 2048 TRUNCATE
+    bin/epsilonctl list databases|groups|users|partitions|settings|nodes
+    bin/epsilonctl cluster
+    bin/epsilonctl bench 100000 1 2048 TRUNCATE 10
 
 ## JSON filters
 
@@ -297,11 +302,11 @@ The CLI accepts the same objects with repeated `--filter '<json>'` arguments.
 Every node runs the same binary. To form a cluster:
 
     # seed
-    bin/zestyd -p 8123 -n 9123 -d node-a
+    bin/epsilond -p 8123 -n 9123 -d node-a
     # joiners (join through any existing member's peer port)
-    bin/zestyd -p 8124 -n 9124 -d node-b
+    bin/epsilond -p 8124 -n 9124 -d node-b
     curl -X POST localhost:8124/admin/join -d '{"addr":"127.0.0.1","port":9123}'
-    bin/zestyd -p 8125 -n 9125 -d node-c
+    bin/epsilond -p 8125 -n 9125 -d node-c
     curl -X POST localhost:8125/admin/join -d '{"addr":"127.0.0.1","port":9123}'
 
 `POST /admin/join` runs the whole flow: the joiner snapshots the config
@@ -313,8 +318,8 @@ time (leader-held global rebalance lock).
 
 Observe the cluster:
 
-    bin/zestyctl cluster          # or: GET /admin/cluster
-    bin/zestyctl list nodes
+    bin/epsilonctl cluster          # or: GET /admin/cluster
+    bin/epsilonctl list nodes
 
 The response includes live/target structure versions, rebalance lock
 state, per-node compliance generation, and the live/target hash ranges.
@@ -334,14 +339,14 @@ Failure semantics:
 | Surface | Purpose |
 |---|---|
 | HTTP port | client REST + admin API (put TLS termination in a reverse proxy) |
-| Unix admin socket | local management traffic for `zestyctl`, unauthenticated by design |
-| Peer TCP mesh | ZSTP frames: identity/state gossip, replication, quorum queries, snapshot transfer |
+| Unix admin socket | local management traffic for `epsilonctl`, unauthenticated by design |
+| Peer TCP mesh | ESTP frames: identity/state gossip, replication, quorum queries, snapshot transfer |
 
 Directory map:
 
     src/engine/    shard manager, SQLite shards, TTL cleanup, config store,
                    analytics, benchmark
-    src/socket/    ZSTP wire codec, cluster mesh, replication, snapshots
+    src/socket/    ESTP wire codec, cluster mesh, replication, snapshots
     src/httpd/     minimal HTTP/1.1 server (keep-alive, routes, static files)
     src/api/       REST handlers (data ops, sync protocol, admin ops)
     src/sqlite/    vendored SQLite amalgamation (do not modify)

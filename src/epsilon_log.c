@@ -1,6 +1,6 @@
-/* zesty_log.c - shared logging facility. See zesty_log.h. */
+/* epsilon_log.c - shared logging facility. See epsilon_log.h. */
 
-#include "zesty_log.h"
+#include "epsilon_log.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -45,7 +45,7 @@ static void mkdir_p(char *path)
     mkdir(path, 0755);
 }
 
-void zdb_log_open(const char *path)
+void edb_log_open(const char *path)
 {
     time_t now = time(NULL);
     struct tm tmv;
@@ -60,7 +60,7 @@ void zdb_log_open(const char *path)
     }
 
     if (owned_path) {
-        /* ensure the parent directory exists (best effort: /var/log/zestydb) */
+        /* ensure the parent directory exists (best effort: /var/log/epsilondb) */
         snprintf(dir, sizeof(dir), "%s", owned_path);
         char *slash = strrchr(dir, '/');
         if (slash) {
@@ -82,7 +82,7 @@ void zdb_log_open(const char *path)
     pthread_mutex_unlock(&g_log_mutex);
 }
 
-void zdb_log_close(void)
+void edb_log_close(void)
 {
     pthread_mutex_lock(&g_log_mutex);
     if (g_log) {
@@ -120,7 +120,7 @@ static void gzip_file(const char *path)
 
 /* Rotates the log once per day, nginx-style: rename the active log to a
  * date-stamped file, compress it, and start a fresh log. */
-void zdb_log_rotate_if_needed(void)
+void edb_log_rotate_if_needed(void)
 {
     time_t now = time(NULL);
     struct tm tmv;
@@ -161,7 +161,7 @@ void zdb_log_rotate_if_needed(void)
 }
 
 /* Writes a timestamped line to the log file and to the console. */
-void zdb_log(const char *level, const char *fmt, ...)
+void edb_log(const char *level, const char *fmt, ...)
 {
     char msg[2048];
     char ts[32];

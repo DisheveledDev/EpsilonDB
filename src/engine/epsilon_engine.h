@@ -1,4 +1,4 @@
-/* zesty_engine.h - ZestyDB core shard storage engine.
+/* epsilon_engine.h - EpsilonDB core shard storage engine.
  *
  * One SQLite database file per (partition, keyspace) pair, filename is
  * md5(md5(partition) + ":" + md5(keyspace)) + ".sqlite". Documents are JSON values.
@@ -7,7 +7,7 @@
  *   - delete() is a soft delete: ttl is set to now-5 so replicas can
  *     distinguish deletion from expiry during replication.
  *   - a background cleanup pass runs periodically and removes rows expired
- *     more than ZDB_CLEANUP_GRACE_SECONDS ago; the grace window lets nodes
+ *     more than EDB_CLEANUP_GRACE_SECONDS ago; the grace window lets nodes
  *     that were offline replay changes they missed when they come back.
  *   - shards accumulating many expirations are marked dirty and re-indexed
  *     (VACUUM) by the cleanup thread.
@@ -15,11 +15,11 @@
  * All functions returning a document return a cJSON object/array that the
  * caller must free with cJSON_Delete(). String lists are returned as
  * NULL-terminated arrays of malloc'd strings; release with
- * zdb_free_strings().
+ * edb_free_strings().
  */
 
-#ifndef ZESTY_ENGINE_H
-#define ZESTY_ENGINE_H
+#ifndef EPSILON_ENGINE_H
+#define EPSILON_ENGINE_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -27,22 +27,22 @@
 #include "../sqlite/sqlite3.h"
 #include "../../vendor/cjson/cJSON.h"
 
-#define ZDB_CLEANUP_INTERVAL_SECONDS 60
-#define ZDB_CLEANUP_GRACE_SECONDS    7200
+#define EDB_CLEANUP_INTERVAL_SECONDS 60
+#define EDB_CLEANUP_GRACE_SECONDS    7200
 
-typedef struct zdb_shard_manager zdb_engine;
+typedef struct edb_shard_manager edb_engine;
 
 /* Open (or create) the shard store rooted at path. The directory is created
  * if missing and any existing "*.sqlite" files are opened. Returns NULL on
  * failure. */
-zdb_engine *zdb_engine_open(const char *path);
+edb_engine *edb_engine_open(const char *path);
 
 /* Close all shards and free the manager. */
-void zdb_engine_close(zdb_engine *mgr);
+void edb_engine_close(edb_engine *mgr);
 
 /* The data directory backing this shard store (for tools that need to
  * touch shard files directly, e.g. snapshot transfer). */
-const char *zdb_engine_path(zdb_engine *mgr);
+const char *edb_engine_path(edb_engine *mgr);
 
 /* --- stage 6b: shard snapshot support --------------------------------- */
 
@@ -50,7 +50,7 @@ const char *zdb_engine_path(zdb_engine *mgr);
  * (the framed partition/keyspace digest under the store root) and key_out
  * with the 32-char hex shard key. Returns false on allocation/argument
  * failure. The file may not exist yet. */
-bool zdb_shard_path(zdb_engine *mgr, const char *partition,
+bool edb_shard_path(edb_engine *mgr, const char *partition,
                     const char *keyspace, char *path_out, size_t cap,
                     char key_out[33]);
 
@@ -60,53 +60,53 @@ bool zdb_shard_path(zdb_engine *mgr, const char *partition,
  * finishes and then reopen cleanly. Returns true when a handle existed.
  * Also runs an integrity check on the new file: returns false when the
  * reopened database fails "PRAGMA integrity_check". */
-bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
+bool edb_shard_invalidate(edb_engine *mgr, const char *partition,
                           const char *keyspace);
 
 /* True when partition/keyspace currently has an open shard handle.
  * Test hook for invalidate semantics. */
-bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
+bool edb_shard_is_open(edb_engine *mgr, const char *partition,
                        const char *keyspace);
-bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
+bool edb_shard_validate(edb_engine *mgr, const char *partition,
                         const char *keyspace);
 
 /* --- stage 6d: shard GC ------------------------------------------------ */
 
 /* Fills keys[] with up to cap 32-char md5 shard keys present on disk in
  * the store root. Returns the number written. */
-size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap);
+size_t edb_engine_shard_keys(edb_engine *mgr, char (*keys)[33], size_t cap);
 
 /* Removes the shard file identified by a 32-char md5 key (and its cached
  * handle, if open) from disk. Returns true when the file is gone. Used
  * to GC redundant shards after a rebalance moves them to another node. */
-bool zdb_shard_gc(zdb_engine *mgr, const char key[33]);
+bool edb_shard_gc(edb_engine *mgr, const char key[33]);
 
 /* Store a JSON document under id in partition/keyspace.
  * ttl_seconds: seconds until expiry, or -1 for no expiry. */
-bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
+bool edb_put(edb_engine *mgr, const char *partition, const char *keyspace,
              const char *id, const char *json_value, long long ttl_seconds);
 
 /* Fetch a document as a parsed cJSON value, or NULL if absent/expired. */
-cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
+cJSON *edb_get(edb_engine *mgr, const char *partition, const char *keyspace,
                const char *id);
 
 /* Soft-delete a document. Returns true on success (even if absent). */
-bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
+bool edb_delete(edb_engine *mgr, const char *partition, const char *keyspace,
                 const char *id);
 
 /* Structured filters are one object or an array of objects shaped as
  * {"key":"manager.age","operator":"eq","value":42}. Multiple filters
  * use AND semantics. Supported operators: eq, ne, gt, gte, lt, lte. */
-char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
+char **edb_ids(edb_engine *mgr, const char *partition, const char *keyspace,
                const cJSON *filters, size_t *count_out);
-cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
+cJSON *edb_all(edb_engine *mgr, const char *partition, const char *keyspace,
                const cJSON *filters);
-cJSON *zdb_query(zdb_engine *mgr, const char *partition,
+cJSON *edb_query(edb_engine *mgr, const char *partition,
                  const char *keyspace, const cJSON *filters);
-bool zdb_filters_valid(const cJSON *filters);
+bool edb_filters_valid(const cJSON *filters);
 
 /* Force a cleanup + reindex pass over one shard now (mainly for tests). */
-bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
+bool edb_force_cleanup(edb_engine *mgr, const char *partition,
                        const char *keyspace);
 
 /* --- stage 5: replication-aware variants ------------------------------ */
@@ -116,40 +116,40 @@ bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
  * any, including soft-deleted rows) already carries a NEWER timestamp.
  * ttl_absolute is an epoch expiry (pass -1 for no expiry). Returns true
  * when the record is now current locally (applied or already newer). */
-bool zdb_replica_put(zdb_engine *mgr, const char *partition,
+bool edb_replica_put(edb_engine *mgr, const char *partition,
                      const char *keyspace, const char *id,
                      const char *json_value, long long ttl_absolute,
                      long long timestamp);
-bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
+bool edb_replica_put_origin(edb_engine *mgr, const char *partition,
                             const char *keyspace, const char *id,
                             const char *json_value, long long ttl_absolute,
                             long long timestamp, const char *origin);
 
 /* Apply a replicated soft-delete carrying an explicit origin timestamp.
  * LWW semantics as above; ttl becomes timestamp - 5 (tombstone). */
-bool zdb_replica_delete(zdb_engine *mgr, const char *partition,
+bool edb_replica_delete(edb_engine *mgr, const char *partition,
                         const char *keyspace, const char *id,
                         long long timestamp);
-bool zdb_replica_delete_origin(zdb_engine *mgr, const char *partition,
+bool edb_replica_delete_origin(edb_engine *mgr, const char *partition,
                                const char *keyspace, const char *id,
                                long long timestamp, const char *origin);
 
-/* Like zdb_get but also reports the row's last-modified timestamp
+/* Like edb_get but also reports the row's last-modified timestamp
  * (needed for quorum comparison). NULL value => ts untouched. */
-cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_get_ts(edb_engine *mgr, const char *partition,
                   const char *keyspace, const char *id,
                   long long *timestamp_out);
 
-/* Like zdb_all/zdb_query but each element is an object
+/* Like edb_all/edb_query but each element is an object
  * {"id":..,"timestamp":..,"value":{..}} so replicas can be merged by
  * comparing timestamps. */
-cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_all_ts(edb_engine *mgr, const char *partition,
                   const char *keyspace, const cJSON *filters);
-cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_query_ts(edb_engine *mgr, const char *partition,
                     const char *keyspace, const cJSON *filters);
 
 /* Free a NULL-terminated list of malloc'd strings. */
-void zdb_free_strings(char **strings);
+void edb_free_strings(char **strings);
 
 /* --- per-partition SQLite tuning -------------------------------------- */
 
@@ -158,22 +158,22 @@ typedef struct {
     char journal_mode[16];     /* "DELETE" | "TRUNCATE" | "WAL" */
     long long vacuum_seconds;  /* re-VACUUM interval; 0 = never */
     long long reindex_seconds; /* re-REINDEX interval; 0 = never */
-} zdb_shard_settings;
+} edb_shard_settings;
 
 /* Fills `out` with the default shard settings. */
-void zdb_shard_settings_default(zdb_shard_settings *out);
+void edb_shard_settings_default(edb_shard_settings *out);
 
 /* Provider that resolves a partition's shard settings. Registered by the
  * config layer once it is open. The engine calls it (holding no locks)
  * when a shard is first opened or lazily re-checked. */
-typedef void (*zdb_shard_settings_fn)(void *ctx, const char *partition,
-                                      zdb_shard_settings *out);
+typedef void (*edb_shard_settings_fn)(void *ctx, const char *partition,
+                                      edb_shard_settings *out);
 
-void zdb_engine_set_settings_provider(zdb_engine *mgr,
-                                      zdb_shard_settings_fn fn, void *ctx);
+void edb_engine_set_settings_provider(edb_engine *mgr,
+                                      edb_shard_settings_fn fn, void *ctx);
 
 /* Reopens every open shard belonging to `partition` so its connection
  * picks up changed settings. Returns the number of shards reloaded. */
-int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition);
+int edb_engine_reload_partition(edb_engine *mgr, const char *partition);
 
 #endif

@@ -1,6 +1,6 @@
 /* test_snapshot.c - stage 6b tests: shard snapshot transfer between two
  * in-process nodes. Populates shards on node A, transfers them to node
- * B over the ZSTP snapshot protocol, and verifies byte-equivalent row
+ * B over the ESTP snapshot protocol, and verifies byte-equivalent row
  * contents plus the engine invalidate/reopen path. Plain assert-style
  * harness like test_engine.
  *
@@ -22,8 +22,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_snap.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_snap.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -42,7 +42,7 @@ static int g_failures = 0;
 #include "../src/engine/md5.h"
 
 typedef struct {
-    zdb_engine *engine;
+    edb_engine *engine;
     char dir[256];
     int port;                 /* peer listener for snapshot serving */
     int listen_fd;
@@ -57,17 +57,17 @@ static void node_start(snap_node *n, const char *dir)
     if (system(cmd) != 0) {
         /* best effort */
     }
-    n->engine = zdb_engine_open(dir);
+    n->engine = edb_engine_open(dir);
 }
 
 static void node_stop(snap_node *n)
 {
-    zdb_engine_close(n->engine);
+    edb_engine_close(n->engine);
     n->engine = NULL;
 }
 
 /* Minimal peer-style listener: accepts connections, performs the HELLO
- * exchange, and hands SNAP_REQ exchanges to zdb_snap_serve. Runs until
+ * exchange, and hands SNAP_REQ exchanges to edb_snap_serve. Runs until
  * stop_serving closes the socket. */
 
 #include <arpa/inet.h>
@@ -93,8 +93,8 @@ static void *serve_conn(void *arg)
     int fd = (int)(intptr_t)arg;
     char *payload = NULL;
 
-    int t = zstp_recv_frame(fd, &payload);
-    if (t != ZSTP_HELLO) {
+    int t = estp_recv_frame(fd, &payload);
+    if (t != ESTP_HELLO) {
         free(payload);
         close(fd);
         return NULL;
@@ -105,13 +105,13 @@ static void *serve_conn(void *arg)
     cJSON_AddStringToObject(hello, "node_id", "snap-server");
     char *hs = cJSON_PrintUnformatted(hello);
     cJSON_Delete(hello);
-    zstp_send_frame(fd, ZSTP_HELLO, hs ? hs : "{}", NULL);
+    estp_send_frame(fd, ESTP_HELLO, hs ? hs : "{}", NULL);
     free(hs);
 
     uint32_t plen = 0;
-    t = zstp_recv_frame_raw(fd, &payload, &plen);
-    if (t == ZSTP_SNAP_REQ) {
-        zdb_snap_serve(fd, plen, payload, g_server_node->engine);
+    t = estp_recv_frame_raw(fd, &payload, &plen);
+    if (t == ESTP_SNAP_REQ) {
+        edb_snap_serve(fd, plen, payload, g_server_node->engine);
     }
     free(payload);
     shutdown(fd, SHUT_RDWR);
@@ -187,20 +187,20 @@ static void shard_key_of(const char *partition, const char *keyspace,
     char partition_hash[33];
     char keyspace_hash[33];
     char framed[66];
-    zdb_md5_hex(partition, strlen(partition), partition_hash);
-    zdb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
+    edb_md5_hex(partition, strlen(partition), partition_hash);
+    edb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
     snprintf(framed, sizeof(framed), "%s:%s", partition_hash,
              keyspace_hash);
-    zdb_md5_hex(framed, strlen(framed), out);
+    edb_md5_hex(framed, strlen(framed), out);
 }
 
 /* Row-by-row comparison of two shards via timestamp-tagged reads:
  * identical id sets and identical (timestamp, value) pairs. */
-static bool rows_match(zdb_engine *a, zdb_engine *b, const char *part,
+static bool rows_match(edb_engine *a, edb_engine *b, const char *part,
                        const char *ks)
 {
-    cJSON *ra = zdb_all_ts(a, part, ks, NULL);
-    cJSON *rb = zdb_all_ts(b, part, ks, NULL);
+    cJSON *ra = edb_all_ts(a, part, ks, NULL);
+    cJSON *rb = edb_all_ts(b, part, ks, NULL);
     bool match = false;
 
     if (ra && rb &&
@@ -274,7 +274,7 @@ static void chunk_populate(void)
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value),
                  "{\"n\":%d,\"pad\":\"%.*d\"}", i, 40, 0);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
+        CHECK(edb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 50; i++) {
         char id[32];
@@ -282,10 +282,10 @@ static void chunk_populate(void)
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d,\"txt\":\"hello %d\"}",
                  i, i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
+        CHECK(edb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
-    cJSON *all = zdb_all_ts(f.a.engine, "main", "kv", NULL);
+    cJSON *all = edb_all_ts(f.a.engine, "main", "kv", NULL);
     CHECK(all && cJSON_GetArraySize(all) == 500);
     cJSON_Delete(all);
 
@@ -309,7 +309,7 @@ static void chunk_transfer(void)
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value),
                  "{\"n\":%d,\"pad\":\"%.*d\"}", i, 40, 0);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
+        CHECK(edb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 50; i++) {
         char id[32];
@@ -317,19 +317,19 @@ static void chunk_transfer(void)
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d,\"txt\":\"hello %d\"}",
                  i, i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
+        CHECK(edb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
-    CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, key_main, f.b.dir) == 0);
+    CHECK(edb_snap_fetch("127.0.0.1", f.a.port, key_main, f.b.dir) == 0);
 
     /* B has never opened the shard: force the engine to notice it via
      * invalidate (no handle yet -> false, but harmless) then read */
-    zdb_shard_invalidate(f.b.engine, "main", "kv");
+    edb_shard_invalidate(f.b.engine, "main", "kv");
     CHECK(rows_match(f.a.engine, f.b.engine, "main", "kv"));
 
-    CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, key_other,
+    CHECK(edb_snap_fetch("127.0.0.1", f.a.port, key_other,
                          f.b.dir) == 0);
-    zdb_shard_invalidate(f.b.engine, "other", "docs");
+    edb_shard_invalidate(f.b.engine, "other", "docs");
     CHECK(rows_match(f.a.engine, f.b.engine, "other", "docs"));
 
     fixture_stop(&f);
@@ -345,7 +345,7 @@ static void chunk_empty(void)
     char key_empty[33];
     shard_key_of("ghost", "none", key_empty);
 
-    CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, key_empty,
+    CHECK(edb_snap_fetch("127.0.0.1", f.a.port, key_empty,
                          f.b.dir) == 0);
 
     /* an empty snapshot still lands as a file on the receiver: the
@@ -368,19 +368,19 @@ static void chunk_errors(void)
 
     char key_main[33];
     shard_key_of("main", "kv", key_main);
-    CHECK(zdb_put(f.a.engine, "main", "kv", "id-0",
+    CHECK(edb_put(f.a.engine, "main", "kv", "id-0",
                   "{\"n\":0}", -1));
 
     /* unknown key: server refuses cleanly */
-    CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, "zzzzzzzzzzzzzzzzzzzzz"
+    CHECK(edb_snap_fetch("127.0.0.1", f.a.port, "zzzzzzzzzzzzzzzzzzzzz"
                                            "zzzzzzzzzz",
                          f.b.dir) != 0);
 
     /* malformed key length must also be refused, not served */
-    CHECK(zdb_snap_fetch("127.0.0.1", f.a.port, "short", f.b.dir) != 0);
+    CHECK(edb_snap_fetch("127.0.0.1", f.a.port, "short", f.b.dir) != 0);
 
     /* unreachable peer: connection refused on a closed port */
-    CHECK(zdb_snap_fetch("127.0.0.1", 1, key_main, f.b.dir) != 0);
+    CHECK(edb_snap_fetch("127.0.0.1", 1, key_main, f.b.dir) != 0);
 
     fixture_stop(&f);
 }
@@ -402,20 +402,20 @@ static void chunk_invalidate(void)
         char value[64];
         snprintf(id, sizeof(id), "id-%04d", i);
         snprintf(value, sizeof(value), "{\"n\":%d}", i);
-        CHECK(zdb_put(f.a.engine, "main", "kv", id, value, -1));
+        CHECK(edb_put(f.a.engine, "main", "kv", id, value, -1));
     }
     for (int i = 0; i < 5; i++) {
         char id[32];
         char value[64];
         snprintf(id, sizeof(id), "doc-%03d", i);
         snprintf(value, sizeof(value), "{\"i\":%d}", i);
-        CHECK(zdb_put(f.a.engine, "other", "docs", id, value, -1));
+        CHECK(edb_put(f.a.engine, "other", "docs", id, value, -1));
     }
 
-    cJSON *doc = zdb_get(f.a.engine, "main", "kv", "id-0007");
+    cJSON *doc = edb_get(f.a.engine, "main", "kv", "id-0007");
     CHECK(doc != NULL);
     cJSON_Delete(doc);
-    CHECK(zdb_shard_is_open(f.a.engine, "main", "kv"));
+    CHECK(edb_shard_is_open(f.a.engine, "main", "kv"));
 
     /* replace the shard file underneath the engine with another
      * shard's contents, then invalidate: reads must reflect the new
@@ -445,12 +445,12 @@ static void chunk_invalidate(void)
              srcp, dstp, dstp, dstp);
     CHECK(system(cmd) == 0);
 
-    CHECK(zdb_shard_invalidate(f.a.engine, "main", "kv"));
-    CHECK(zdb_shard_is_open(f.a.engine, "main", "kv"));
-    doc = zdb_get(f.a.engine, "main", "kv", "id-0007");
+    CHECK(edb_shard_invalidate(f.a.engine, "main", "kv"));
+    CHECK(edb_shard_is_open(f.a.engine, "main", "kv"));
+    doc = edb_get(f.a.engine, "main", "kv", "id-0007");
     CHECK(doc == NULL);   /* now holds other/docs contents instead */
     cJSON_Delete(doc);
-    doc = zdb_get(f.a.engine, "main", "kv", "doc-003");
+    doc = edb_get(f.a.engine, "main", "kv", "doc-003");
     CHECK(doc != NULL);
     cJSON_Delete(doc);
 

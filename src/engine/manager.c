@@ -1,7 +1,7 @@
 #include "shard_internal.h"
 
 #include <dirent.h>
-#include "../zesty_log.h"
+#include "../epsilon_log.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,19 +12,19 @@
 
 #include "md5.h"
 
-#define ZDB_SHARD_BUCKETS 512
+#define EDB_SHARD_BUCKETS 512
 
 struct shard_link {
-    zdb_shard *shard;
+    edb_shard *shard;
     struct shard_link *next;
 };
 
-struct zdb_shard_manager {
+struct edb_shard_manager {
     char *path;
     pthread_mutex_t lock;              /* guards buckets + bucket counts */
-    struct shard_link *buckets[ZDB_SHARD_BUCKETS];
+    struct shard_link *buckets[EDB_SHARD_BUCKETS];
 
-    zdb_shard_settings_fn settings_fn;
+    edb_shard_settings_fn settings_fn;
     void *settings_ctx;
 
     pthread_t cleanup_thread;
@@ -40,7 +40,7 @@ static size_t bucket_for(const char *key)
                                                    : key[0] - 'a' + 10);
     unsigned int lo = (unsigned int)(key[1] <= '9' ? key[1] - '0'
                                                    : key[1] - 'a' + 10);
-    return (size_t)((hi << 4) | lo) & (ZDB_SHARD_BUCKETS - 1);
+    return (size_t)((hi << 4) | lo) & (EDB_SHARD_BUCKETS - 1);
 }
 
 static void shard_key(const char *partition, const char *keyspace,
@@ -49,11 +49,11 @@ static void shard_key(const char *partition, const char *keyspace,
     char partition_hash[33];
     char keyspace_hash[33];
     char framed[66];
-    zdb_md5_hex(partition, strlen(partition), partition_hash);
-    zdb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
+    edb_md5_hex(partition, strlen(partition), partition_hash);
+    edb_md5_hex(keyspace, strlen(keyspace), keyspace_hash);
     snprintf(framed, sizeof(framed), "%s:%s", partition_hash,
              keyspace_hash);
-    zdb_md5_hex(framed, strlen(framed), out);
+    edb_md5_hex(framed, strlen(framed), out);
 }
 
 static void legacy_shard_key(const char *partition, const char *keyspace,
@@ -61,11 +61,11 @@ static void legacy_shard_key(const char *partition, const char *keyspace,
 {
     char combined[1024];
     snprintf(combined, sizeof(combined), "%s%s", partition, keyspace);
-    zdb_md5_hex(combined, strlen(combined), out);
+    edb_md5_hex(combined, strlen(combined), out);
 }
 
 /* Look up a shard by key without opening it. Caller holds mgr->lock. */
-static zdb_shard *find_locked(zdb_engine *mgr, const char *key)
+static edb_shard *find_locked(edb_engine *mgr, const char *key)
 {
     for (struct shard_link *l = mgr->buckets[bucket_for(key)]; l; l = l->next) {
         if (strcmp(l->shard->key, key) == 0) {
@@ -78,23 +78,23 @@ static zdb_shard *find_locked(zdb_engine *mgr, const char *key)
 /* Insert an opened shard. Takes ownership on success. Caller must not hold
  * mgr->lock. Returns the shard, or NULL after freeing it if the key was
  * inserted concurrently. */
-static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh,
+static edb_shard *insert_shard(edb_engine *mgr, edb_shard *sh,
                                bool acquire)
 {
     pthread_mutex_lock(&mgr->lock);
-    zdb_shard *existing = find_locked(mgr, sh->key);
+    edb_shard *existing = find_locked(mgr, sh->key);
     if (existing) {
         if (acquire) {
             existing->refs++;
         }
         pthread_mutex_unlock(&mgr->lock);
-        zdb_shard_free(sh);
+        edb_shard_free(sh);
         return existing;
     }
     struct shard_link *link = malloc(sizeof(*link));
     if (!link) {
         pthread_mutex_unlock(&mgr->lock);
-        zdb_shard_free(sh);
+        edb_shard_free(sh);
         return NULL;
     }
     sh->refs = acquire ? 1 : 0;
@@ -105,7 +105,7 @@ static zdb_shard *insert_shard(zdb_engine *mgr, zdb_shard *sh,
     return sh;
 }
 
-static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
+static bool migrate_legacy_shard(edb_engine *mgr, const char *partition,
                                  const char *keyspace, const char *new_key)
 {
     char legacy_key[33];
@@ -132,7 +132,7 @@ static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
     while (*link && strcmp((*link)->shard->key, legacy_key) != 0) {
         link = &(*link)->next;
     }
-    zdb_shard *legacy = NULL;
+    edb_shard *legacy = NULL;
     if (*link) {
         if ((*link)->shard->refs > 0) {
             pthread_mutex_unlock(&mgr->lock);
@@ -144,7 +144,7 @@ static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
         free(removed);
     }
     if (legacy) {
-        zdb_shard_free(legacy);
+        edb_shard_free(legacy);
     }
     bool migrated = rename(legacy_path, new_path) == 0 || errno == ENOENT;
     if (migrated) {
@@ -166,8 +166,8 @@ static bool migrate_legacy_shard(zdb_engine *mgr, const char *partition,
     return migrated;
 }
 
-void zdb_engine_set_settings_provider(zdb_engine *mgr,
-                                      zdb_shard_settings_fn fn, void *ctx)
+void edb_engine_set_settings_provider(edb_engine *mgr,
+                                      edb_shard_settings_fn fn, void *ctx)
 {
     if (!mgr) {
         return;
@@ -178,11 +178,11 @@ void zdb_engine_set_settings_provider(zdb_engine *mgr,
     pthread_mutex_unlock(&mgr->lock);
 }
 
-static void resolve_settings(zdb_engine *mgr, const char *partition,
-                             zdb_shard_settings *out)
+static void resolve_settings(edb_engine *mgr, const char *partition,
+                             edb_shard_settings *out)
 {
-    zdb_shard_settings_default(out);
-    zdb_shard_settings_fn fn;
+    edb_shard_settings_default(out);
+    edb_shard_settings_fn fn;
     void *ctx;
     pthread_mutex_lock(&mgr->lock);
     fn = mgr->settings_fn;
@@ -193,8 +193,8 @@ static void resolve_settings(zdb_engine *mgr, const char *partition,
     }
 }
 
-static bool settings_differ(const zdb_shard_settings *a,
-                            const zdb_shard_settings *b)
+static bool settings_differ(const edb_shard_settings *a,
+                            const edb_shard_settings *b)
 {
     return a->cache_size != b->cache_size ||
            strcmp(a->journal_mode, b->journal_mode) != 0 ||
@@ -202,7 +202,7 @@ static bool settings_differ(const zdb_shard_settings *a,
            a->reindex_seconds != b->reindex_seconds;
 }
 
-static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
+static edb_shard *shard_for(edb_engine *mgr, const char *partition,
                             const char *keyspace)
 {
     char key[33];
@@ -211,11 +211,11 @@ static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
         return NULL;
     }
 
-    zdb_shard_settings desired;
+    edb_shard_settings desired;
     resolve_settings(mgr, partition, &desired);
 
     pthread_mutex_lock(&mgr->lock);
-    zdb_shard *sh = find_locked(mgr, key);
+    edb_shard *sh = find_locked(mgr, key);
     if (sh) {
         sh->refs++;
     }
@@ -228,8 +228,8 @@ static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
             return NULL;
         }
         snprintf(path, len, "%s/%s.sqlite", mgr->path, key);
-        zdb_shard *opened =
-            zdb_shard_open(path, key, partition, keyspace, &desired);
+        edb_shard *opened =
+            edb_shard_open(path, key, partition, keyspace, &desired);
         free(path);
         if (!opened) {
             return NULL;
@@ -251,12 +251,12 @@ static zdb_shard *shard_for(zdb_engine *mgr, const char *partition,
     }
     pthread_mutex_unlock(&sh->lock);
     if (reopen) {
-        zdb_shard_reopen(sh, &desired);
+        edb_shard_reopen(sh, &desired);
     }
     return sh;
 }
 
-static void shard_release(zdb_engine *mgr, zdb_shard *sh)
+static void shard_release(edb_engine *mgr, edb_shard *sh)
 {
     bool destroy = false;
     pthread_mutex_lock(&mgr->lock);
@@ -266,20 +266,20 @@ static void shard_release(zdb_engine *mgr, zdb_shard *sh)
     destroy = sh->retired && sh->refs == 0;
     pthread_mutex_unlock(&mgr->lock);
     if (destroy) {
-        zdb_shard_free(sh);
+        edb_shard_free(sh);
     }
 }
 
-static void shard_release(zdb_engine *mgr, zdb_shard *sh);
+static void shard_release(edb_engine *mgr, edb_shard *sh);
 
-static void close_all(zdb_engine *mgr)
+static void close_all(edb_engine *mgr)
 {
     pthread_mutex_lock(&mgr->lock);
-    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+    for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
         struct shard_link *l = mgr->buckets[i];
         while (l) {
             struct shard_link *next = l->next;
-            zdb_shard_free(l->shard);
+            edb_shard_free(l->shard);
             free(l);
             l = next;
         }
@@ -288,22 +288,22 @@ static void close_all(zdb_engine *mgr)
     pthread_mutex_unlock(&mgr->lock);
 }
 
-static void cleanup_all_shards(zdb_engine *mgr)
+static void cleanup_all_shards(edb_engine *mgr)
 {
     size_t count = 0;
     pthread_mutex_lock(&mgr->lock);
-    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+    for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
         for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
             count++;
         }
     }
-    zdb_shard **shards = count ? malloc(count * sizeof(*shards)) : NULL;
+    edb_shard **shards = count ? malloc(count * sizeof(*shards)) : NULL;
     if (count && !shards) {
         pthread_mutex_unlock(&mgr->lock);
         return;
     }
     size_t used = 0;
-    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+    for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
         for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
             l->shard->refs++;
             shards[used++] = l->shard;
@@ -312,7 +312,7 @@ static void cleanup_all_shards(zdb_engine *mgr)
     pthread_mutex_unlock(&mgr->lock);
 
     for (size_t i = 0; i < used; i++) {
-        zdb_shard_cleanup(shards[i]);
+        edb_shard_cleanup(shards[i]);
         shard_release(mgr, shards[i]);
     }
     free(shards);
@@ -320,13 +320,13 @@ static void cleanup_all_shards(zdb_engine *mgr)
 
 static void *cleanup_thread_main(void *arg)
 {
-    zdb_engine *mgr = arg;
+    edb_engine *mgr = arg;
 
     pthread_mutex_lock(&mgr->wakeup_lock);
     while (mgr->cleanup_running) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += ZDB_CLEANUP_INTERVAL_SECONDS;
+        ts.tv_sec += EDB_CLEANUP_INTERVAL_SECONDS;
         int rc = 0;
         while (mgr->cleanup_running && rc != ETIMEDOUT) {
             rc = pthread_cond_timedwait(&mgr->wakeup_cond,
@@ -345,13 +345,13 @@ static void *cleanup_thread_main(void *arg)
     return NULL;
 }
 
-zdb_engine *zdb_engine_open(const char *path)
+edb_engine *edb_engine_open(const char *path)
 {
     if (!path || !*path) {
         return NULL;
     }
 
-    zdb_engine *mgr = calloc(1, sizeof(*mgr));
+    edb_engine *mgr = calloc(1, sizeof(*mgr));
     if (!mgr) {
         return NULL;
     }
@@ -365,17 +365,17 @@ zdb_engine *zdb_engine_open(const char *path)
     pthread_cond_init(&mgr->wakeup_cond, NULL);
 
     if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-        zdb_log("ERROR", "cannot create data directory '%s': %s", path,
+        edb_log("ERROR", "cannot create data directory '%s': %s", path,
                 strerror(errno));
-        zdb_engine_close(mgr);
+        edb_engine_close(mgr);
         return NULL;
     }
 
     DIR *dir = opendir(path);
     if (!dir) {
-        zdb_log("ERROR", "cannot open data directory '%s': %s", path,
+        edb_log("ERROR", "cannot open data directory '%s': %s", path,
                 strerror(errno));
-        zdb_engine_close(mgr);
+        edb_engine_close(mgr);
         return NULL;
     }
     struct dirent *entry;
@@ -395,17 +395,17 @@ zdb_engine *zdb_engine_open(const char *path)
             continue;
         }
         snprintf(full, plen, "%s/%s", path, entry->d_name);
-        zdb_shard *sh = zdb_shard_open(full, key, "", "", NULL);
+        edb_shard *sh = edb_shard_open(full, key, "", "", NULL);
         free(full);
         if (!sh) {
-            zdb_log("WARN",
+            edb_log("WARN",
                     "failed to open existing shard '%s'",
                     entry->d_name);
             continue;
         }
         if (!insert_shard(mgr, sh, false)) {
             closedir(dir);
-            zdb_engine_close(mgr);
+            edb_engine_close(mgr);
             return NULL;
         }
     }
@@ -414,16 +414,16 @@ zdb_engine *zdb_engine_open(const char *path)
     mgr->cleanup_running = true;
     if (pthread_create(&mgr->cleanup_thread, NULL, cleanup_thread_main,
                        mgr) != 0) {
-        zdb_log("ERROR", "failed to start cleanup thread");
+        edb_log("ERROR", "failed to start cleanup thread");
         mgr->cleanup_running = false;
-        zdb_engine_close(mgr);
+        edb_engine_close(mgr);
         return NULL;
     }
 
     return mgr;
 }
 
-void zdb_engine_close(zdb_engine *mgr)
+void edb_engine_close(edb_engine *mgr)
 {
     if (!mgr) {
         return;
@@ -443,12 +443,12 @@ void zdb_engine_close(zdb_engine *mgr)
     free(mgr);
 }
 
-const char *zdb_engine_path(zdb_engine *mgr)
+const char *edb_engine_path(edb_engine *mgr)
 {
     return mgr ? mgr->path : NULL;
 }
 
-size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap)
+size_t edb_engine_shard_keys(edb_engine *mgr, char (*keys)[33], size_t cap)
 {
     if (!mgr || !keys || cap == 0) {
         return 0;
@@ -473,7 +473,7 @@ size_t zdb_engine_shard_keys(zdb_engine *mgr, char (*keys)[33], size_t cap)
     return n;
 }
 
-bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
+bool edb_shard_gc(edb_engine *mgr, const char key[33])
 {
     if (!mgr || !key || strlen(key) != 32) {
         return false;
@@ -481,7 +481,7 @@ bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
 
     /* drop the cached handle (if any) before removing the file so a
      * later reopen starts from a clean, empty shard */
-    zdb_shard *sh = NULL;
+    edb_shard *sh = NULL;
     pthread_mutex_lock(&mgr->lock);
     struct shard_link **pp = &mgr->buckets[bucket_for(key)];
     while (*pp && strcmp((*pp)->shard->key, key) != 0) {
@@ -521,7 +521,7 @@ bool zdb_shard_gc(zdb_engine *mgr, const char key[33])
     return rc == 0;
 }
 
-bool zdb_shard_path(zdb_engine *mgr, const char *partition,
+bool edb_shard_path(edb_engine *mgr, const char *partition,
                     const char *keyspace, char *path_out, size_t cap,
                     char key_out[33])
 {
@@ -545,7 +545,7 @@ bool zdb_shard_path(zdb_engine *mgr, const char *partition,
  * (Currently unused: invalidate runs integrity_check via sqlite3_exec
  * on the replaced handle; kept for the stage 6c delta-catch-up work.) */
 #if 0
-static bool shard_integrity_ok(zdb_shard *sh)
+static bool shard_integrity_ok(edb_shard *sh)
 {
     pthread_mutex_lock(&sh->lock);
     sqlite3_stmt *stmt = NULL;
@@ -564,7 +564,7 @@ static bool shard_integrity_ok(zdb_shard *sh)
 }
 #endif
 
-bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
+bool edb_shard_invalidate(edb_engine *mgr, const char *partition,
                           const char *keyspace)
 {
     if (!mgr || !partition || !keyspace) {
@@ -577,10 +577,10 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
         (int)sizeof(path)) {
         return false;
     }
-    zdb_shard_settings settings;
+    edb_shard_settings settings;
     resolve_settings(mgr, partition, &settings);
 
-    zdb_shard *sh = NULL;
+    edb_shard *sh = NULL;
     pthread_mutex_lock(&mgr->lock);
     sh = find_locked(mgr, key);
     if (sh) {
@@ -594,7 +594,7 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
     snprintf(side, sizeof(side), "%s-shm", path);
     unlink(side);
 
-    zdb_shard *fresh = zdb_shard_open(path, key, partition, keyspace,
+    edb_shard *fresh = edb_shard_open(path, key, partition, keyspace,
                                       &settings);
     bool ok = false;
     if (fresh) {
@@ -629,12 +629,12 @@ bool zdb_shard_invalidate(zdb_engine *mgr, const char *partition,
         pthread_mutex_unlock(&sh->lock);
     }
     if (fresh) {
-        zdb_shard_free(fresh);
+        edb_shard_free(fresh);
     }
     return ok;
 }
 
-bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
+bool edb_shard_is_open(edb_engine *mgr, const char *partition,
                        const char *keyspace)
 {
     if (!mgr) {
@@ -643,31 +643,31 @@ bool zdb_shard_is_open(zdb_engine *mgr, const char *partition,
     char key[33];
     shard_key(partition, keyspace, key);
     pthread_mutex_lock(&mgr->lock);
-    zdb_shard *sh = find_locked(mgr, key);
+    edb_shard *sh = find_locked(mgr, key);
     pthread_mutex_unlock(&mgr->lock);
     return sh != NULL;
 }
 
-int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition)
+int edb_engine_reload_partition(edb_engine *mgr, const char *partition)
 {
     if (!mgr || !partition || !*partition) {
         return 0;
     }
-    zdb_shard_settings settings;
+    edb_shard_settings settings;
     resolve_settings(mgr, partition, &settings);
 
     int reloaded = 0;
     pthread_mutex_lock(&mgr->lock);
-    for (size_t i = 0; i < ZDB_SHARD_BUCKETS; i++) {
+    for (size_t i = 0; i < EDB_SHARD_BUCKETS; i++) {
         for (struct shard_link *l = mgr->buckets[i]; l; l = l->next) {
-            zdb_shard *sh = l->shard;
+            edb_shard *sh = l->shard;
             pthread_mutex_lock(&sh->lock);
             bool match = strcmp(sh->partition, partition) == 0;
             pthread_mutex_unlock(&sh->lock);
             if (!match) {
                 continue;
             }
-            if (zdb_shard_reopen(sh, &settings)) {
+            if (edb_shard_reopen(sh, &settings)) {
                 reloaded++;
             }
         }
@@ -676,7 +676,7 @@ int zdb_engine_reload_partition(zdb_engine *mgr, const char *partition)
     return reloaded;
 }
 
-bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
+bool edb_shard_validate(edb_engine *mgr, const char *partition,
                         const char *keyspace)
 {
     if (!mgr || !partition || !keyspace) {
@@ -684,7 +684,7 @@ bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
     }
     char path[1024];
     char key[33];
-    if (!zdb_shard_path(mgr, partition, keyspace, path, sizeof(path), key)) {
+    if (!edb_shard_path(mgr, partition, keyspace, path, sizeof(path), key)) {
         return false;
     }
     struct stat file_stat;
@@ -713,176 +713,176 @@ bool zdb_shard_validate(zdb_engine *mgr, const char *partition,
 }
 
 
-bool zdb_put(zdb_engine *mgr, const char *partition, const char *keyspace,
+bool edb_put(edb_engine *mgr, const char *partition, const char *keyspace,
              const char *id, const char *json_value, long long ttl_seconds)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_put(sh, id, json_value, ttl_seconds);
+    bool ok = edb_shard_put(sh, id, json_value, ttl_seconds);
     shard_release(mgr, sh);
     return ok;
 }
 
-cJSON *zdb_get(zdb_engine *mgr, const char *partition, const char *keyspace,
+cJSON *edb_get(edb_engine *mgr, const char *partition, const char *keyspace,
                const char *id)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_get(sh, id);
+    cJSON *result = edb_shard_get(sh, id);
     shard_release(mgr, sh);
     return result;
 }
 
-bool zdb_delete(zdb_engine *mgr, const char *partition, const char *keyspace,
+bool edb_delete(edb_engine *mgr, const char *partition, const char *keyspace,
                 const char *id)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_delete(sh, id);
+    bool ok = edb_shard_delete(sh, id);
     shard_release(mgr, sh);
     return ok;
 }
 
-char **zdb_ids(zdb_engine *mgr, const char *partition, const char *keyspace,
+char **edb_ids(edb_engine *mgr, const char *partition, const char *keyspace,
                const cJSON *filters, size_t *count_out)
 {
     *count_out = 0;
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    char **result = zdb_shard_ids(sh, filters, count_out);
+    char **result = edb_shard_ids(sh, filters, count_out);
     shard_release(mgr, sh);
     return result;
 }
 
-cJSON *zdb_all(zdb_engine *mgr, const char *partition, const char *keyspace,
+cJSON *edb_all(edb_engine *mgr, const char *partition, const char *keyspace,
                const cJSON *filters)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_all(sh, filters);
+    cJSON *result = edb_shard_all(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
-cJSON *zdb_query(zdb_engine *mgr, const char *partition, const char *keyspace,
+cJSON *edb_query(edb_engine *mgr, const char *partition, const char *keyspace,
                  const cJSON *filters)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_query(sh, filters);
+    cJSON *result = edb_shard_query(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
-bool zdb_force_cleanup(zdb_engine *mgr, const char *partition,
+bool edb_force_cleanup(edb_engine *mgr, const char *partition,
                        const char *keyspace)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_cleanup(sh);
+    bool ok = edb_shard_cleanup(sh);
     shard_release(mgr, sh);
     return ok;
 }
 
-bool zdb_replica_put(zdb_engine *mgr, const char *partition,
+bool edb_replica_put(edb_engine *mgr, const char *partition,
                      const char *keyspace, const char *id,
                      const char *json_value, long long ttl_absolute,
                      long long timestamp)
 {
-    return zdb_replica_put_origin(mgr, partition, keyspace, id, json_value,
+    return edb_replica_put_origin(mgr, partition, keyspace, id, json_value,
                                   ttl_absolute, timestamp, "");
 }
 
-bool zdb_replica_put_origin(zdb_engine *mgr, const char *partition,
+bool edb_replica_put_origin(edb_engine *mgr, const char *partition,
                             const char *keyspace, const char *id,
                             const char *json_value, long long ttl_absolute,
                             long long timestamp, const char *origin)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_replica_put(sh, id, json_value, ttl_absolute,
+    bool ok = edb_shard_replica_put(sh, id, json_value, ttl_absolute,
                                     timestamp, origin);
     shard_release(mgr, sh);
     return ok;
 }
 
 
-bool zdb_replica_delete(zdb_engine *mgr, const char *partition,
+bool edb_replica_delete(edb_engine *mgr, const char *partition,
                         const char *keyspace, const char *id,
                         long long timestamp)
 {
-    return zdb_replica_delete_origin(mgr, partition, keyspace, id, timestamp,
+    return edb_replica_delete_origin(mgr, partition, keyspace, id, timestamp,
                                      "");
 }
 
-bool zdb_replica_delete_origin(zdb_engine *mgr, const char *partition,
+bool edb_replica_delete_origin(edb_engine *mgr, const char *partition,
                                const char *keyspace, const char *id,
                                long long timestamp, const char *origin)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return false;
     }
-    bool ok = zdb_shard_replica_delete(sh, id, timestamp, origin);
+    bool ok = edb_shard_replica_delete(sh, id, timestamp, origin);
     shard_release(mgr, sh);
     return ok;
 }
 
 
-cJSON *zdb_get_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_get_ts(edb_engine *mgr, const char *partition,
                   const char *keyspace, const char *id,
                   long long *timestamp_out)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_get_ts(sh, id, timestamp_out);
+    cJSON *result = edb_shard_get_ts(sh, id, timestamp_out);
     shard_release(mgr, sh);
     return result;
 }
 
-cJSON *zdb_all_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_all_ts(edb_engine *mgr, const char *partition,
                   const char *keyspace, const cJSON *filters)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_all_ts(sh, filters);
+    cJSON *result = edb_shard_all_ts(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
-cJSON *zdb_query_ts(zdb_engine *mgr, const char *partition,
+cJSON *edb_query_ts(edb_engine *mgr, const char *partition,
                     const char *keyspace, const cJSON *filters)
 {
-    zdb_shard *sh = shard_for(mgr, partition, keyspace);
+    edb_shard *sh = shard_for(mgr, partition, keyspace);
     if (!sh) {
         return NULL;
     }
-    cJSON *result = zdb_shard_query_ts(sh, filters);
+    cJSON *result = edb_shard_query_ts(sh, filters);
     shard_release(mgr, sh);
     return result;
 }
 
-void zdb_free_strings(char **strings)
+void edb_free_strings(char **strings)
 {
     if (!strings) {
         return;

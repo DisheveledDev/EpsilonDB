@@ -1,6 +1,6 @@
-/* zesty_crypto.c - see zesty_crypto.h. */
+/* epsilon_crypto.c - see epsilon_crypto.h. */
 
-#include "zesty_crypto.h"
+#include "epsilon_crypto.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +76,7 @@ static void chacha20_init(uint32_t state[16], const uint8_t key[32],
     }
 }
 
-void zdb_chacha20_xor(uint8_t *out, const uint8_t *in, size_t len,
+void edb_chacha20_xor(uint8_t *out, const uint8_t *in, size_t len,
                       const uint8_t key[32], const uint8_t nonce[12],
                       uint32_t counter)
 {
@@ -115,7 +115,7 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
     size_t i;
 
     if (key_len > 64) {
-        zdb_sha256(key, key_len, k);
+        edb_sha256(key, key_len, k);
         memset(k + 32, 0, 32);
     } else {
         memcpy(k, key, key_len);
@@ -133,18 +133,18 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
     }
     memcpy(inner, ipad, 64);
     memcpy(inner + 64, msg, msg_len);
-    zdb_sha256(inner, 64 + msg_len, inner_hash);
+    edb_sha256(inner, 64 + msg_len, inner_hash);
     free(inner);
 
     {
         uint8_t outer[96];
         memcpy(outer, opad, 64);
         memcpy(outer + 64, inner_hash, 32);
-        zdb_sha256(outer, 96, out);
+        edb_sha256(outer, 96, out);
     }
 }
 
-void zdb_hmac_sha256(const uint8_t *key, size_t key_len,
+void edb_hmac_sha256(const uint8_t *key, size_t key_len,
                      const uint8_t *msg, size_t msg_len, uint8_t out[32])
 {
     hmac_sha256(key, key_len, msg, msg_len, out);
@@ -153,7 +153,7 @@ void zdb_hmac_sha256(const uint8_t *key, size_t key_len,
 /* ------------------------------------------------------------------ */
 /* HKDF-SHA256 (RFC 5869)                                              */
 
-int zdb_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
+int edb_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
                     const uint8_t *salt, size_t salt_len,
                     const uint8_t *info, size_t info_len,
                     uint8_t *okm, size_t okm_len)
@@ -223,22 +223,22 @@ static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
     return diff == 0;
 }
 
-int zdb_aead_seal(const uint8_t enc_key[32], const uint8_t mac_key[32],
+int edb_aead_seal(const uint8_t enc_key[32], const uint8_t mac_key[32],
                   const uint8_t nonce[12], const uint8_t *aad, size_t aad_len,
                   const uint8_t *plain, size_t plain_len,
                   uint8_t *out, size_t out_cap)
 {
     uint8_t *mac_in;
     size_t mac_len;
-    size_t total = ZDB_NONCE_LEN + plain_len + ZDB_TAG_LEN;
+    size_t total = EDB_NONCE_LEN + plain_len + EDB_TAG_LEN;
     if (out_cap < total) {
         return -1;
     }
 
-    memcpy(out, nonce, ZDB_NONCE_LEN);
-    zdb_chacha20_xor(out + ZDB_NONCE_LEN, plain, plain_len, enc_key, nonce, 1);
+    memcpy(out, nonce, EDB_NONCE_LEN);
+    edb_chacha20_xor(out + EDB_NONCE_LEN, plain, plain_len, enc_key, nonce, 1);
 
-    mac_len = aad_len + ZDB_NONCE_LEN + plain_len;
+    mac_len = aad_len + EDB_NONCE_LEN + plain_len;
     mac_in = malloc(mac_len ? mac_len : 1);
     if (!mac_in) {
         return -1;
@@ -246,14 +246,14 @@ int zdb_aead_seal(const uint8_t enc_key[32], const uint8_t mac_key[32],
     if (aad_len) {
         memcpy(mac_in, aad, aad_len);
     }
-    memcpy(mac_in + aad_len, out, ZDB_NONCE_LEN + plain_len);
-    zdb_hmac_sha256(mac_key, 32, mac_in, mac_len,
-                    out + ZDB_NONCE_LEN + plain_len);
+    memcpy(mac_in + aad_len, out, EDB_NONCE_LEN + plain_len);
+    edb_hmac_sha256(mac_key, 32, mac_in, mac_len,
+                    out + EDB_NONCE_LEN + plain_len);
     free(mac_in);
     return 0;
 }
 
-int zdb_aead_open(const uint8_t enc_key[32], const uint8_t mac_key[32],
+int edb_aead_open(const uint8_t enc_key[32], const uint8_t mac_key[32],
                   const uint8_t *aad, size_t aad_len,
                   const uint8_t *in, size_t in_len,
                   uint8_t *out, size_t out_cap)
@@ -267,18 +267,18 @@ int zdb_aead_open(const uint8_t enc_key[32], const uint8_t mac_key[32],
     size_t mac_len;
     int ok;
 
-    if (in_len < ZDB_NONCE_LEN + ZDB_TAG_LEN) {
+    if (in_len < EDB_NONCE_LEN + EDB_TAG_LEN) {
         return -1;
     }
-    plain_len = in_len - ZDB_NONCE_LEN - ZDB_TAG_LEN;
+    plain_len = in_len - EDB_NONCE_LEN - EDB_TAG_LEN;
     if (plain_len > out_cap) {
         return -1;
     }
     nonce = in;
-    cipher = in + ZDB_NONCE_LEN;
-    tag = in + ZDB_NONCE_LEN + plain_len;
+    cipher = in + EDB_NONCE_LEN;
+    tag = in + EDB_NONCE_LEN + plain_len;
 
-    mac_len = aad_len + ZDB_NONCE_LEN + plain_len;
+    mac_len = aad_len + EDB_NONCE_LEN + plain_len;
     mac_in = malloc(mac_len ? mac_len : 1);
     if (!mac_in) {
         return -1;
@@ -286,15 +286,15 @@ int zdb_aead_open(const uint8_t enc_key[32], const uint8_t mac_key[32],
     if (aad_len) {
         memcpy(mac_in, aad, aad_len);
     }
-    memcpy(mac_in + aad_len, in, ZDB_NONCE_LEN + plain_len);
-    zdb_hmac_sha256(mac_key, 32, mac_in, mac_len, expected);
+    memcpy(mac_in + aad_len, in, EDB_NONCE_LEN + plain_len);
+    edb_hmac_sha256(mac_key, 32, mac_in, mac_len, expected);
     free(mac_in);
 
-    if (!ct_equal(expected, tag, ZDB_TAG_LEN)) {
+    if (!ct_equal(expected, tag, EDB_TAG_LEN)) {
         return -1;
     }
     (void)ok;
-    zdb_chacha20_xor(out, cipher, plain_len, enc_key, nonce, 1);
+    edb_chacha20_xor(out, cipher, plain_len, enc_key, nonce, 1);
     return (int)plain_len;
 }
 
@@ -328,7 +328,7 @@ static int test_chacha20(void)
     for (i = 0; i < 32; i++) {
         key[i] = (uint8_t)i;
     }
-    zdb_chacha20_xor(out, (const uint8_t *)plain, plen, key, nonce, 1);
+    edb_chacha20_xor(out, (const uint8_t *)plain, plen, key, nonce, 1);
     return hex_eq(
         "6e2e359a2568f98041ba0728dd0d6981"
         "e97e7aec1d4360c20a27afccfd9fae0b"
@@ -346,7 +346,7 @@ static int test_hmac(void)
     uint8_t key[20];
     uint8_t out[32];
     memset(key, 0x0b, sizeof(key));
-    zdb_hmac_sha256(key, sizeof(key), (const uint8_t *)"Hi There", 8, out);
+    edb_hmac_sha256(key, sizeof(key), (const uint8_t *)"Hi There", 8, out);
     return hex_eq(
         "b0344c61d8db38535ca8afceaf0bf12b"
         "881dc200c9833da726e9376c2e32cff7",
@@ -367,7 +367,7 @@ static int test_hkdf(void)
     for (i = 0; i < 10; i++) {
         info[i] = (uint8_t)(0xf0 + i);
     }
-    if (zdb_hkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt), info,
+    if (edb_hkdf_sha256(ikm, sizeof(ikm), salt, sizeof(salt), info,
                         sizeof(info), okm, sizeof(okm)) != 0) {
         return 0;
     }
@@ -384,7 +384,7 @@ static int test_aead(void)
     uint8_t mac_key[32];
     uint8_t nonce[12] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     const char *plain = "attack at dawn";
-    const char *aad = "zstp";
+    const char *aad = "estp";
     uint8_t sealed[128];
     uint8_t opened[128];
     int i;
@@ -394,29 +394,29 @@ static int test_aead(void)
         enc_key[i] = (uint8_t)(0x40 + i);
         mac_key[i] = (uint8_t)(0x80 + i);
     }
-    if (zdb_aead_seal(enc_key, mac_key, nonce, (const uint8_t *)aad,
+    if (edb_aead_seal(enc_key, mac_key, nonce, (const uint8_t *)aad,
                       strlen(aad), (const uint8_t *)plain, strlen(plain),
                       sealed, sizeof(sealed)) != 0) {
         return 0;
     }
-    n = zdb_aead_open(enc_key, mac_key, (const uint8_t *)aad, strlen(aad),
-                      sealed, strlen(plain) + ZDB_NONCE_LEN + ZDB_TAG_LEN,
+    n = edb_aead_open(enc_key, mac_key, (const uint8_t *)aad, strlen(aad),
+                      sealed, strlen(plain) + EDB_NONCE_LEN + EDB_TAG_LEN,
                       opened, sizeof(opened));
     if (n != (int)strlen(plain) || memcmp(opened, plain, strlen(plain)) != 0) {
         return 0;
     }
 
     /* tampering must be rejected */
-    sealed[ZDB_NONCE_LEN] ^= 0x01;
-    if (zdb_aead_open(enc_key, mac_key, (const uint8_t *)aad, strlen(aad),
-                      sealed, strlen(plain) + ZDB_NONCE_LEN + ZDB_TAG_LEN,
+    sealed[EDB_NONCE_LEN] ^= 0x01;
+    if (edb_aead_open(enc_key, mac_key, (const uint8_t *)aad, strlen(aad),
+                      sealed, strlen(plain) + EDB_NONCE_LEN + EDB_TAG_LEN,
                       opened, sizeof(opened)) != -1) {
         return 0;
     }
     return 1;
 }
 
-int zdb_crypto_selftest(void)
+int edb_crypto_selftest(void)
 {
     if (!test_chacha20()) {
         return 1;

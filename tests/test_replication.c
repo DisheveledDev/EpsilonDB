@@ -10,9 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_cluster.h"
-#include "../src/socket/zesty_repl.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_cluster.h"
+#include "../src/socket/epsilon_repl.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -27,10 +27,10 @@ static int g_failures = 0;
     } while (0)
 
 typedef struct {
-    zdb_engine *engine;
-    zdb_config *cfg;
-    zdb_cluster *cluster;
-    zdb_repl *repl;
+    edb_engine *engine;
+    edb_config *cfg;
+    edb_cluster *cluster;
+    edb_repl *repl;
     char dir[256];
 } node;
 
@@ -68,14 +68,14 @@ static bool test_apply_change(void *ud, const cJSON *change)
         long long ttl_abs = cJSON_IsNumber(jttl)
                                 ? (long long)jttl->valuedouble
                                 : -1;
-        bool ok = zdb_replica_put(n->engine, jpart->valuestring,
+        bool ok = edb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
                                   value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
     if (strcmp(jop->valuestring, "delete") == 0) {
-        return zdb_replica_delete(n->engine, jpart->valuestring,
+        return edb_replica_delete(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring, ts);
     }
     return false;
@@ -103,7 +103,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
             cJSON_GetObjectItemCaseSensitive(request, "id");
         long long ts = 0;
         cJSON *doc = cJSON_IsString(jid) && jid->valuestring
-                         ? zdb_get_ts(n->engine, jpart->valuestring,
+                         ? edb_get_ts(n->engine, jpart->valuestring,
                                       jks->valuestring,
                                       jid->valuestring, &ts)
                          : NULL;
@@ -124,9 +124,9 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
         const cJSON *filters =
             cJSON_GetObjectItemCaseSensitive(request, "filters");
         cJSON *rows = strcmp(jq->valuestring, "all_ts") == 0
-                          ? zdb_all_ts(n->engine, jpart->valuestring,
+                          ? edb_all_ts(n->engine, jpart->valuestring,
                                        jks->valuestring, filters)
-                          : zdb_query_ts(n->engine, jpart->valuestring,
+                          : edb_query_ts(n->engine, jpart->valuestring,
                                          jks->valuestring, filters);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
@@ -134,13 +134,13 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
         size_t cnt = 0;
         const cJSON *filters =
             cJSON_GetObjectItemCaseSensitive(request, "filters");
-        char **ids = zdb_ids(n->engine, jpart->valuestring,
+        char **ids = edb_ids(n->engine, jpart->valuestring,
                              jks->valuestring, filters, &cnt);
         cJSON *arr = cJSON_AddArrayToObject(out, "ids");
         for (size_t i = 0; arr && ids && i < cnt; i++) {
             cJSON_AddItemToArray(arr, cJSON_CreateString(ids[i]));
         }
-        zdb_free_strings(ids);
+        edb_free_strings(ids);
     } else {
         cJSON_Delete(out);
         return NULL;
@@ -156,23 +156,23 @@ static void node_start(node *n, const char *dir, int port)
     if (system(cmd) != 0) {
         /* best effort */
     }
-    n->engine = zdb_engine_open(dir);
-    n->cfg = zdb_config_open(n->engine);
-    char id[ZDB_NODE_ID_MAX];
-    n->cluster = zdb_cluster_start(n->cfg, "127.0.0.1", port, id);
-    n->repl = zdb_repl_start(n->cluster, n->cfg, dir);
+    n->engine = edb_engine_open(dir);
+    n->cfg = edb_config_open(n->engine);
+    char id[EDB_NODE_ID_MAX];
+    n->cluster = edb_cluster_start(n->cfg, "127.0.0.1", port, id);
+    n->repl = edb_repl_start(n->cluster, n->cfg, dir);
 
     /* bind this node's engine to its repl (per-cluster dispatch) */
-    zdb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
+    edb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
                           n);
 }
 
 static void node_stop(node *n)
 {
-    zdb_repl_stop(n->repl);
-    zdb_cluster_stop(n->cluster);
-    zdb_config_close(n->cfg);
-    zdb_engine_close(n->engine);
+    edb_repl_stop(n->repl);
+    edb_cluster_stop(n->cluster);
+    edb_config_close(n->cfg);
+    edb_engine_close(n->engine);
     n->repl = NULL;
     n->cluster = NULL;
     n->cfg = NULL;
@@ -219,10 +219,10 @@ typedef struct {
     size_t want;
 } converge_ctx;
 
-static size_t online_peers(zdb_cluster *cl)
+static size_t online_peers(edb_cluster *cl)
 {
-    zdb_peer_info peers[16];
-    size_t n = zdb_cluster_peers(cl, peers, 16);
+    edb_peer_info peers[16];
+    size_t n = edb_cluster_peers(cl, peers, 16);
     size_t online = 0;
     for (size_t i = 0; i < n; i++) {
         if (peers[i].online) {
@@ -252,23 +252,23 @@ int main(void)
     node_start(&a, dir, port_base);
     CHECK(a.cluster != NULL);
 
-    zdb_database_create(a.cfg, "app", 2);
-    zdb_database_create(a.cfg, "strict", 3);   /* rf=3: needs 2/2 holders */
+    edb_database_create(a.cfg, "app", 2);
+    edb_database_create(a.cfg, "strict", 3);   /* rf=3: needs 2/2 holders */
 
     snprintf(dir, sizeof(dir), "tests/data/repl/b");
     node_start(&b, dir, port_base + 1);
     CHECK(b.cluster != NULL);
-    zdb_database_create(b.cfg, "app", 2);
-    zdb_database_create(b.cfg, "strict", 3);
+    edb_database_create(b.cfg, "app", 2);
+    edb_database_create(b.cfg, "strict", 3);
 
     snprintf(dir, sizeof(dir), "tests/data/repl/c");
     node_start(&c, dir, port_base + 2);
     CHECK(c.cluster != NULL);
-    zdb_database_create(c.cfg, "app", 2);
-    zdb_database_create(c.cfg, "strict", 3);
+    edb_database_create(c.cfg, "app", 2);
+    edb_database_create(c.cfg, "strict", 3);
 
-    CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
-    CHECK(zdb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
+    CHECK(edb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
+    CHECK(edb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc = { &a, &b, &c, 3 };
     CHECK(wait_for(15, mesh_converged, &cc));
     settle();
@@ -278,12 +278,12 @@ int main(void)
         char change[512];
         build_put(change, sizeof(change), "app", "main", "kv", "greeting",
                   (long long)time(NULL), "{\"hello\":\"world\"}");
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
 
         /* poll until both replicas hold the doc */
         for (int i = 0; i < 100; i++) {
-            cJSON *vb = zdb_get(b.engine, "main", "kv", "greeting");
-            cJSON *vc = zdb_get(c.engine, "main", "kv", "greeting");
+            cJSON *vb = edb_get(b.engine, "main", "kv", "greeting");
+            cJSON *vc = edb_get(c.engine, "main", "kv", "greeting");
             bool both = vb && vc;
             cJSON_Delete(vb);
             cJSON_Delete(vc);
@@ -293,8 +293,8 @@ int main(void)
             usleep(100 * 1000);
         }
 
-        cJSON *vb = zdb_get(b.engine, "main", "kv", "greeting");
-        cJSON *vc = zdb_get(c.engine, "main", "kv", "greeting");
+        cJSON *vb = edb_get(b.engine, "main", "kv", "greeting");
+        cJSON *vc = edb_get(c.engine, "main", "kv", "greeting");
         CHECK(vb != NULL);
         CHECK(vc != NULL);
         if (vb) {
@@ -317,14 +317,14 @@ int main(void)
         char newer[512];
         build_put(newer, sizeof(newer), "app", "main", "kv", "lww",
                   now + 10, "{\"v\":2}");
-        CHECK(zdb_repl_write(a.repl, "app", newer) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", newer) == EDB_REPL_OK);
 
         char older[512];
         build_put(older, sizeof(older), "app", "main", "kv", "lww",
                   now, "{\"v\":1}");
-        CHECK(zdb_repl_write(b.repl, "app", older) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(b.repl, "app", older) == EDB_REPL_OK);
 
-        cJSON *doc = zdb_get(a.engine, "main", "kv", "lww");
+        cJSON *doc = edb_get(a.engine, "main", "kv", "lww");
         CHECK(doc != NULL);
         if (doc) {
             cJSON *v = cJSON_GetObjectItemCaseSensitive(doc, "v");
@@ -341,10 +341,10 @@ int main(void)
                  "{\"op\":\"delete\",\"db\":\"app\",\"partition\":\"main\","
                  "\"keyspace\":\"kv\",\"id\":\"greeting\",\"ts\":%lld}",
                  now);
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
 
-        cJSON *gone_a = zdb_get(a.engine, "main", "kv", "greeting");
-        cJSON *gone_b = zdb_get(b.engine, "main", "kv", "greeting");
+        cJSON *gone_a = edb_get(a.engine, "main", "kv", "greeting");
+        cJSON *gone_b = edb_get(b.engine, "main", "kv", "greeting");
         CHECK(gone_a == NULL);
         CHECK(gone_b == NULL);
         cJSON_Delete(gone_a);
@@ -358,19 +358,19 @@ int main(void)
         char change[512];
         build_put(change, sizeof(change), "app", "main", "kv", "offline",
                   (long long)time(NULL), "{\"queued\":true}");
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
 
         /* restart b and rejoin */
         snprintf(dir, sizeof(dir), "tests/data/repl/b");
-        b.engine = zdb_engine_open(dir);
-        b.cfg = zdb_config_open(b.engine);
-        b.cluster = zdb_cluster_start(b.cfg, "127.0.0.1", port_base + 1,
+        b.engine = edb_engine_open(dir);
+        b.cfg = edb_config_open(b.engine);
+        b.cluster = edb_cluster_start(b.cfg, "127.0.0.1", port_base + 1,
                                       NULL);
-        b.repl = zdb_repl_start(b.cluster, b.cfg, dir);
-        zdb_repl_set_handlers(b.repl, test_apply_change,
+        b.repl = edb_repl_start(b.cluster, b.cfg, dir);
+        edb_repl_set_handlers(b.repl, test_apply_change,
                               test_read_request, &b);
         CHECK(b.repl != NULL);
-        CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
+        CHECK(edb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
         converge_ctx again = { &a, &b, &c, 3 };
         CHECK(wait_for(15, mesh_converged, &again));
         settle();
@@ -378,7 +378,7 @@ int main(void)
         /* replay happens on the maintenance tick once b is seen back */
         bool replayed = false;
         for (int i = 0; i < 100 && !replayed; i++) {
-            cJSON *doc = zdb_get(b.engine, "main", "kv", "offline");
+            cJSON *doc = edb_get(b.engine, "main", "kv", "offline");
             if (doc) {
                 replayed = true;
             }
@@ -394,19 +394,19 @@ int main(void)
         build_put(change, sizeof(change), "app", "main", "users", "u1",
                   (long long)time(NULL),
                   "{\"name\":\"ada\",\"manager\":{\"age\":50}}");
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
         build_put(change, sizeof(change), "app", "main", "users", "u2",
                   (long long)time(NULL),
                   "{\"name\":\"bob\",\"manager\":{\"age\":30}}");
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
 
         /* direct engine read confirms local copy */
-        cJSON *local = zdb_get(a.engine, "main", "users", "u1");
+        cJSON *local = edb_get(a.engine, "main", "users", "u1");
         CHECK(local != NULL);
         cJSON_Delete(local);
 
         /* quorum read returns the merged/agreed doc */
-        cJSON *got = zdb_repl_read_get(a.repl, "app", "main", "users",
+        cJSON *got = edb_repl_read_get(a.repl, "app", "main", "users",
                                        "u1");
         CHECK(got != NULL);
         if (got) {
@@ -419,26 +419,26 @@ int main(void)
 
         /* ids/all merges across replicas */
         size_t nids = 0;
-        char **ids = zdb_repl_read_ids(a.repl, "app", "main", "users",
+        char **ids = edb_repl_read_ids(a.repl, "app", "main", "users",
                                        NULL, &nids);
         CHECK(ids != NULL && nids == 2);
-        zdb_free_strings(ids);
+        edb_free_strings(ids);
 
-        cJSON *all = zdb_repl_read_all(a.repl, "app", "main", "users",
+        cJSON *all = edb_repl_read_all(a.repl, "app", "main", "users",
                                        NULL);
         CHECK(all != NULL && cJSON_GetArraySize(all) == 2);
         cJSON_Delete(all);
 
         cJSON *filters = cJSON_Parse(
             "{\"key\":\"manager.age\",\"operator\":\"gt\",\"value\":40}");
-        cJSON *filtered = zdb_repl_read_query(a.repl, "app", "main", "users",
+        cJSON *filtered = edb_repl_read_query(a.repl, "app", "main", "users",
                                               filters);
         CHECK(filtered && cJSON_GetArraySize(filtered) == 1);
         cJSON_Delete(filtered);
-        ids = zdb_repl_read_ids(a.repl, "app", "main", "users", filters,
+        ids = edb_repl_read_ids(a.repl, "app", "main", "users", filters,
                                 &nids);
         CHECK(ids && nids == 1 && strcmp(ids[0], "u1") == 0);
-        zdb_free_strings(ids);
+        edb_free_strings(ids);
         cJSON_Delete(filters);
     }
 
@@ -451,16 +451,16 @@ int main(void)
         char ok_change[512];
         build_put(ok_change, sizeof(ok_change), "strict", "main", "kv",
                   "writable", (long long)time(NULL), "{\"n\":1}");
-        CHECK(zdb_repl_write(a.repl, "strict", ok_change) ==
-              ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "strict", ok_change) ==
+              EDB_REPL_OK);
 
         /* take b down too: only holder left is a -> rejected */
         node_stop(&b);
         char bad_change[512];
         build_put(bad_change, sizeof(bad_change), "strict", "main", "kv",
                   "rejected", (long long)time(NULL), "{\"n\":2}");
-        CHECK(zdb_repl_write(a.repl, "strict", bad_change) ==
-              ZDB_REPL_QUORUM_LOST);
+        CHECK(edb_repl_write(a.repl, "strict", bad_change) ==
+              EDB_REPL_QUORUM_LOST);
 
         /* rf=2 database still writable alone (responders-based read
          * quorum keeps reads available; single-holder write succeeds
@@ -469,29 +469,29 @@ int main(void)
         char app_change[512];
         build_put(app_change, sizeof(app_change), "app", "main", "kv",
                   "alone", (long long)time(NULL), "{\"n\":3}");
-        CHECK(zdb_repl_write(a.repl, "app", app_change) ==
-              ZDB_REPL_QUORUM_LOST);
+        CHECK(edb_repl_write(a.repl, "app", app_change) ==
+              EDB_REPL_QUORUM_LOST);
 
         /* bring everyone back; cached strict/app changes must replay */
         snprintf(dir, sizeof(dir), "tests/data/repl/b");
-        b.engine = zdb_engine_open(dir);
-        b.cfg = zdb_config_open(b.engine);
-        b.cluster = zdb_cluster_start(b.cfg, "127.0.0.1", port_base + 1,
+        b.engine = edb_engine_open(dir);
+        b.cfg = edb_config_open(b.engine);
+        b.cluster = edb_cluster_start(b.cfg, "127.0.0.1", port_base + 1,
                                       NULL);
-        b.repl = zdb_repl_start(b.cluster, b.cfg, dir);
-        zdb_repl_set_handlers(b.repl, test_apply_change,
+        b.repl = edb_repl_start(b.cluster, b.cfg, dir);
+        edb_repl_set_handlers(b.repl, test_apply_change,
                               test_read_request, &b);
-        CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
+        CHECK(edb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
 
         snprintf(dir, sizeof(dir), "tests/data/repl/c");
-        c.engine = zdb_engine_open(dir);
-        c.cfg = zdb_config_open(c.engine);
-        c.cluster = zdb_cluster_start(c.cfg, "127.0.0.1", port_base + 2,
+        c.engine = edb_engine_open(dir);
+        c.cfg = edb_config_open(c.engine);
+        c.cluster = edb_cluster_start(c.cfg, "127.0.0.1", port_base + 2,
                                       NULL);
-        c.repl = zdb_repl_start(c.cluster, c.cfg, dir);
-        zdb_repl_set_handlers(c.repl, test_apply_change,
+        c.repl = edb_repl_start(c.cluster, c.cfg, dir);
+        edb_repl_set_handlers(c.repl, test_apply_change,
                               test_read_request, &c);
-        CHECK(zdb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
+        CHECK(edb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
 
         converge_ctx final_cc = { &a, &b, &c, 3 };
         CHECK(wait_for(15, mesh_converged, &final_cc));
@@ -499,7 +499,7 @@ int main(void)
 
         bool converged_data = false;
         for (int i = 0; i < 100 && !converged_data; i++) {
-            cJSON *doc = zdb_get(c.engine, "main", "kv", "writable");
+            cJSON *doc = edb_get(c.engine, "main", "kv", "writable");
             if (doc) {
                 converged_data = true;
             }

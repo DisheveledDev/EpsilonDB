@@ -7,8 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_cluster.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_cluster.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -33,8 +33,8 @@ static void wait_for(int seconds, bool (*cond)(void *), void *ctx)
 }
 
 typedef struct {
-    zdb_cluster *a;
-    zdb_cluster *b;
+    edb_cluster *a;
+    edb_cluster *b;
 } two_nodes;
 
 static bool converged(void *ctx)
@@ -43,9 +43,9 @@ static bool converged(void *ctx)
     if (!t->a || !t->b) {
         return false;
     }
-    zdb_peer_info pa[16], pb[16];
-    size_t na = zdb_cluster_peers(t->a, pa, 16);
-    size_t nb = zdb_cluster_peers(t->b, pb, 16);
+    edb_peer_info pa[16], pb[16];
+    size_t na = edb_cluster_peers(t->a, pa, 16);
+    size_t nb = edb_cluster_peers(t->b, pb, 16);
     if (na < 2 || nb < 2) {
         return false;
     }
@@ -54,20 +54,20 @@ static bool converged(void *ctx)
      * differ (each node still owns the full space from when it was
      * alone) until the rebalance service promotes the target. The mesh
      * itself only needs to converge on membership and the target view. */
-    zdb_range_info ra[8], rb[8];
-    size_t nra = zdb_cluster_ranges(t->a, ra, 8);
-    size_t nrb = zdb_cluster_ranges(t->b, rb, 8);
-    long long tga = zdb_cluster_target_generation(t->a);
-    long long tgb = zdb_cluster_target_generation(t->b);
-    if (zdb_cluster_generation(t->a) == 0 ||
-        zdb_cluster_generation(t->b) == 0 ||
+    edb_range_info ra[8], rb[8];
+    size_t nra = edb_cluster_ranges(t->a, ra, 8);
+    size_t nrb = edb_cluster_ranges(t->b, rb, 8);
+    long long tga = edb_cluster_target_generation(t->a);
+    long long tgb = edb_cluster_target_generation(t->b);
+    if (edb_cluster_generation(t->a) == 0 ||
+        edb_cluster_generation(t->b) == 0 ||
         nra == 0 || nrb == 0 || tga != tgb || tga == 0) {
         return false;
     }
     /* target tables identical too */
-    zdb_range_info taa[8], tab[8];
-    size_t nta = zdb_cluster_target_ranges(t->a, taa, 8);
-    size_t ntb = zdb_cluster_target_ranges(t->b, tab, 8);
+    edb_range_info taa[8], tab[8];
+    size_t nta = edb_cluster_target_ranges(t->a, taa, 8);
+    size_t ntb = edb_cluster_target_ranges(t->b, tab, 8);
     if (nta != ntb || nta == 0) {
         return false;
     }
@@ -81,8 +81,8 @@ static bool converged(void *ctx)
 
     /* each sees the other online */
     bool a_online = false, b_online = false;
-    const char *idb = zdb_cluster_self_id(t->b);
-    const char *ida = zdb_cluster_self_id(t->a);
+    const char *idb = edb_cluster_self_id(t->b);
+    const char *ida = edb_cluster_self_id(t->a);
     for (size_t i = 0; i < na; i++) {
         if (strcmp(pa[i].id, idb) == 0 && pa[i].online) {
             a_online = true;
@@ -115,47 +115,47 @@ static void test_two_node_mesh(const char *dir)
     snprintf(pata, sizeof(pata), "%s/a", dir);
     snprintf(patb, sizeof(patb), "%s/b", dir);
 
-    zdb_engine *ea = zdb_engine_open(pata);
-    zdb_config *ca = zdb_config_open(ea);
-    zdb_engine *eb = zdb_engine_open(patb);
-    zdb_config *cb = zdb_config_open(eb);
+    edb_engine *ea = edb_engine_open(pata);
+    edb_config *ca = edb_config_open(ea);
+    edb_engine *eb = edb_engine_open(patb);
+    edb_config *cb = edb_config_open(eb);
     CHECK(ca && cb);
 
-    char ida[ZDB_NODE_ID_MAX], idb[ZDB_NODE_ID_MAX];
-    zdb_cluster *a = zdb_cluster_start(ca, "127.0.0.1", port_base, ida);
+    char ida[EDB_NODE_ID_MAX], idb[EDB_NODE_ID_MAX];
+    edb_cluster *a = edb_cluster_start(ca, "127.0.0.1", port_base, ida);
     CHECK(a != NULL);
-    CHECK(a && strcmp(zdb_cluster_self_id(a), ida) == 0);
+    CHECK(a && strcmp(edb_cluster_self_id(a), ida) == 0);
 
     /* single node: leader of itself, full range, generation >= 1 */
-    CHECK(zdb_cluster_is_leader(a));
-    CHECK(zdb_cluster_generation(a) >= 1);
-    zdb_range_info ra[8];
-    size_t nr = zdb_cluster_ranges(a, ra, 8);
+    CHECK(edb_cluster_is_leader(a));
+    CHECK(edb_cluster_generation(a) >= 1);
+    edb_range_info ra[8];
+    size_t nr = edb_cluster_ranges(a, ra, 8);
     CHECK(nr == 1);
     CHECK(nr == 1 && strcmp(ra[0].node_id, ida) == 0);
     CHECK(nr == 1 && ra[0].start[0] == '0' && ra[0].end[0] == 'f');
-    CHECK(a && zdb_cluster_owner(a, "00000000000000000000000000000000") &&
-          strcmp(zdb_cluster_owner(a,
+    CHECK(a && edb_cluster_owner(a, "00000000000000000000000000000000") &&
+          strcmp(edb_cluster_owner(a,
                   "00000000000000000000000000000000"), ida) == 0);
 
     /* node b joins a */
-    zdb_cluster *b = zdb_cluster_start(cb, "127.0.0.1", port_base + 1,
+    edb_cluster *b = edb_cluster_start(cb, "127.0.0.1", port_base + 1,
                                        idb);
     CHECK(b != NULL);
     CHECK(strcmp(ida, idb) != 0);
     sleep(1);   /* let both acceptor/maintainer threads start first */
 
     two_nodes t = { a, b };
-    zdb_cluster_set_auto_compliant(a, false);
-    zdb_cluster_set_auto_compliant(b, false);
-    CHECK(zdb_cluster_join(b, "127.0.0.1", port_base) == 0);
+    edb_cluster_set_auto_compliant(a, false);
+    edb_cluster_set_auto_compliant(b, false);
+    CHECK(edb_cluster_join(b, "127.0.0.1", port_base) == 0);
     wait_for(15, converged, &t);
     CHECK(converged(&t));
 
     /* deterministic leader: smallest id wins on both sides */
     const char *expected = strcmp(ida, idb) < 0 ? ida : idb;
-    const char *la = zdb_cluster_leader(a);
-    const char *lb = zdb_cluster_leader(b);
+    const char *la = edb_cluster_leader(a);
+    const char *lb = edb_cluster_leader(b);
     CHECK(la && strcmp(la, expected) == 0);
     CHECK(lb && strcmp(lb, expected) == 0);
 
@@ -165,19 +165,19 @@ static void test_two_node_mesh(const char *dir)
      * invariant tested here is that both nodes hold identical views of
      * whichever tables exist (already checked by converged()), and
      * ownership lookups are consistent across nodes for both tables. */
-    zdb_range_info rbb[8], taa[8], tab[8];
-    size_t nb_r = zdb_cluster_ranges(b, rbb, 8);
-    nr = zdb_cluster_ranges(a, ra, 8);
+    edb_range_info rbb[8], taa[8], tab[8];
+    size_t nb_r = edb_cluster_ranges(b, rbb, 8);
+    nr = edb_cluster_ranges(a, ra, 8);
     CHECK(nr == nb_r);
-    size_t nta = zdb_cluster_target_ranges(a, taa, 8);
-    size_t ntb = zdb_cluster_target_ranges(b, tab, 8);
+    size_t nta = edb_cluster_target_ranges(a, taa, 8);
+    size_t ntb = edb_cluster_target_ranges(b, tab, 8);
     CHECK(nta == 2 && ntb == 2);
 
     /* ownership lookups agree across nodes */
     const char *own_a =
-        zdb_cluster_owner(a, "7fffffffffffffffffffffffffffffff");
+        edb_cluster_owner(a, "7fffffffffffffffffffffffffffffff");
     const char *own_b =
-        zdb_cluster_owner(b, "7fffffffffffffffffffffffffffffff");
+        edb_cluster_owner(b, "7fffffffffffffffffffffffffffffff");
     /* live tables still show 1 slice each (pre-promotion), so both
      * owners are the respective selves; the invariant is consistency
      * with each node's own live view */
@@ -191,19 +191,19 @@ static void test_two_node_mesh(const char *dir)
     }
 
     /* membership persisted in the system database (settings store) */
-    char *members = zdb_setting_get(ca, "cluster.members");
+    char *members = edb_setting_get(ca, "cluster.members");
     CHECK(members && strstr(members, idb) != NULL);
     free(members);
-    members = zdb_setting_get(cb, "cluster.members");
+    members = edb_setting_get(cb, "cluster.members");
     CHECK(members && strstr(members, ida) != NULL);
     free(members);
 
-    zdb_cluster_stop(b);
-    zdb_cluster_stop(a);
-    zdb_config_close(ca);
-    zdb_config_close(cb);
-    zdb_engine_close(ea);
-    zdb_engine_close(eb);
+    edb_cluster_stop(b);
+    edb_cluster_stop(a);
+    edb_config_close(ca);
+    edb_config_close(cb);
+    edb_engine_close(ea);
+    edb_engine_close(eb);
 }
 
 int main(void)

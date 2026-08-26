@@ -10,7 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
-bool zdb_random_bytes(uint8_t *out, size_t len)
+bool edb_random_bytes(uint8_t *out, size_t len)
 {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) {
@@ -38,7 +38,7 @@ bool zdb_random_bytes(uint8_t *out, size_t len)
     return true;
 }
 
-void zdb_random_hex(char *out, size_t hex_chars)
+void edb_random_hex(char *out, size_t hex_chars)
 {
     static const char hex[] = "0123456789abcdef";
     uint8_t bytes[128];
@@ -46,7 +46,7 @@ void zdb_random_hex(char *out, size_t hex_chars)
     if (count > sizeof(bytes)) {
         count = sizeof(bytes);
     }
-    zdb_random_bytes(bytes, count);
+    edb_random_bytes(bytes, count);
     for (size_t i = 0; i < count && i * 2 < hex_chars; i++) {
         out[i * 2] = hex[bytes[i] >> 4];
         if (i * 2 + 1 < hex_chars) {

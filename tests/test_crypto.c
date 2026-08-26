@@ -3,11 +3,11 @@
 
 #include <stdio.h>
 
-#include "../src/engine/zesty_crypto.h"
+#include "../src/engine/epsilon_crypto.h"
 
 int main(void)
 {
-    int rc = zdb_crypto_selftest();
+    int rc = edb_crypto_selftest();
     if (rc == 0) {
         printf("tests/test_crypto: ok\n");
         return 0;

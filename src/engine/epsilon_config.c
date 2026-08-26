@@ -1,4 +1,4 @@
-#include "zesty_config.h"
+#include "epsilon_config.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -19,12 +19,12 @@
 #define CFG_KEYSPACE_KEYSPACES   "config_keyspaces"
 #define CFG_KEYSPACE_SETTINGS    "config_settings"
 
-struct zdb_config {
-    zdb_engine *engine;
+struct edb_config {
+    edb_engine *engine;
     bool owns_engine;
     pthread_mutex_t replicate_lock;
     pthread_mutex_t group_lock;
-    zdb_config_replicate_fn replicate;
+    edb_config_replicate_fn replicate;
     void *replicate_ctx;
 };
 
@@ -37,9 +37,9 @@ static char *record_json(const cJSON *obj)
     return printed;
 }
 
-static cJSON *fetch(zdb_config *cfg, const char *keyspace, const char *id)
+static cJSON *fetch(edb_config *cfg, const char *keyspace, const char *id)
 {
-    return zdb_get(cfg->engine, ZDB_SYSTEM_DB, keyspace, id);
+    return edb_get(cfg->engine, EDB_SYSTEM_DB, keyspace, id);
 }
 
 static bool internal_cluster_setting(const char *keyspace, const char *id)
@@ -49,7 +49,7 @@ static bool internal_cluster_setting(const char *keyspace, const char *id)
             strncmp(id, "rebalance.", 10) == 0);
 }
 
-static bool store(zdb_config *cfg, const char *keyspace, const char *id,
+static bool store(edb_config *cfg, const char *keyspace, const char *id,
                   cJSON *obj)
 {
     char *json = record_json(obj);
@@ -63,13 +63,13 @@ static bool store(zdb_config *cfg, const char *keyspace, const char *id,
         pthread_mutex_unlock(&cfg->replicate_lock);
     } else {
         pthread_mutex_unlock(&cfg->replicate_lock);
-        ok = zdb_put(cfg->engine, ZDB_SYSTEM_DB, keyspace, id, json, -1);
+        ok = edb_put(cfg->engine, EDB_SYSTEM_DB, keyspace, id, json, -1);
     }
     free(json);
     return ok;
 }
 
-static bool remove_record(zdb_config *cfg, const char *keyspace,
+static bool remove_record(edb_config *cfg, const char *keyspace,
                           const char *id)
 {
     pthread_mutex_lock(&cfg->replicate_lock);
@@ -79,12 +79,12 @@ static bool remove_record(zdb_config *cfg, const char *keyspace,
         return ok;
     }
     pthread_mutex_unlock(&cfg->replicate_lock);
-    return zdb_delete(cfg->engine, ZDB_SYSTEM_DB, keyspace, id);
+    return edb_delete(cfg->engine, EDB_SYSTEM_DB, keyspace, id);
 }
 
-static cJSON *collect(zdb_config *cfg, const char *keyspace)
+static cJSON *collect(edb_config *cfg, const char *keyspace)
 {
-    return zdb_all(cfg->engine, ZDB_SYSTEM_DB, keyspace, NULL);
+    return edb_all(cfg->engine, EDB_SYSTEM_DB, keyspace, NULL);
 }
 
 /* Extract helpers with bounds-checked copies. */
@@ -146,7 +146,7 @@ static void set_json_i64(cJSON *obj, const char *field, long long v)
     cJSON_AddStringToObject(obj, field, buf);
 }
 
-static void copy_settings(const cJSON *obj, zdb_shard_settings *out)
+static void copy_settings(const cJSON *obj, edb_shard_settings *out)
 {
     out->cache_size = json_i64(obj, "cache_size");
     copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
@@ -158,12 +158,12 @@ static void copy_settings(const cJSON *obj, zdb_shard_settings *out)
     out->reindex_seconds = json_i64(obj, "reindex_seconds");
 }
 
-zdb_config *zdb_config_open(zdb_engine *engine)
+edb_config *edb_config_open(edb_engine *engine)
 {
     if (!engine) {
         return NULL;
     }
-    zdb_config *cfg = calloc(1, sizeof(*cfg));
+    edb_config *cfg = calloc(1, sizeof(*cfg));
     if (!cfg) {
         return NULL;
     }
@@ -174,13 +174,13 @@ zdb_config *zdb_config_open(zdb_engine *engine)
     return cfg;
 }
 
-zdb_engine *zdb_config_engine(zdb_config *cfg)
+edb_engine *edb_config_engine(edb_config *cfg)
 {
     return cfg ? cfg->engine : NULL;
 }
 
-void zdb_config_set_replicator(zdb_config *cfg,
-                               zdb_config_replicate_fn replicate, void *ctx)
+void edb_config_set_replicator(edb_config *cfg,
+                               edb_config_replicate_fn replicate, void *ctx)
 {
     if (!cfg) {
         return;
@@ -191,7 +191,7 @@ void zdb_config_set_replicator(zdb_config *cfg,
     pthread_mutex_unlock(&cfg->replicate_lock);
 }
 
-void zdb_config_close(zdb_config *cfg)
+void edb_config_close(edb_config *cfg)
 {
     if (!cfg) {
         return;
@@ -203,15 +203,15 @@ void zdb_config_close(zdb_config *cfg)
 
 /* --- databases -------------------------------------------------------- */
 
-bool zdb_database_create(zdb_config *cfg, const char *name,
+bool edb_database_create(edb_config *cfg, const char *name,
                          int replication_factor)
 {
-    if (!cfg || !name || !*name || !NAME_OK(name, zdb_database_info) ||
+    if (!cfg || !name || !*name || !NAME_OK(name, edb_database_info) ||
         replication_factor < 1) {
         return false;
     }
-    zdb_database_info existing;
-    if (zdb_database_get(cfg, name, &existing)) {
+    edb_database_info existing;
+    if (edb_database_get(cfg, name, &existing)) {
         return false;   /* duplicate */
     }
     cJSON *obj = cJSON_CreateObject();
@@ -226,7 +226,7 @@ bool zdb_database_create(zdb_config *cfg, const char *name,
     return ok;
 }
 
-static bool remove_keyspaces_for(zdb_config *cfg, const char *database,
+static bool remove_keyspaces_for(edb_config *cfg, const char *database,
                                  const char *partition)
 {
     cJSON *all = collect(cfg, CFG_KEYSPACE_KEYSPACES);
@@ -260,24 +260,24 @@ static bool remove_keyspaces_for(zdb_config *cfg, const char *database,
 }
 
 
-bool zdb_database_delete(zdb_config *cfg, const char *name)
+bool edb_database_delete(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return false;
     }
     /* also drop partitions belonging to this database */
     size_t n = 0;
-    zdb_partition_info *parts = zdb_partition_list(cfg, name, &n);
+    edb_partition_info *parts = edb_partition_list(cfg, name, &n);
     for (size_t i = 0; parts && i < n; i++) {
-        zdb_partition_delete(cfg, name, parts[i].name);
+        edb_partition_delete(cfg, name, parts[i].name);
     }
     bool keyspaces_ok = remove_keyspaces_for(cfg, name, NULL);
     free(parts);
     return keyspaces_ok && remove_record(cfg, CFG_KEYSPACE_DATABASES, name);
 }
 
-bool zdb_database_get(zdb_config *cfg, const char *name,
-                      zdb_database_info *out)
+bool edb_database_get(edb_config *cfg, const char *name,
+                      edb_database_info *out)
 {
     if (!cfg || !name || !out) {
         return false;
@@ -294,7 +294,7 @@ bool zdb_database_get(zdb_config *cfg, const char *name,
     return out->name[0] != '\0';
 }
 
-zdb_database_info *zdb_database_list(zdb_config *cfg, size_t *count_out)
+edb_database_info *edb_database_list(edb_config *cfg, size_t *count_out)
 {
     *count_out = 0;
     if (!cfg) {
@@ -305,7 +305,7 @@ zdb_database_info *zdb_database_list(zdb_config *cfg, size_t *count_out)
         return NULL;
     }
     size_t n = (size_t)cJSON_GetArraySize(all);
-    zdb_database_info *out = calloc(n + 1, sizeof(*out));
+    edb_database_info *out = calloc(n + 1, sizeof(*out));
     if (!out) {
         cJSON_Delete(all);
         return NULL;
@@ -326,19 +326,19 @@ zdb_database_info *zdb_database_list(zdb_config *cfg, size_t *count_out)
 
 /* --- security groups --------------------------------------------------- */
 
-static uint64_t next_free_bit(zdb_config *cfg)
+static uint64_t next_free_bit(edb_config *cfg)
 {
     size_t n = 0;
-    zdb_group_info *groups = zdb_group_list(cfg, &n);
+    edb_group_info *groups = edb_group_list(cfg, &n);
     uint64_t used = 0;
     for (size_t i = 0; groups && i < n; i++) {
         if (groups[i].bit_position >= 1 &&
-            groups[i].bit_position <= ZDB_MAX_GROUPS) {
+            groups[i].bit_position <= EDB_MAX_GROUPS) {
             used |= (1ULL << (groups[i].bit_position - 1));
         }
     }
     free(groups);
-    for (int bit = 1; bit <= ZDB_MAX_GROUPS; bit++) {
+    for (int bit = 1; bit <= EDB_MAX_GROUPS; bit++) {
         if (!(used & (1ULL << (bit - 1)))) {
             return (uint64_t)bit;
         }
@@ -346,14 +346,14 @@ static uint64_t next_free_bit(zdb_config *cfg)
     return 0;   /* exhausted */
 }
 
-bool zdb_group_create(zdb_config *cfg, const char *name)
+bool edb_group_create(edb_config *cfg, const char *name)
 {
-    if (!cfg || !name || !*name || !NAME_OK(name, zdb_group_info)) {
+    if (!cfg || !name || !*name || !NAME_OK(name, edb_group_info)) {
         return false;
     }
     pthread_mutex_lock(&cfg->group_lock);
-    zdb_group_info existing;
-    if (zdb_group_get(cfg, name, &existing)) {
+    edb_group_info existing;
+    if (edb_group_get(cfg, name, &existing)) {
         pthread_mutex_unlock(&cfg->group_lock);
         return false;
     }
@@ -376,7 +376,7 @@ bool zdb_group_create(zdb_config *cfg, const char *name)
     return ok;
 }
 
-bool zdb_group_delete(zdb_config *cfg, const char *name)
+bool edb_group_delete(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return false;
@@ -387,7 +387,7 @@ bool zdb_group_delete(zdb_config *cfg, const char *name)
     return ok;
 }
 
-bool zdb_group_get(zdb_config *cfg, const char *name, zdb_group_info *out)
+bool edb_group_get(edb_config *cfg, const char *name, edb_group_info *out)
 {
     if (!cfg || !name || !out) {
         return false;
@@ -400,10 +400,10 @@ bool zdb_group_get(zdb_config *cfg, const char *name, zdb_group_info *out)
     out->bit_position = json_u64(obj, "bit_position");
     cJSON_Delete(obj);
     return out->name[0] != '\0' &&
-           out->bit_position >= 1 && out->bit_position <= ZDB_MAX_GROUPS;
+           out->bit_position >= 1 && out->bit_position <= EDB_MAX_GROUPS;
 }
 
-zdb_group_info *zdb_group_list(zdb_config *cfg, size_t *count_out)
+edb_group_info *edb_group_list(edb_config *cfg, size_t *count_out)
 {
     *count_out = 0;
     if (!cfg) {
@@ -414,7 +414,7 @@ zdb_group_info *zdb_group_list(zdb_config *cfg, size_t *count_out)
         return NULL;
     }
     size_t n = (size_t)cJSON_GetArraySize(all);
-    zdb_group_info *out = calloc(n + 1, sizeof(*out));
+    edb_group_info *out = calloc(n + 1, sizeof(*out));
     if (!out) {
         cJSON_Delete(all);
         return NULL;
@@ -433,13 +433,13 @@ zdb_group_info *zdb_group_list(zdb_config *cfg, size_t *count_out)
 
 /* --- users ------------------------------------------------------------- */
 
-bool zdb_user_create(zdb_config *cfg, const char *name, uint64_t groups)
+bool edb_user_create(edb_config *cfg, const char *name, uint64_t groups)
 {
-    if (!cfg || !name || !*name || !NAME_OK(name, zdb_user_info)) {
+    if (!cfg || !name || !*name || !NAME_OK(name, edb_user_info)) {
         return false;
     }
-    zdb_user_info existing;
-    if (zdb_user_get(cfg, name, &existing)) {
+    edb_user_info existing;
+    if (edb_user_get(cfg, name, &existing)) {
         return false;
     }
     cJSON *obj = cJSON_CreateObject();
@@ -454,7 +454,7 @@ bool zdb_user_create(zdb_config *cfg, const char *name, uint64_t groups)
     return ok;
 }
 
-bool zdb_user_delete(zdb_config *cfg, const char *name)
+bool edb_user_delete(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return false;
@@ -462,7 +462,7 @@ bool zdb_user_delete(zdb_config *cfg, const char *name)
     return remove_record(cfg, CFG_KEYSPACE_USERS, name);
 }
 
-static bool user_update(zdb_config *cfg, const char *name, uint64_t groups)
+static bool user_update(edb_config *cfg, const char *name, uint64_t groups)
 {
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
@@ -476,19 +476,19 @@ static bool user_update(zdb_config *cfg, const char *name, uint64_t groups)
     return ok;
 }
 
-bool zdb_user_set_groups(zdb_config *cfg, const char *name, uint64_t groups)
+bool edb_user_set_groups(edb_config *cfg, const char *name, uint64_t groups)
 {
     if (!cfg || !name) {
         return false;
     }
-    zdb_user_info existing;
-    if (!zdb_user_get(cfg, name, &existing)) {
+    edb_user_info existing;
+    if (!edb_user_get(cfg, name, &existing)) {
         return false;
     }
     return user_update(cfg, name, groups);
 }
 
-bool zdb_user_get(zdb_config *cfg, const char *name, zdb_user_info *out)
+bool edb_user_get(edb_config *cfg, const char *name, edb_user_info *out)
 {
     if (!cfg || !name || !out) {
         return false;
@@ -503,7 +503,7 @@ bool zdb_user_get(zdb_config *cfg, const char *name, zdb_user_info *out)
     return out->name[0] != '\0';
 }
 
-zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out)
+edb_user_info *edb_user_list(edb_config *cfg, size_t *count_out)
 {
     *count_out = 0;
     if (!cfg) {
@@ -514,7 +514,7 @@ zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out)
         return NULL;
     }
     size_t n = (size_t)cJSON_GetArraySize(all);
-    zdb_user_info *out = calloc(n + 1, sizeof(*out));
+    edb_user_info *out = calloc(n + 1, sizeof(*out));
     if (!out) {
         cJSON_Delete(all);
         return NULL;
@@ -533,7 +533,7 @@ zdb_user_info *zdb_user_list(zdb_config *cfg, size_t *count_out)
 
 /* --- passwords ---------------------------------------------------------- */
 
-#define ZDB_PASSWORD_ITERATIONS 100000
+#define EDB_PASSWORD_ITERATIONS 100000
 
 static int hex_value(char c)
 {
@@ -573,9 +573,9 @@ static void hash_password(const char *salt_hex, const char *password,
     memcpy(input + sizeof(salt), password, plen);
 
     uint8_t digest[32];
-    zdb_sha256(input, sizeof(salt) + plen, digest);
-    for (int i = 1; i < ZDB_PASSWORD_ITERATIONS; i++) {
-        zdb_sha256(digest, sizeof(digest), digest);
+    edb_sha256(input, sizeof(salt) + plen, digest);
+    for (int i = 1; i < EDB_PASSWORD_ITERATIONS; i++) {
+        edb_sha256(digest, sizeof(digest), digest);
     }
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) {
@@ -585,18 +585,18 @@ static void hash_password(const char *salt_hex, const char *password,
     out[64] = '\0';
 }
 
-bool zdb_user_set_password(zdb_config *cfg, const char *name,
+bool edb_user_set_password(edb_config *cfg, const char *name,
                            const char *password)
 {
     if (!cfg || !name || !password || !*password) {
         return false;
     }
-    zdb_user_info existing;
-    if (!zdb_user_get(cfg, name, &existing)) {
+    edb_user_info existing;
+    if (!edb_user_get(cfg, name, &existing)) {
         return false;
     }
     char salt_hex[33];
-    zdb_random_hex(salt_hex, 32);
+    edb_random_hex(salt_hex, 32);
     char hash[65];
     hash_password(salt_hex, password, hash);
 
@@ -614,7 +614,7 @@ bool zdb_user_set_password(zdb_config *cfg, const char *name,
     return ok;
 }
 
-bool zdb_user_verify_password(zdb_config *cfg, const char *name,
+bool edb_user_verify_password(edb_config *cfg, const char *name,
                               const char *password)
 {
     if (!cfg || !name || !password) {
@@ -638,7 +638,7 @@ bool zdb_user_verify_password(zdb_config *cfg, const char *name,
     return ok;
 }
 
-bool zdb_user_has_password(zdb_config *cfg, const char *name)
+bool edb_user_has_password(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return false;
@@ -654,10 +654,10 @@ bool zdb_user_has_password(zdb_config *cfg, const char *name)
     return has;
 }
 
-bool zdb_admin_exists(zdb_config *cfg)
+bool edb_admin_exists(edb_config *cfg)
 {
     size_t count = 0;
-    zdb_user_info *users = zdb_user_list(cfg, &count);
+    edb_user_info *users = edb_user_list(cfg, &count);
     bool exists = false;
     for (size_t i = 0; users && i < count; i++) {
         if (users[i].groups & 1ULL) {
@@ -671,18 +671,18 @@ bool zdb_admin_exists(zdb_config *cfg)
 
 /* --- partitions --------------------------------------------------------- */
 
-bool zdb_partition_create(zdb_config *cfg, const char *database,
+bool edb_partition_create(edb_config *cfg, const char *database,
                           const char *name, uint64_t create_mask,
                           uint64_t update_mask, uint64_t read_mask,
                           uint64_t delete_mask)
 {
     if (!cfg || !database || !name || !*database || !*name ||
-        !NAME_OK(database, zdb_partition_info) ||
-        !NAME_OK(name, zdb_partition_info)) {
+        !NAME_OK(database, edb_partition_info) ||
+        !NAME_OK(name, edb_partition_info)) {
         return false;
     }
-    zdb_partition_info existing;
-    if (zdb_partition_get(cfg, database, name, &existing)) {
+    edb_partition_info existing;
+    if (edb_partition_get(cfg, database, name, &existing)) {
         return false;
     }
     char id[384];
@@ -698,8 +698,8 @@ bool zdb_partition_create(zdb_config *cfg, const char *database,
     set_json_u64(obj, "update_mask", update_mask);
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
-    zdb_shard_settings defaults;
-    zdb_shard_settings_default(&defaults);
+    edb_shard_settings defaults;
+    edb_shard_settings_default(&defaults);
     set_json_i64(obj, "cache_size", defaults.cache_size);
     cJSON_AddStringToObject(obj, "journal_mode", defaults.journal_mode);
     set_json_i64(obj, "vacuum_seconds", defaults.vacuum_seconds);
@@ -709,7 +709,7 @@ bool zdb_partition_create(zdb_config *cfg, const char *database,
     return ok;
 }
 
-bool zdb_partition_delete(zdb_config *cfg, const char *database,
+bool edb_partition_delete(edb_config *cfg, const char *database,
                           const char *name)
 {
     if (!cfg || !database || !name) {
@@ -721,7 +721,7 @@ bool zdb_partition_delete(zdb_config *cfg, const char *database,
            remove_record(cfg, CFG_KEYSPACE_PARTITIONS, id);
 }
 
-bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
+bool edb_partition_set_masks(edb_config *cfg, const char *database,
                              const char *name, uint64_t create_mask,
                              uint64_t update_mask, uint64_t read_mask,
                              uint64_t delete_mask)
@@ -729,8 +729,8 @@ bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
     if (!cfg || !database || !name) {
         return false;
     }
-    zdb_partition_info existing;
-    if (!zdb_partition_get(cfg, database, name, &existing)) {
+    edb_partition_info existing;
+    if (!edb_partition_get(cfg, database, name, &existing)) {
         return false;
     }
     char id[384];
@@ -755,8 +755,8 @@ bool zdb_partition_set_masks(zdb_config *cfg, const char *database,
     return ok;
 }
 
-bool zdb_partition_get(zdb_config *cfg, const char *database,
-                       const char *name, zdb_partition_info *out)
+bool edb_partition_get(edb_config *cfg, const char *database,
+                       const char *name, edb_partition_info *out)
 {
     if (!cfg || !database || !name || !out) {
         return false;
@@ -785,15 +785,15 @@ bool zdb_partition_get(zdb_config *cfg, const char *database,
     return out->name[0] != '\0';
 }
 
-bool zdb_partition_set_settings(zdb_config *cfg, const char *database,
+bool edb_partition_set_settings(edb_config *cfg, const char *database,
                                 const char *name,
-                                const zdb_shard_settings *settings)
+                                const edb_shard_settings *settings)
 {
     if (!cfg || !database || !name || !settings) {
         return false;
     }
-    zdb_partition_info existing;
-    if (!zdb_partition_get(cfg, database, name, &existing)) {
+    edb_partition_info existing;
+    if (!edb_partition_get(cfg, database, name, &existing)) {
         return false;
     }
     char id[384];
@@ -816,7 +816,7 @@ bool zdb_partition_set_settings(zdb_config *cfg, const char *database,
     bool ok = store(cfg, CFG_KEYSPACE_PARTITIONS, id, obj);
     cJSON_Delete(obj);
     if (ok) {
-        zdb_engine_reload_partition(cfg->engine, name);
+        edb_engine_reload_partition(cfg->engine, name);
     }
     return ok;
 }
@@ -826,7 +826,7 @@ bool zdb_partition_set_settings(zdb_config *cfg, const char *database,
  * tighten them afterwards via set_masks. This is what makes writes to
  * unseen partitions transparent: the first put registers the partition
  * and its keyspace usage in the system database. */
-bool zdb_partition_ensure(zdb_config *cfg, const char *database,
+bool edb_partition_ensure(edb_config *cfg, const char *database,
                           const char *partition, const char *keyspace,
                           bool *created_out)
 {
@@ -837,19 +837,19 @@ bool zdb_partition_ensure(zdb_config *cfg, const char *database,
         !*database || !*partition || !*keyspace) {
         return false;
     }
-    if (!NAME_OK(database, zdb_partition_info) ||
-        !NAME_OK(partition, zdb_keyspace_info)) {
+    if (!NAME_OK(database, edb_partition_info) ||
+        !NAME_OK(partition, edb_keyspace_info)) {
         return false;
     }
 
-    zdb_partition_info existing;
-    bool exists = zdb_partition_get(cfg, database, partition, &existing);
+    edb_partition_info existing;
+    bool exists = edb_partition_get(cfg, database, partition, &existing);
     if (!exists) {
         /* registry of used partitions per database */
-        if (!zdb_partition_create(cfg, database, partition,
-                                  ZDB_MASK_ALLOW_ALL, ZDB_MASK_ALLOW_ALL,
-                                  ZDB_MASK_ALLOW_ALL,
-                                  ZDB_MASK_ALLOW_ALL)) {
+        if (!edb_partition_create(cfg, database, partition,
+                                  EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
+                                  EDB_MASK_ALLOW_ALL,
+                                  EDB_MASK_ALLOW_ALL)) {
             return false;
         }
         if (created_out) {
@@ -883,7 +883,7 @@ bool zdb_partition_ensure(zdb_config *cfg, const char *database,
     return true;
 }
 
-zdb_keyspace_info *zdb_keyspace_list(zdb_config *cfg, size_t *count_out)
+edb_keyspace_info *edb_keyspace_list(edb_config *cfg, size_t *count_out)
 {
     *count_out = 0;
     if (!cfg) {
@@ -894,7 +894,7 @@ zdb_keyspace_info *zdb_keyspace_list(zdb_config *cfg, size_t *count_out)
         return NULL;
     }
     size_t total = (size_t)cJSON_GetArraySize(all);
-    zdb_keyspace_info *out = calloc(total + 1, sizeof(*out));
+    edb_keyspace_info *out = calloc(total + 1, sizeof(*out));
     if (!out) {
         cJSON_Delete(all);
         return NULL;
@@ -916,7 +916,7 @@ zdb_keyspace_info *zdb_keyspace_list(zdb_config *cfg, size_t *count_out)
     return out;
 }
 
-zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
+edb_partition_info *edb_partition_list(edb_config *cfg, const char *database,
                                        size_t *count_out)
 {
     *count_out = 0;
@@ -928,7 +928,7 @@ zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
         return NULL;
     }
     size_t total = (size_t)cJSON_GetArraySize(all);
-    zdb_partition_info *out = calloc(total + 1, sizeof(*out));
+    edb_partition_info *out = calloc(total + 1, sizeof(*out));
     if (!out) {
         cJSON_Delete(all);
         return NULL;
@@ -967,12 +967,12 @@ zdb_partition_info *zdb_partition_list(zdb_config *cfg, const char *database,
  * The reserved __system__ partition always uses defaults: its config shards
  * are what this very provider reads, so reading them here would recurse. */
 static void config_settings_provider(void *ctx, const char *partition,
-                                     zdb_shard_settings *out)
+                                     edb_shard_settings *out)
 {
-    if (strcmp(partition, ZDB_SYSTEM_DB) == 0) {
+    if (strcmp(partition, EDB_SYSTEM_DB) == 0) {
         return;
     }
-    zdb_config *cfg = ctx;
+    edb_config *cfg = ctx;
     cJSON *all = collect(cfg, CFG_KEYSPACE_PARTITIONS);
     cJSON *item = NULL;
     cJSON_ArrayForEach(item, all) {
@@ -987,21 +987,21 @@ static void config_settings_provider(void *ctx, const char *partition,
     cJSON_Delete(all);
 }
 
-void zdb_config_register_settings(zdb_config *cfg)
+void edb_config_register_settings(edb_config *cfg)
 {
     if (cfg) {
-        zdb_engine_set_settings_provider(cfg->engine,
+        edb_engine_set_settings_provider(cfg->engine,
                                          config_settings_provider, cfg);
     }
 }
 
 /* --- authorization ------------------------------------------------------ */
 
-bool zdb_check_perm(uint64_t mask, uint64_t user_groups,
-                    zdb_permission perm)
+bool edb_check_perm(uint64_t mask, uint64_t user_groups,
+                    edb_permission perm)
 {
     (void)perm;   /* masks are per-permission; caller selects the mask */
-    if (mask == ZDB_MASK_ALLOW_ALL) {
+    if (mask == EDB_MASK_ALLOW_ALL) {
         return true;
     }
     return (mask & user_groups) != 0;
@@ -1009,7 +1009,7 @@ bool zdb_check_perm(uint64_t mask, uint64_t user_groups,
 
 /* --- server/cluster settings -------------------------------------------- */
 
-bool zdb_setting_set(zdb_config *cfg, const char *name,
+bool edb_setting_set(edb_config *cfg, const char *name,
                      const char *json_value)
 {
     if (!cfg || !name || !*name || !json_value) {
@@ -1039,7 +1039,7 @@ bool zdb_setting_set(zdb_config *cfg, const char *name,
     return ok;
 }
 
-char *zdb_setting_get(zdb_config *cfg, const char *name)
+char *edb_setting_get(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return NULL;
@@ -1059,7 +1059,7 @@ char *zdb_setting_get(zdb_config *cfg, const char *name)
     return out;
 }
 
-bool zdb_setting_delete(zdb_config *cfg, const char *name)
+bool edb_setting_delete(edb_config *cfg, const char *name)
 {
     if (!cfg || !name) {
         return false;
@@ -1067,7 +1067,7 @@ bool zdb_setting_delete(zdb_config *cfg, const char *name)
     return remove_record(cfg, CFG_KEYSPACE_SETTINGS, name);
 }
 
-char **zdb_setting_list(zdb_config *cfg, size_t *count_out)
+char **edb_setting_list(edb_config *cfg, size_t *count_out)
 {
     *count_out = 0;
     if (!cfg) {
@@ -1097,7 +1097,7 @@ char **zdb_setting_list(zdb_config *cfg, size_t *count_out)
     return names;
 }
 
-bool zdb_config_is_system_key(zdb_config *cfg, const char key[33])
+bool edb_config_is_system_key(edb_config *cfg, const char key[33])
 {
     if (!cfg || !key || strlen(key) != 32) {
         return false;
@@ -1111,7 +1111,7 @@ bool zdb_config_is_system_key(zdb_config *cfg, const char key[33])
          i < sizeof(keyspaces) / sizeof(keyspaces[0]); i++) {
         char sys_key[33];
         char path[1024];
-        if (zdb_shard_path(cfg->engine, ZDB_SYSTEM_DB, keyspaces[i], path,
+        if (edb_shard_path(cfg->engine, EDB_SYSTEM_DB, keyspaces[i], path,
                            sizeof(path), sys_key) &&
             strcmp(sys_key, key) == 0) {
             return true;
@@ -1120,7 +1120,7 @@ bool zdb_config_is_system_key(zdb_config *cfg, const char key[33])
     return false;
 }
 
-size_t zdb_config_system_keyspaces(const char **out, size_t cap)
+size_t edb_config_system_keyspaces(const char **out, size_t cap)
 {
     static const char *const keyspaces[] = {
         CFG_KEYSPACE_DATABASES, CFG_KEYSPACE_GROUPS,   CFG_KEYSPACE_USERS,

@@ -1,4 +1,4 @@
-#include "zesty_analytics.h"
+#include "epsilon_analytics.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -27,13 +27,13 @@ typedef struct {
     uint64_t max_us;
 } slow_stat;
 
-struct zdb_analytics {
-    zdb_config *cfg;
-    zdb_engine *engine;
+struct edb_analytics {
+    edb_config *cfg;
+    edb_engine *engine;
     char node_id[64];
-    zdb_analytics_flush_fn flush;
+    edb_analytics_flush_fn flush;
     void *flush_ctx;
-    zdb_analytics_cluster_fn cluster_fn;
+    edb_analytics_cluster_fn cluster_fn;
     void *cluster_ctx;
 
     pthread_mutex_t lock;
@@ -53,7 +53,7 @@ static long long epoch_sec(void)
     return (long long)time(NULL);
 }
 
-static shard_stat *find_shard(zdb_analytics *a, const char *partition,
+static shard_stat *find_shard(edb_analytics *a, const char *partition,
                               const char *keyspace)
 {
     for (size_t i = 0; i < a->nshards; i++) {
@@ -78,7 +78,7 @@ static shard_stat *find_shard(zdb_analytics *a, const char *partition,
     return s;
 }
 
-static slow_stat *find_slow(zdb_analytics *a, const char *kind,
+static slow_stat *find_slow(edb_analytics *a, const char *kind,
                             const char *partition, const char *keyspace,
                             const char *filter_key)
 {
@@ -150,7 +150,7 @@ static void join_filter_keys(const char *const *keys, size_t nkeys,
 
 /* --- recording -------------------------------------------------------- */
 
-static void record_read_locked(zdb_analytics *a, const char *partition,
+static void record_read_locked(edb_analytics *a, const char *partition,
                                const char *keyspace, long long latency_us)
 {
     shard_stat *s = find_shard(a, partition, keyspace);
@@ -161,7 +161,7 @@ static void record_read_locked(zdb_analytics *a, const char *partition,
     s->read_us += (uint64_t)latency_us;
 }
 
-static void record_slow_locked(zdb_analytics *a, const char *kind,
+static void record_slow_locked(edb_analytics *a, const char *kind,
                                const char *partition, const char *keyspace,
                                const char *filter_key, long long latency_us)
 {
@@ -176,7 +176,7 @@ static void record_slow_locked(zdb_analytics *a, const char *kind,
     }
 }
 
-void zdb_analytics_record_read(zdb_analytics *a, const char *partition,
+void edb_analytics_record_read(edb_analytics *a, const char *partition,
                                const char *keyspace, long long latency_us)
 {
     if (!a) {
@@ -188,7 +188,7 @@ void zdb_analytics_record_read(zdb_analytics *a, const char *partition,
     pthread_mutex_unlock(&a->lock);
 }
 
-void zdb_analytics_record_write(zdb_analytics *a, const char *partition,
+void edb_analytics_record_write(edb_analytics *a, const char *partition,
                                 const char *keyspace, bool update,
                                 long long latency_us)
 {
@@ -208,7 +208,7 @@ void zdb_analytics_record_write(zdb_analytics *a, const char *partition,
     pthread_mutex_unlock(&a->lock);
 }
 
-void zdb_analytics_record_delete(zdb_analytics *a, const char *partition,
+void edb_analytics_record_delete(edb_analytics *a, const char *partition,
                                  const char *keyspace, long long latency_us)
 {
     if (!a) {
@@ -224,7 +224,7 @@ void zdb_analytics_record_delete(zdb_analytics *a, const char *partition,
     pthread_mutex_unlock(&a->lock);
 }
 
-void zdb_analytics_record_query(zdb_analytics *a, const char *partition,
+void edb_analytics_record_query(edb_analytics *a, const char *partition,
                                 const char *keyspace,
                                 const char *const *filter_keys, size_t nkeys,
                                 long long latency_us)
@@ -243,7 +243,7 @@ void zdb_analytics_record_query(zdb_analytics *a, const char *partition,
 
 /* --- snapshot flush --------------------------------------------------- */
 
-static cJSON *snapshot_json(zdb_analytics *a)
+static cJSON *snapshot_json(edb_analytics *a)
 {
     cJSON *doc = cJSON_CreateObject();
     if (!doc) {
@@ -293,7 +293,7 @@ static cJSON *snapshot_json(zdb_analytics *a)
     return doc;
 }
 
-static void flush_snapshot(zdb_analytics *a)
+static void flush_snapshot(edb_analytics *a)
 {
     if (!a->flush) {
         return;
@@ -309,16 +309,16 @@ static void flush_snapshot(zdb_analytics *a)
         return;
     }
     a->flush(a->flush_ctx, a->node_id, json,
-             epoch_sec() + ZDB_ANALYTICS_TTL_SECS);
+             epoch_sec() + EDB_ANALYTICS_TTL_SECS);
     free(json);
     cJSON_Delete(doc);
 }
 
 static void *flush_thread_main(void *arg)
 {
-    zdb_analytics *a = arg;
+    edb_analytics *a = arg;
     while (true) {
-        for (int i = 0; i < ZDB_ANALYTICS_FLUSH_SECS; i++) {
+        for (int i = 0; i < EDB_ANALYTICS_FLUSH_SECS; i++) {
             pthread_mutex_lock(&a->lock);
             bool running = a->running;
             pthread_mutex_unlock(&a->lock);
@@ -335,18 +335,18 @@ static void *flush_thread_main(void *arg)
 
 /* --- lifecycle -------------------------------------------------------- */
 
-zdb_analytics *zdb_analytics_start(zdb_config *cfg, const char *node_id,
-                                   zdb_analytics_flush_fn flush, void *ctx)
+edb_analytics *edb_analytics_start(edb_config *cfg, const char *node_id,
+                                   edb_analytics_flush_fn flush, void *ctx)
 {
     if (!cfg) {
         return NULL;
     }
-    zdb_analytics *a = calloc(1, sizeof(*a));
+    edb_analytics *a = calloc(1, sizeof(*a));
     if (!a) {
         return NULL;
     }
     a->cfg = cfg;
-    a->engine = zdb_config_engine(cfg);
+    a->engine = edb_config_engine(cfg);
     snprintf(a->node_id, sizeof(a->node_id), "%s",
              node_id && *node_id ? node_id : "local");
     a->flush = flush;
@@ -362,8 +362,8 @@ zdb_analytics *zdb_analytics_start(zdb_config *cfg, const char *node_id,
     return a;
 }
 
-void zdb_analytics_set_cluster_metrics(zdb_analytics *a,
-                                       zdb_analytics_cluster_fn fn, void *ctx)
+void edb_analytics_set_cluster_metrics(edb_analytics *a,
+                                       edb_analytics_cluster_fn fn, void *ctx)
 {
     if (!a) {
         return;
@@ -374,7 +374,7 @@ void zdb_analytics_set_cluster_metrics(zdb_analytics *a,
     pthread_mutex_unlock(&a->lock);
 }
 
-void zdb_analytics_stop(zdb_analytics *a)
+void edb_analytics_stop(edb_analytics *a)
 {
     if (!a) {
         return;
@@ -464,7 +464,7 @@ static report_slow *agg_slow(report_slow **listp, size_t *n, size_t *cap,
     return s;
 }
 
-cJSON *zdb_analytics_report(zdb_analytics *a)
+cJSON *edb_analytics_report(edb_analytics *a)
 {
     cJSON *out = cJSON_CreateObject();
     if (!out) {
@@ -481,8 +481,8 @@ cJSON *zdb_analytics_report(zdb_analytics *a)
     uint64_t pending_changes = 0;
 
     if (a && a->engine) {
-        cJSON *snapshots = zdb_all(a->engine, ZDB_SYSTEM_DB,
-                                   ZDB_ANALYTICS_KEYSPACE, NULL);
+        cJSON *snapshots = edb_all(a->engine, EDB_SYSTEM_DB,
+                                   EDB_ANALYTICS_KEYSPACE, NULL);
         const cJSON *snap = NULL;
         cJSON_ArrayForEach(snap, snapshots) {
             if (!cJSON_IsObject(snap)) {

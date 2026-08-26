@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stage 6e end-to-end: spawns a seed node and a joiner as real zestyd
+# Stage 6e end-to-end: spawns a seed node and a joiner as real epsilond
 # processes, then drives the join through the HTTP admin API.
 set -e
 cd "$(dirname "$0")/.."
@@ -13,10 +13,10 @@ DATA=tests/data/join_live
 rm -rf "$DATA"
 mkdir -p "$DATA/a" "$DATA/b"
 
-bin/zestyd -p "$SEED_HTTP" -n "$SEED_PEER" -d "$DATA/a" \
+bin/epsilond -p "$SEED_HTTP" -n "$SEED_PEER" -d "$DATA/a" \
     >"$DATA/a/server.log" 2>&1 &
 PID_A=$!
-bin/zestyd -p "$JOIN_HTTP" -n "$JOIN_PEER" -d "$DATA/b" \
+bin/epsilond -p "$JOIN_HTTP" -n "$JOIN_PEER" -d "$DATA/b" \
     >"$DATA/b/server.log" 2>&1 &
 PID_B=$!
 trap 'kill $PID_A $PID_B 2>/dev/null || true; wait $PID_A $PID_B 2>/dev/null || true' EXIT

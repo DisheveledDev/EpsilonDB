@@ -89,7 +89,7 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
-/* ZestyDB: this node parses JSON from multiple threads (HTTP workers,
+/* EpsilonDB: this node parses JSON from multiple threads (HTTP workers,
  * the cluster mesh); make the last-error slot thread-local so threads do
  * not race on it. */
 static _Thread_local error global_error = { NULL, 0 };

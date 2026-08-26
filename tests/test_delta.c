@@ -15,10 +15,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_cluster.h"
-#include "../src/socket/zesty_repl.h"
-#include "../src/socket/zesty_snap.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_cluster.h"
+#include "../src/socket/epsilon_repl.h"
+#include "../src/socket/epsilon_snap.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -33,10 +33,10 @@ static int g_failures = 0;
     } while (0)
 
 typedef struct {
-    zdb_engine *engine;
-    zdb_config *cfg;
-    zdb_cluster *cluster;
-    zdb_repl *repl;
+    edb_engine *engine;
+    edb_config *cfg;
+    edb_cluster *cluster;
+    edb_repl *repl;
     char dir[256];
 } node;
 
@@ -72,14 +72,14 @@ static bool test_apply_change(void *ud, const cJSON *change)
         long long ttl_abs = cJSON_IsNumber(jttl)
                                 ? (long long)jttl->valuedouble
                                 : -1;
-        bool ok = zdb_replica_put(n->engine, jpart->valuestring,
+        bool ok = edb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
                                   value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
     if (strcmp(jop->valuestring, "delete") == 0) {
-        return zdb_replica_delete(n->engine, jpart->valuestring,
+        return edb_replica_delete(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring, ts);
     }
     return false;
@@ -107,7 +107,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
             cJSON_GetObjectItemCaseSensitive(request, "id");
         long long ts = 0;
         cJSON *doc = cJSON_IsString(jid) && jid->valuestring
-                         ? zdb_get_ts(n->engine, jpart->valuestring,
+                         ? edb_get_ts(n->engine, jpart->valuestring,
                                       jks->valuestring,
                                       jid->valuestring, &ts)
                          : NULL;
@@ -124,7 +124,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
             cJSON_AddNullToObject(out, "row");
         }
     } else if (strcmp(jq->valuestring, "all_ts") == 0) {
-        cJSON *rows = zdb_all_ts(n->engine, jpart->valuestring,
+        cJSON *rows = edb_all_ts(n->engine, jpart->valuestring,
                                  jks->valuestring, NULL);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
@@ -143,21 +143,21 @@ static void node_start(node *n, const char *dir, int port)
     if (system(cmd) != 0) {
         /* best effort */
     }
-    n->engine = zdb_engine_open(dir);
-    n->cfg = zdb_config_open(n->engine);
-    char id[ZDB_NODE_ID_MAX];
-    n->cluster = zdb_cluster_start(n->cfg, "127.0.0.1", port, id);
-    n->repl = zdb_repl_start(n->cluster, n->cfg, dir);
-    zdb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
+    n->engine = edb_engine_open(dir);
+    n->cfg = edb_config_open(n->engine);
+    char id[EDB_NODE_ID_MAX];
+    n->cluster = edb_cluster_start(n->cfg, "127.0.0.1", port, id);
+    n->repl = edb_repl_start(n->cluster, n->cfg, dir);
+    edb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
                           n);
 }
 
 static void node_stop(node *n)
 {
-    zdb_repl_stop(n->repl);
-    zdb_cluster_stop(n->cluster);
-    zdb_config_close(n->cfg);
-    zdb_engine_close(n->engine);
+    edb_repl_stop(n->repl);
+    edb_cluster_stop(n->cluster);
+    edb_config_close(n->cfg);
+    edb_engine_close(n->engine);
     n->repl = NULL;
     n->cluster = NULL;
     n->cfg = NULL;
@@ -196,10 +196,10 @@ typedef struct {
     size_t want;
 } converge_ctx;
 
-static size_t online_peers(zdb_cluster *cl)
+static size_t online_peers(edb_cluster *cl)
 {
-    zdb_peer_info peers[16];
-    size_t n = zdb_cluster_peers(cl, peers, 16);
+    edb_peer_info peers[16];
+    size_t n = edb_cluster_peers(cl, peers, 16);
     size_t online = 0;
     for (size_t i = 0; i < n; i++) {
         if (peers[i].online) {
@@ -221,11 +221,11 @@ static bool mesh_converged(void *ctxp)
 }
 
 /* Row-by-row equality of two shards via timestamp-tagged reads. */
-static bool rows_equal(zdb_engine *a, zdb_engine *b, const char *part,
+static bool rows_equal(edb_engine *a, edb_engine *b, const char *part,
                        const char *ks)
 {
-    cJSON *ra = zdb_all_ts(a, part, ks, NULL);
-    cJSON *rb = zdb_all_ts(b, part, ks, NULL);
+    cJSON *ra = edb_all_ts(a, part, ks, NULL);
+    cJSON *rb = edb_all_ts(b, part, ks, NULL);
     bool match = false;
     if (ra && rb &&
         cJSON_GetArraySize(ra) == cJSON_GetArraySize(rb)) {
@@ -246,27 +246,27 @@ static bool rows_equal(zdb_engine *a, zdb_engine *b, const char *part,
  * live table so the next join starts a fresh wave. */
 static void complete_wave(node *a, node *b)
 {
-    const char *lid = zdb_cluster_leader(a->cluster);
+    const char *lid = edb_cluster_leader(a->cluster);
     if (!lid) {
         return;
     }
-    zdb_cluster *leader = strcmp(lid, zdb_cluster_self_id(a->cluster)) == 0
+    edb_cluster *leader = strcmp(lid, edb_cluster_self_id(a->cluster)) == 0
                               ? a->cluster
                               : b->cluster;
-    zdb_config *lcfg = leader == a->cluster ? a->cfg : b->cfg;
+    edb_config *lcfg = leader == a->cluster ? a->cfg : b->cfg;
     const char *ids[2] = {
-        zdb_cluster_self_id(a->cluster),
-        zdb_cluster_self_id(b->cluster),
+        edb_cluster_self_id(a->cluster),
+        edb_cluster_self_id(b->cluster),
     };
     char val[32];
     snprintf(val, sizeof(val), "%lld",
-             zdb_cluster_target_generation(leader));
+             edb_cluster_target_generation(leader));
     for (int i = 0; i < 2; i++) {
         char dn[96];
         snprintf(dn, sizeof(dn), "rebalance.done.%.63s", ids[i]);
-        zdb_setting_set(lcfg, dn, val);
+        edb_setting_set(lcfg, dn, val);
     }
-    zdb_cluster_promote_target(leader);
+    edb_cluster_promote_target(leader);
     settle();
 }
 
@@ -279,18 +279,18 @@ int main(void)
     snprintf(dir, sizeof(dir), "tests/data/delta/a");
     node_start(&a, dir, port_base);
     CHECK(a.cluster != NULL);
-    zdb_database_create(a.cfg, "app", 2);
+    edb_database_create(a.cfg, "app", 2);
 
     snprintf(dir, sizeof(dir), "tests/data/delta/b");
     node_start(&b, dir, port_base + 1);
-    zdb_database_create(b.cfg, "app", 2);
+    edb_database_create(b.cfg, "app", 2);
 
     /* stable two-node live table before the join we actually test */
-    CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
+    CHECK(edb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc2 = { { &a, &b, NULL }, 2 };
     CHECK(wait_for(15, mesh_converged, &cc2));
     complete_wave(&a, &b);
-    CHECK(zdb_cluster_target_generation(a.cluster) == 0);
+    CHECK(edb_cluster_target_generation(a.cluster) == 0);
     /* the one-shot join connection closing flaps b offline until its
      * persistent connection is up; wait for a stable two-node mesh */
     converge_ctx cc2b = { { &a, &b, NULL }, 2 };
@@ -306,39 +306,39 @@ int main(void)
         snprintf(value, sizeof(value), "{\"n\":%d}", i);
         build_put(change, sizeof(change), "app", "main", "kv", id,
                   (long long)time(NULL), value);
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
     }
 
     /* --- d joins: leader publishes a 3-slice target ------------------ */
     snprintf(dir, sizeof(dir), "tests/data/delta/d");
     node_start(&d, dir, port_base + 2);
-    zdb_cluster_set_auto_compliant(d.cluster, false);
-    zdb_database_create(d.cfg, "app", 2);
-    CHECK(zdb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
+    edb_cluster_set_auto_compliant(d.cluster, false);
+    edb_database_create(d.cfg, "app", 2);
+    CHECK(edb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc3 = { { &a, &b, &d }, 3 };
     CHECK(wait_for(15, mesh_converged, &cc3));
     settle();
-    CHECK(zdb_cluster_target_generation(d.cluster) > 0);
+    CHECK(edb_cluster_target_generation(d.cluster) > 0);
 
     /* --- snapshot the shard while syncing ----------------------------- */
     char key[33];
     char path[1024];
-    CHECK(zdb_shard_path(d.engine, "main", "kv", path, sizeof(path),
+    CHECK(edb_shard_path(d.engine, "main", "kv", path, sizeof(path),
                          key));
 
     /* refuse writes so the live nodes cache deltas for us instead */
-    zdb_repl_set_syncing(d.repl, true);
+    edb_repl_set_syncing(d.repl, true);
 
-    CHECK(zdb_snap_fetch("127.0.0.1", port_base, key, d.dir) == 0);
-    zdb_shard_invalidate(d.engine, "main", "kv");
+    CHECK(edb_snap_fetch("127.0.0.1", port_base, key, d.dir) == 0);
+    edb_shard_invalidate(d.engine, "main", "kv");
 
     /* d now holds the base snapshot but not the deltas below */
-    cJSON *base = zdb_all_ts(d.engine, "main", "kv", NULL);
+    cJSON *base = edb_all_ts(d.engine, "main", "kv", NULL);
     CHECK(base && cJSON_GetArraySize(base) == 200);
     cJSON_Delete(base);
 
     /* --- writes during sync: cached by a, not applied to d ------------ */
-    const char *d_id = zdb_cluster_self_id(d.cluster);
+    const char *d_id = edb_cluster_self_id(d.cluster);
     CHECK(d_id != NULL);
     for (int i = 0; i < 50; i++) {
         char id[32];
@@ -348,23 +348,23 @@ int main(void)
         snprintf(value, sizeof(value), "{\"delta\":%d}", i);
         build_put(change, sizeof(change), "app", "main", "kv", id,
                   (long long)time(NULL), value);
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
     }
 
     /* the origin (a) must have queued these for d */
-    CHECK(zdb_repl_pending_for(a.repl, d_id) > 0);
+    CHECK(edb_repl_pending_for(a.repl, d_id) > 0);
 
     /* d has still not applied them: it refused the writes */
-    cJSON *mid = zdb_get(d.engine, "main", "kv", "delta-0000");
+    cJSON *mid = edb_get(d.engine, "main", "kv", "delta-0000");
     CHECK(mid == NULL);
     cJSON_Delete(mid);
 
     /* --- reopen writes and flush: cached deltas replay in order ------- */
-    zdb_repl_set_syncing(d.repl, false);
-    CHECK(zdb_repl_flush(d.repl));
+    edb_repl_set_syncing(d.repl, false);
+    CHECK(edb_repl_flush(d.repl));
 
     /* a's queue for d is drained */
-    CHECK(zdb_repl_pending_for(a.repl, d_id) == 0);
+    CHECK(edb_repl_pending_for(a.repl, d_id) == 0);
 
     /* d ends identical to a quorum (a) with no lost writes */
     bool converged = false;
@@ -376,7 +376,7 @@ int main(void)
     }
     CHECK(converged);
 
-    cJSON *all = zdb_all_ts(d.engine, "main", "kv", NULL);
+    cJSON *all = edb_all_ts(d.engine, "main", "kv", NULL);
     CHECK(all && cJSON_GetArraySize(all) == 250);
     cJSON_Delete(all);
 
@@ -389,10 +389,10 @@ int main(void)
         snprintf(value, sizeof(value), "{\"doc\":%d}", i);
         build_put(change, sizeof(change), "app", "other", "docs", id,
                   (long long)time(NULL), value);
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
     }
 
-    CHECK(zdb_repl_catchup(d.repl, "127.0.0.1", port_base, "other",
+    CHECK(edb_repl_catchup(d.repl, "127.0.0.1", port_base, "other",
                            "docs"));
     bool other_converged = false;
     for (int i = 0; i < 100 && !other_converged; i++) {
@@ -405,10 +405,10 @@ int main(void)
     CHECK(other_converged);
 
     /* d reports compliance now that its shards are current */
-    zdb_cluster_mark_compliant(d.cluster);
+    edb_cluster_mark_compliant(d.cluster);
     char done[96];
     snprintf(done, sizeof(done), "rebalance.done.%.63s", d_id);
-    char *v = zdb_setting_get(d.cfg, done);
+    char *v = edb_setting_get(d.cfg, done);
     CHECK(v != NULL);
     free(v);
 

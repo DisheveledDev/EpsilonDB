@@ -1,10 +1,10 @@
 *.o
 *.sqlite
 .DS_Store
-libzesty.a
+libepsilon.a
 AGENTS.md
-zestyctl
-zestyd
+epsilonctl
+epsilond
 tests/data/join_live/
 tests/data/chaos/
 tests/data/console_live/

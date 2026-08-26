@@ -1,4 +1,4 @@
-#include "zesty_api.h"
+#include "epsilon_api.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -11,21 +11,21 @@
 
 #include "../../vendor/cjson/cJSON.h"
 #include "../engine/random.h"
-#include "../engine/zesty_analytics.h"
-#include "../engine/zesty_benchmark.h"
+#include "../engine/epsilon_analytics.h"
+#include "../engine/epsilon_benchmark.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 
 typedef struct {
-    zdb_engine *engine;
-    zdb_config *config;
+    edb_engine *engine;
+    edb_config *config;
 } api_ctx;
 
 static api_ctx g_ctx;   /* handlers receive no user pointer; single server */
-static zdb_cluster *g_cluster;   /* may be NULL: clustering disabled */
-static zdb_repl *g_repl;         /* may be NULL: replication disabled */
-static zdb_analytics *g_analytics; /* may be NULL: analytics disabled */
+static edb_cluster *g_cluster;   /* may be NULL: clustering disabled */
+static edb_repl *g_repl;         /* may be NULL: replication disabled */
+static edb_analytics *g_analytics; /* may be NULL: analytics disabled */
 
 /* Monotonic microseconds for latency measurement. */
 static long long api_now_us(void)
@@ -38,8 +38,8 @@ static long long api_now_us(void)
 /* ------------------------------------------------------------------ */
 /* admin console sessions                                              */
 
-#define ZDB_SESSION_CAPACITY 256
-#define ZDB_SESSION_TTL      43200   /* seconds: 12 hours */
+#define EDB_SESSION_CAPACITY 256
+#define EDB_SESSION_TTL      43200   /* seconds: 12 hours */
 
 typedef struct {
     char token[65];
@@ -47,9 +47,9 @@ typedef struct {
     uint64_t groups;
     long long expires;
     bool used;
-} zdb_session;
+} edb_session;
 
-static zdb_session g_sessions[ZDB_SESSION_CAPACITY];
+static edb_session g_sessions[EDB_SESSION_CAPACITY];
 static pthread_mutex_t g_session_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static long long session_now(void)
@@ -65,8 +65,8 @@ static bool session_lookup(const char *token, char username[128],
     }
     long long now = session_now();
     pthread_mutex_lock(&g_session_lock);
-    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
-        zdb_session *s = &g_sessions[i];
+    for (int i = 0; i < EDB_SESSION_CAPACITY; i++) {
+        edb_session *s = &g_sessions[i];
         if (s->used && strcmp(s->token, token) == 0) {
             if (s->expires <= now) {
                 s->used = false;
@@ -87,11 +87,11 @@ static void session_create(const char *username, uint64_t groups,
                            char token_out[65])
 {
     char token[65];
-    zdb_random_hex(token, 64);
+    edb_random_hex(token, 64);
 
     pthread_mutex_lock(&g_session_lock);
-    zdb_session *slot = NULL;
-    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
+    edb_session *slot = NULL;
+    for (int i = 0; i < EDB_SESSION_CAPACITY; i++) {
         if (!g_sessions[i].used || g_sessions[i].expires <= session_now()) {
             slot = &g_sessions[i];
             break;
@@ -104,7 +104,7 @@ static void session_create(const char *username, uint64_t groups,
     snprintf(slot->token, sizeof(slot->token), "%s", token);
     snprintf(slot->username, sizeof(slot->username), "%s", username);
     slot->groups = groups;
-    slot->expires = session_now() + ZDB_SESSION_TTL;
+    slot->expires = session_now() + EDB_SESSION_TTL;
     slot->used = true;
     pthread_mutex_unlock(&g_session_lock);
 
@@ -117,7 +117,7 @@ static void session_destroy(const char *token)
         return;
     }
     pthread_mutex_lock(&g_session_lock);
-    for (int i = 0; i < ZDB_SESSION_CAPACITY; i++) {
+    for (int i = 0; i < EDB_SESSION_CAPACITY; i++) {
         if (g_sessions[i].used && strcmp(g_sessions[i].token, token) == 0) {
             g_sessions[i].used = false;
             break;
@@ -126,7 +126,7 @@ static void session_destroy(const char *token)
     pthread_mutex_unlock(&g_session_lock);
 }
 
-void zdb_api_set_cluster(zdb_cluster *cluster)
+void edb_api_set_cluster(edb_cluster *cluster)
 {
     g_cluster = cluster;
 }
@@ -166,17 +166,17 @@ static bool api_apply_change_impl(void *ud, const cJSON *change)
         long long absolute_ttl = cJSON_IsNumber(ttl)
                                      ? (long long)ttl->valuedouble
                                      : -1;
-        ok = zdb_replica_put_origin(
+        ok = edb_replica_put_origin(
             g_ctx.engine, partition->valuestring, keyspace->valuestring,
             id->valuestring, encoded, absolute_ttl, modified, origin);
         free(encoded);
-        if (ok && strcmp(database->valuestring, ZDB_SYSTEM_DB) != 0) {
-            zdb_partition_ensure(g_ctx.config, database->valuestring,
+        if (ok && strcmp(database->valuestring, EDB_SYSTEM_DB) != 0) {
+            edb_partition_ensure(g_ctx.config, database->valuestring,
                                  partition->valuestring,
                                  keyspace->valuestring, NULL);
         }
     } else if (strcmp(operation->valuestring, "delete") == 0) {
-        ok = zdb_replica_delete_origin(
+        ok = edb_replica_delete_origin(
             g_ctx.engine, partition->valuestring, keyspace->valuestring,
             id->valuestring, modified, origin);
     }
@@ -193,7 +193,7 @@ static cJSON *api_read_request(void *ud, const cJSON *request)
     const cJSON *filters =
         cJSON_GetObjectItemCaseSensitive(request, "filters");
     if (!cJSON_IsString(query) || !cJSON_IsString(partition) ||
-        !cJSON_IsString(keyspace) || !zdb_filters_valid(filters)) {
+        !cJSON_IsString(keyspace) || !edb_filters_valid(filters)) {
         return NULL;
     }
     cJSON *out = cJSON_CreateObject();
@@ -204,7 +204,7 @@ static cJSON *api_read_request(void *ud, const cJSON *request)
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
         long long timestamp = 0;
         cJSON *document = cJSON_IsString(id)
-                              ? zdb_get_ts(g_ctx.engine,
+                              ? edb_get_ts(g_ctx.engine,
                                            partition->valuestring,
                                            keyspace->valuestring,
                                            id->valuestring, &timestamp)
@@ -221,22 +221,22 @@ static cJSON *api_read_request(void *ud, const cJSON *request)
     } else if (strcmp(query->valuestring, "all_ts") == 0 ||
                strcmp(query->valuestring, "query_ts") == 0) {
         cJSON *rows = strcmp(query->valuestring, "all_ts") == 0
-                          ? zdb_all_ts(g_ctx.engine,
+                          ? edb_all_ts(g_ctx.engine,
                                        partition->valuestring,
                                        keyspace->valuestring, filters)
-                          : zdb_query_ts(g_ctx.engine,
+                          : edb_query_ts(g_ctx.engine,
                                          partition->valuestring,
                                          keyspace->valuestring, filters);
         cJSON_AddItemToObject(out, "rows", rows ? rows : cJSON_CreateArray());
     } else if (strcmp(query->valuestring, "ids") == 0) {
         size_t count = 0;
-        char **ids = zdb_ids(g_ctx.engine, partition->valuestring,
+        char **ids = edb_ids(g_ctx.engine, partition->valuestring,
                              keyspace->valuestring, filters, &count);
         cJSON *array = cJSON_AddArrayToObject(out, "ids");
         for (size_t i = 0; array && ids && i < count; i++) {
             cJSON_AddItemToArray(array, cJSON_CreateString(ids[i]));
         }
-        zdb_free_strings(ids);
+        edb_free_strings(ids);
     } else {
         cJSON_Delete(out);
         return NULL;
@@ -246,15 +246,15 @@ static cJSON *api_read_request(void *ud, const cJSON *request)
 static bool api_replicate_config(void *ctx, const char *keyspace,
                                  const char *id, const char *json);
 
-void zdb_api_set_repl(zdb_repl *repl)
+void edb_api_set_repl(edb_repl *repl)
 {
     g_repl = repl;
     if (repl) {
-        zdb_repl_set_handlers(repl, api_apply_change_impl,
+        edb_repl_set_handlers(repl, api_apply_change_impl,
                               api_read_request, NULL);
     }
     if (g_ctx.config) {
-        zdb_config_set_replicator(g_ctx.config,
+        edb_config_set_replicator(g_ctx.config,
                                   repl ? api_replicate_config : NULL, repl);
     }
 }
@@ -271,9 +271,9 @@ static bool api_analytics_flush(void *ctx, const char *node_id,
             return false;
         }
         cJSON_AddStringToObject(change, "op", "put");
-        cJSON_AddStringToObject(change, "db", ZDB_SYSTEM_DB);
-        cJSON_AddStringToObject(change, "partition", ZDB_SYSTEM_DB);
-        cJSON_AddStringToObject(change, "keyspace", ZDB_ANALYTICS_KEYSPACE);
+        cJSON_AddStringToObject(change, "db", EDB_SYSTEM_DB);
+        cJSON_AddStringToObject(change, "partition", EDB_SYSTEM_DB);
+        cJSON_AddStringToObject(change, "keyspace", EDB_ANALYTICS_KEYSPACE);
         cJSON_AddStringToObject(change, "id", node_id);
         cJSON_AddNumberToObject(change, "ts", (double)time(NULL));
         cJSON_AddNumberToObject(change, "ttl_abs", (double)ttl_abs);
@@ -288,14 +288,14 @@ static bool api_analytics_flush(void *ctx, const char *node_id,
         if (!encoded) {
             return false;
         }
-        zdb_repl_status status = zdb_repl_write(g_repl, ZDB_SYSTEM_DB,
+        edb_repl_status status = edb_repl_write(g_repl, EDB_SYSTEM_DB,
                                                 encoded);
         free(encoded);
-        return status == ZDB_REPL_OK;
+        return status == EDB_REPL_OK;
     }
     long long now = (long long)time(NULL);
     long long ttl_rel = ttl_abs > now ? ttl_abs - now : 0;
-    return zdb_put(g_ctx.engine, ZDB_SYSTEM_DB, ZDB_ANALYTICS_KEYSPACE,
+    return edb_put(g_ctx.engine, EDB_SYSTEM_DB, EDB_ANALYTICS_KEYSPACE,
                    node_id, json, ttl_rel);
 }
 
@@ -308,24 +308,24 @@ static cJSON *api_analytics_cluster_metrics(void *ctx)
         return NULL;
     }
     cJSON_AddNumberToObject(o, "pending_changes",
-                            (double)(g_repl ? zdb_repl_pending_total(g_repl)
+                            (double)(g_repl ? edb_repl_pending_total(g_repl)
                                             : 0));
     return o;
 }
 
-void zdb_api_analytics_start(zdb_config *cfg, const char *node_id)
+void edb_api_analytics_start(edb_config *cfg, const char *node_id)
 {
     if (!cfg || g_analytics) {
         return;
     }
-    g_analytics = zdb_analytics_start(cfg, node_id, api_analytics_flush, NULL);
-    zdb_analytics_set_cluster_metrics(g_analytics,
+    g_analytics = edb_analytics_start(cfg, node_id, api_analytics_flush, NULL);
+    edb_analytics_set_cluster_metrics(g_analytics,
                                       api_analytics_cluster_metrics, NULL);
 }
 
-void zdb_api_analytics_stop(void)
+void edb_api_analytics_stop(void)
 {
-    zdb_analytics_stop(g_analytics);
+    edb_analytics_stop(g_analytics);
     g_analytics = NULL;
 }
 
@@ -333,15 +333,15 @@ void zdb_api_analytics_stop(void)
 static bool api_replicate_config(void *ctx, const char *keyspace,
                                  const char *id, const char *json)
 {
-    zdb_repl *repl = ctx;
+    edb_repl *repl = ctx;
     cJSON *change = cJSON_CreateObject();
     if (!repl || !change) {
         cJSON_Delete(change);
         return false;
     }
     cJSON_AddStringToObject(change, "op", json ? "put" : "delete");
-    cJSON_AddStringToObject(change, "db", ZDB_SYSTEM_DB);
-    cJSON_AddStringToObject(change, "partition", ZDB_SYSTEM_DB);
+    cJSON_AddStringToObject(change, "db", EDB_SYSTEM_DB);
+    cJSON_AddStringToObject(change, "partition", EDB_SYSTEM_DB);
     cJSON_AddStringToObject(change, "keyspace", keyspace);
     cJSON_AddStringToObject(change, "id", id);
     cJSON_AddNumberToObject(change, "ts", (double)time(NULL));
@@ -359,15 +359,15 @@ static bool api_replicate_config(void *ctx, const char *keyspace,
     if (!encoded) {
         return false;
     }
-    zdb_repl_status status = zdb_repl_write(repl, ZDB_SYSTEM_DB, encoded);
+    edb_repl_status status = edb_repl_write(repl, EDB_SYSTEM_DB, encoded);
     free(encoded);
-    return status == ZDB_REPL_OK;
+    return status == EDB_REPL_OK;
 }
 
 
 /* --- stage 5 replication handlers ----------------------------------- */
 
-static void respond_json(zdb_http_response *res, int status, cJSON *obj)
+static void respond_json(edb_http_response *res, int status, cJSON *obj)
 {
     res->status = status;
     res->content_type = "application/json";
@@ -381,7 +381,7 @@ static void respond_json(zdb_http_response *res, int status, cJSON *obj)
     }
 }
 
-static void respond_error(zdb_http_response *res, int status,
+static void respond_error(edb_http_response *res, int status,
                           const char *message)
 {
     cJSON *obj = cJSON_CreateObject();
@@ -391,7 +391,7 @@ static void respond_error(zdb_http_response *res, int status,
     respond_json(res, status, obj);
 }
 
-static bool body_json(const zdb_http_request *req, cJSON **out)
+static bool body_json(const edb_http_request *req, cJSON **out)
 {
     if (!req->body || req->body_len == 0) {
         return false;
@@ -427,7 +427,7 @@ static bool json_u64_value(const cJSON *item, uint64_t *out)
     return false;
 }
 
-static bool query_param(const zdb_http_request *req, const char *name,
+static bool query_param(const edb_http_request *req, const char *name,
                         char *out, size_t cap)
 {
     size_t name_len = strlen(name);
@@ -460,8 +460,8 @@ static bool query_param(const zdb_http_request *req, const char *name,
  * the body / an "authorization" query param carrying the user name.
  * Returns the group mask; sets *ok. Unknown/absent users yield mask with
  * ok=false unless the special user "anonymous" exists. */
-static uint64_t authenticate(const zdb_http_request *req,
-                             const zdb_http_request *unused, bool *ok)
+static uint64_t authenticate(const edb_http_request *req,
+                             const edb_http_request *unused, bool *ok)
 {
     (void)unused;
     *ok = true;
@@ -473,7 +473,7 @@ static uint64_t authenticate(const zdb_http_request *req,
     uint64_t groups = 0;
     char token_buf[256] = "";
     const char *token = NULL;
-    const char *hdr = zdb_http_header(req, "Authorization");
+    const char *hdr = edb_http_header(req, "Authorization");
     if (hdr) {
         const char *value = strncmp(hdr, "Bearer ", 7) == 0 ? hdr + 7 : hdr;
         if (snprintf(token_buf, sizeof(token_buf), "%s", value) <
@@ -482,7 +482,7 @@ static uint64_t authenticate(const zdb_http_request *req,
         }
     }
     if (!token) {
-        hdr = zdb_http_header(req, "authorization");
+        hdr = edb_http_header(req, "authorization");
         if (hdr && snprintf(token_buf, sizeof(token_buf), "%s", hdr) <
                        (int)sizeof(token_buf)) {
             token = token_buf;
@@ -511,8 +511,8 @@ static uint64_t authenticate(const zdb_http_request *req,
         if (session_lookup(token, session_username, &groups)) {
             /* authenticated via an admin console session token */
         } else {
-            zdb_user_info user;
-            if (zdb_user_get(g_ctx.config, token, &user)) {
+            edb_user_info user;
+            if (edb_user_get(g_ctx.config, token, &user)) {
                 groups = user.groups;
             } else {
                 *ok = false;
@@ -520,7 +520,7 @@ static uint64_t authenticate(const zdb_http_request *req,
         }
     } else {
         size_t nusers = 0;
-        zdb_user_info *users = zdb_user_list(g_ctx.config, &nusers);
+        edb_user_info *users = edb_user_list(g_ctx.config, &nusers);
         bool bootstrapped = users != NULL && nusers > 0;
         free(users);
         groups = bootstrapped ? 0ULL : ~0ULL;
@@ -531,23 +531,23 @@ static uint64_t authenticate(const zdb_http_request *req,
 /* Looks up partition masks and checks one permission. Unknown partitions
  * are treated as open (allow-all masks) because partitions materialise
  * transparently on first write; explicit records exist to restrict them. */
-static bool authorize_partition(zdb_config *cfg, const char *database,
+static bool authorize_partition(edb_config *cfg, const char *database,
                                 const char *partition, uint64_t user_groups,
-                                zdb_permission perm, zdb_http_response *res)
+                                edb_permission perm, edb_http_response *res)
 {
-    zdb_partition_info part;
-    if (!zdb_partition_get(cfg, database, partition, &part)) {
+    edb_partition_info part;
+    if (!edb_partition_get(cfg, database, partition, &part)) {
         return true;   /* implicit partition: allow-all masks */
     }
     uint64_t mask;
     switch (perm) {
-    case ZDB_PERM_CREATE: mask = part.create_mask; break;
-    case ZDB_PERM_UPDATE: mask = part.update_mask; break;
-    case ZDB_PERM_READ:   mask = part.read_mask; break;
-    case ZDB_PERM_DELETE: mask = part.delete_mask; break;
+    case EDB_PERM_CREATE: mask = part.create_mask; break;
+    case EDB_PERM_UPDATE: mask = part.update_mask; break;
+    case EDB_PERM_READ:   mask = part.read_mask; break;
+    case EDB_PERM_DELETE: mask = part.delete_mask; break;
     default:              mask = ~0ULL; break;
     }
-    if (!zdb_check_perm(mask, user_groups, perm)) {
+    if (!edb_check_perm(mask, user_groups, perm)) {
         respond_error(res, 403, "permission denied");
         return false;
     }
@@ -590,8 +590,8 @@ static bool split_data_path(const char *path, char db[128], char part[256],
     return true;
 }
 
-static bool handle_data_put(const zdb_http_request *req,
-                            zdb_http_response *res)
+static bool handle_data_put(const edb_http_request *req,
+                            edb_http_response *res)
 {
     char db[128], part[256], ks[128], id[512];
     if (!split_data_path(req->path, db, part, ks, id)) {
@@ -629,9 +629,9 @@ static bool handle_data_put(const zdb_http_request *req,
     if (query_param(req, "ttl", ttlbuf, sizeof(ttlbuf))) {
         ttl = strtoll(ttlbuf, NULL, 10);
     }
-    cJSON *existing = zdb_get(g_ctx.engine, part, ks, id);
+    cJSON *existing = edb_get(g_ctx.engine, part, ks, id);
     bool is_update = existing != NULL;
-    zdb_permission permission = existing ? ZDB_PERM_UPDATE : ZDB_PERM_CREATE;
+    edb_permission permission = existing ? EDB_PERM_UPDATE : EDB_PERM_CREATE;
     cJSON_Delete(existing);
     if (!authorize_partition(g_ctx.config, db, part, groups, permission, res)) {
         free(json);
@@ -663,28 +663,28 @@ static bool handle_data_put(const zdb_http_request *req,
             char *change_json = cJSON_PrintUnformatted(change);
             cJSON_Delete(change);
             if (change_json) {
-                zdb_repl_status status = zdb_repl_write(g_repl, db,
+                edb_repl_status status = edb_repl_write(g_repl, db,
                                                         change_json);
                 free(change_json);
-                if (status == ZDB_REPL_QUORUM_LOST) {
+                if (status == EDB_REPL_QUORUM_LOST) {
                     free(json);
                     respond_error(res, 503,
                                   "quorum unavailable: write rejected");
                     return true;
                 }
-                ok = status == ZDB_REPL_OK;
+                ok = status == EDB_REPL_OK;
             }
         }
     } else {
-        ok = zdb_put(g_ctx.engine, part, ks, id, json, ttl);
+        ok = edb_put(g_ctx.engine, part, ks, id, json, ttl);
     }
     if (ok) {
-        zdb_partition_ensure(g_ctx.config, db, part, ks, NULL);
+        edb_partition_ensure(g_ctx.config, db, part, ks, NULL);
     }
     free(json);
 
     if (g_analytics && ok) {
-        zdb_analytics_record_write(g_analytics, part, ks, is_update,
+        edb_analytics_record_write(g_analytics, part, ks, is_update,
                                    api_now_us() - started);
     }
 
@@ -693,14 +693,14 @@ static bool handle_data_put(const zdb_http_request *req,
         return true;
     }
     respond_json(res, 200, NULL);
-    res->body = zdb_http_body_printf(&res->body_len,
+    res->body = edb_http_body_printf(&res->body_len,
                                      "{\"status\":\"ok\",\"id\":\"%s\"}",
                                      id);
     return true;
 }
 
-static bool handle_data_get(const zdb_http_request *req,
-                            zdb_http_response *res)
+static bool handle_data_get(const edb_http_request *req,
+                            edb_http_response *res)
 {
     char db[128], part[256], ks[128], id[512];
     if (!split_data_path(req->path, db, part, ks, id)) {
@@ -714,18 +714,18 @@ static bool handle_data_get(const zdb_http_request *req,
         respond_error(res, 401, "unknown user");
         return true;
     }
-    if (!authorize_partition(g_ctx.config, db, part, groups, ZDB_PERM_READ,
+    if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_READ,
                              res)) {
         return true;
     }
 
     long long started = api_now_us();
     cJSON *doc = g_repl
-                     ? zdb_repl_read_get(g_repl, db, part, ks, id)
-                     : zdb_get(g_ctx.engine, part, ks, id);
+                     ? edb_repl_read_get(g_repl, db, part, ks, id)
+                     : edb_get(g_ctx.engine, part, ks, id);
     long long elapsed = api_now_us() - started;
     if (g_analytics) {
-        zdb_analytics_record_read(g_analytics, part, ks, elapsed);
+        edb_analytics_record_read(g_analytics, part, ks, elapsed);
     }
     if (!doc) {
         respond_error(res, 404, "not found");
@@ -735,8 +735,8 @@ static bool handle_data_get(const zdb_http_request *req,
     return true;
 }
 
-static bool handle_data_delete(const zdb_http_request *req,
-                               zdb_http_response *res)
+static bool handle_data_delete(const edb_http_request *req,
+                               edb_http_response *res)
 {
     char db[128], part[256], ks[128], id[512];
     if (!split_data_path(req->path, db, part, ks, id)) {
@@ -750,7 +750,7 @@ static bool handle_data_delete(const zdb_http_request *req,
         respond_error(res, 401, "unknown user");
         return true;
     }
-    if (!authorize_partition(g_ctx.config, db, part, groups, ZDB_PERM_DELETE,
+    if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_DELETE,
                              res)) {
         return true;
     }
@@ -778,33 +778,33 @@ static bool handle_data_delete(const zdb_http_request *req,
             respond_error(res, 500, "encode failed");
             return true;
         }
-        zdb_repl_status st =
-            zdb_repl_write(g_repl, db, change_json);
+        edb_repl_status st =
+            edb_repl_write(g_repl, db, change_json);
         free(change_json);
-        if (st == ZDB_REPL_LOCAL_FAIL) {
+        if (st == EDB_REPL_LOCAL_FAIL) {
             respond_error(res, 500, "delete failed");
             return true;
         }
-        if (st == ZDB_REPL_QUORUM_LOST) {
+        if (st == EDB_REPL_QUORUM_LOST) {
             respond_error(res, 503,
                           "quorum unavailable: delete rejected");
             return true;
         }
         ok = true;
     } else {
-        ok = zdb_delete(g_ctx.engine, part, ks, id);
+        ok = edb_delete(g_ctx.engine, part, ks, id);
     }
     if (!ok) {
         respond_error(res, 500, "delete failed");
         return true;
     }
     if (g_analytics) {
-        zdb_analytics_record_delete(g_analytics, part, ks,
+        edb_analytics_record_delete(g_analytics, part, ks,
                                     api_now_us() - started);
     }
     res->status = 200;
     res->content_type = "application/json";
-    res->body = zdb_http_body_printf(&res->body_len,
+    res->body = edb_http_body_printf(&res->body_len,
                                      "{\"status\":\"deleted\",\"id\":\"%s\"}",
                                      id);
     return true;
@@ -815,7 +815,7 @@ static size_t partition_keyspaces(const char *db, const char *partition,
                                   char out[][128], size_t cap)
 {
     size_t total = 0;
-    zdb_keyspace_info *list = zdb_keyspace_list(g_ctx.config, &total);
+    edb_keyspace_info *list = edb_keyspace_list(g_ctx.config, &total);
     size_t found = 0;
     for (size_t i = 0; list && i < total && found < cap; i++) {
         if (strcmp(list[i].database, db) == 0 &&
@@ -913,9 +913,9 @@ static cJSON *partition_wide_query(const char *db, const char *part,
     }
     for (size_t i = 0; i < nks; i++) {
         cJSON *meta = g_repl
-                          ? zdb_repl_read_query_meta(g_repl, db, part,
+                          ? edb_repl_read_query_meta(g_repl, db, part,
                                                      keyspaces[i], filters)
-                          : zdb_query_ts(g_ctx.engine, part, keyspaces[i],
+                          : edb_query_ts(g_ctx.engine, part, keyspaces[i],
                                          filters);
         if (!meta) {
             continue;
@@ -996,8 +996,8 @@ static size_t collect_filter_keys(const cJSON *filters, const char **keys,
     return n;
 }
 
-static bool handle_data_collect(const zdb_http_request *req,
-                                zdb_http_response *res)
+static bool handle_data_collect(const edb_http_request *req,
+                                edb_http_response *res)
 {
     const char *path = req->path;
     if (strncmp(path, "/data/", 6) != 0) {
@@ -1050,7 +1050,7 @@ static bool handle_data_collect(const zdb_http_request *req,
         respond_error(res, 401, "unknown user");
         return true;
     }
-    if (!authorize_partition(g_ctx.config, db, part, groups, ZDB_PERM_READ,
+    if (!authorize_partition(g_ctx.config, db, part, groups, EDB_PERM_READ,
                              res)) {
         return true;
     }
@@ -1067,7 +1067,7 @@ static bool handle_data_collect(const zdb_http_request *req,
                                                                       "filters")
                                    : NULL;
         filters = wrapped ? wrapped : body;
-        if (!zdb_filters_valid(filters)) {
+        if (!edb_filters_valid(filters)) {
             cJSON_Delete(body);
             respond_error(res, 400, "invalid JSON filter");
             return true;
@@ -1085,14 +1085,14 @@ static bool handle_data_collect(const zdb_http_request *req,
     if (strcmp(operation, "ids") == 0) {
         size_t count = 0;
         char **ids = g_repl
-                         ? zdb_repl_read_ids(g_repl, db, part, ks, filters,
+                         ? edb_repl_read_ids(g_repl, db, part, ks, filters,
                                              &count)
-                         : zdb_ids(g_ctx.engine, part, ks, filters, &count);
+                         : edb_ids(g_ctx.engine, part, ks, filters, &count);
         cJSON *array = cJSON_CreateArray();
         for (size_t i = 0; array && ids && i < count; i++) {
             cJSON_AddItemToArray(array, cJSON_CreateString(ids[i]));
         }
-        zdb_free_strings(ids);
+        edb_free_strings(ids);
         respond_json(res, 200, array);
     } else if (keyspace_omitted) {
         cJSON *documents = partition_wide_query(db, part, filters);
@@ -1102,9 +1102,9 @@ static bool handle_data_collect(const zdb_http_request *req,
         /* all and query share identical engine semantics (a filter may be
          * empty); both return the record key as a leading "id" field. */
         cJSON *meta = g_repl
-                          ? zdb_repl_read_query_meta(g_repl, db, part, ks,
+                          ? edb_repl_read_query_meta(g_repl, db, part, ks,
                                                      filters)
-                          : zdb_query_ts(g_ctx.engine, part, ks, filters);
+                          : edb_query_ts(g_ctx.engine, part, ks, filters);
         cJSON *documents = meta ? flatten_meta_rows(meta) : NULL;
         if (meta) {
             cJSON_Delete(meta);
@@ -1113,7 +1113,7 @@ static bool handle_data_collect(const zdb_http_request *req,
                      documents ? documents : cJSON_CreateArray());
     }
     if (g_analytics) {
-        zdb_analytics_record_query(g_analytics, part, ks, filter_keys, nkeys,
+        edb_analytics_record_query(g_analytics, part, ks, filter_keys, nkeys,
                                    api_now_us() - started);
     }
     cJSON_Delete(body);
@@ -1123,8 +1123,8 @@ static bool handle_data_collect(const zdb_http_request *req,
 /* ------------------------------------------------------------------ */
 /* admin routes                                                        */
 
-static bool require_admin_auth(const zdb_http_request *req,
-                               zdb_http_response *res)
+static bool require_admin_auth(const edb_http_request *req,
+                               edb_http_response *res)
 {
     /* admin operations are only permitted to authenticated users that hold
      * bit 1 (the first security group). */
@@ -1141,15 +1141,15 @@ static bool require_admin_auth(const zdb_http_request *req,
     return true;
 }
 
-static bool handle_admin_databases(const zdb_http_request *req,
-                                   zdb_http_response *res)
+static bool handle_admin_databases(const edb_http_request *req,
+                                   edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
     }
     if (strcmp(req->method, "GET") == 0) {
         size_t n = 0;
-        zdb_database_info *list = zdb_database_list(g_ctx.config, &n);
+        edb_database_info *list = edb_database_list(g_ctx.config, &n);
         cJSON *arr = cJSON_CreateArray();
         for (size_t i = 0; list && i < n; i++) {
             cJSON *o = cJSON_CreateObject();
@@ -1178,7 +1178,7 @@ static bool handle_admin_databases(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_database_create(g_ctx.config, name->valuestring,
+        bool ok = edb_database_create(g_ctx.config, name->valuestring,
                                       rf->valueint);
         cJSON_Delete(body);
         if (!ok) {
@@ -1186,22 +1186,22 @@ static bool handle_admin_databases(const zdb_http_request *req,
             return true;
         }
         respond_json(res, 201, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"created\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
     return true;
 }
 
-static bool handle_admin_groups(const zdb_http_request *req,
-                                zdb_http_response *res)
+static bool handle_admin_groups(const edb_http_request *req,
+                                edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
     }
     if (strcmp(req->method, "GET") == 0) {
         size_t n = 0;
-        zdb_group_info *list = zdb_group_list(g_ctx.config, &n);
+        edb_group_info *list = edb_group_list(g_ctx.config, &n);
         cJSON *arr = cJSON_CreateArray();
         for (size_t i = 0; list && i < n; i++) {
             cJSON *o = cJSON_CreateObject();
@@ -1229,29 +1229,29 @@ static bool handle_admin_groups(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_group_create(g_ctx.config, name->valuestring);
+        bool ok = edb_group_create(g_ctx.config, name->valuestring);
         cJSON_Delete(body);
         if (!ok) {
             respond_error(res, 409, "create failed (duplicate/full)");
             return true;
         }
         respond_json(res, 201, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"created\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
     return true;
 }
 
-static bool handle_admin_users(const zdb_http_request *req,
-                               zdb_http_response *res)
+static bool handle_admin_users(const edb_http_request *req,
+                               edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
     }
     if (strcmp(req->method, "GET") == 0) {
         size_t n = 0;
-        zdb_user_info *list = zdb_user_list(g_ctx.config, &n);
+        edb_user_info *list = edb_user_list(g_ctx.config, &n);
         cJSON *arr = cJSON_CreateArray();
         for (size_t i = 0; list && i < n; i++) {
             cJSON *o = cJSON_CreateObject();
@@ -1284,11 +1284,11 @@ static bool handle_admin_users(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_user_create(g_ctx.config, name->valuestring,
+        bool ok = edb_user_create(g_ctx.config, name->valuestring,
                                   group_mask);
         if (ok && cJSON_IsString(password) && password->valuestring &&
             *password->valuestring) {
-            ok = zdb_user_set_password(g_ctx.config, name->valuestring,
+            ok = edb_user_set_password(g_ctx.config, name->valuestring,
                                        password->valuestring);
         }
         cJSON_Delete(body);
@@ -1297,7 +1297,7 @@ static bool handle_admin_users(const zdb_http_request *req,
             return true;
         }
         respond_json(res, 201, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"created\":true}");
         return true;
     }
     if (strcmp(req->method, "PUT") == 0) {
@@ -1318,11 +1318,11 @@ static bool handle_admin_users(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_user_set_groups(g_ctx.config, name->valuestring,
+        bool ok = edb_user_set_groups(g_ctx.config, name->valuestring,
                                       group_mask);
         if (ok && cJSON_IsString(password) && password->valuestring &&
             *password->valuestring) {
-            ok = zdb_user_set_password(g_ctx.config, name->valuestring,
+            ok = edb_user_set_password(g_ctx.config, name->valuestring,
                                        password->valuestring);
         }
         cJSON_Delete(body);
@@ -1331,7 +1331,7 @@ static bool handle_admin_users(const zdb_http_request *req,
             return true;
         }
         respond_json(res, 200, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"updated\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"updated\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
@@ -1341,9 +1341,9 @@ static bool handle_admin_users(const zdb_http_request *req,
 /* Parses optional shard-tuning fields from a partition request body. Returns
  * true when at least one tuning field was present. */
 static bool partition_settings_from_json(const cJSON *body,
-                                        zdb_shard_settings *out)
+                                        edb_shard_settings *out)
 {
-    zdb_shard_settings_default(out);
+    edb_shard_settings_default(out);
     bool present = false;
     const cJSON *cs = cJSON_GetObjectItemCaseSensitive(body, "cache_size");
     if (cJSON_IsNumber(cs)) {
@@ -1370,7 +1370,7 @@ static bool partition_settings_from_json(const cJSON *body,
 }
 
 static void partition_add_settings_json(cJSON *o,
-                                        const zdb_partition_info *p)
+                                        const edb_partition_info *p)
 {
     cJSON_AddNumberToObject(o, "cache_size", (double)p->cache_size);
     cJSON_AddStringToObject(o, "journal_mode", p->journal_mode);
@@ -1378,8 +1378,8 @@ static void partition_add_settings_json(cJSON *o,
     cJSON_AddNumberToObject(o, "reindex_seconds", (double)p->reindex_seconds);
 }
 
-static bool handle_admin_partitions(const zdb_http_request *req,
-                                    zdb_http_response *res)
+static bool handle_admin_partitions(const edb_http_request *req,
+                                    edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
@@ -1388,17 +1388,17 @@ static bool handle_admin_partitions(const zdb_http_request *req,
         char dbbuf[128];
         bool have_db = query_param(req, "database", dbbuf, sizeof(dbbuf));
         size_t n = 0;
-        zdb_partition_info *list =
-            zdb_partition_list(g_ctx.config, have_db ? dbbuf : "", &n);
+        edb_partition_info *list =
+            edb_partition_list(g_ctx.config, have_db ? dbbuf : "", &n);
         if (!have_db) {
             /* list across all databases */
             free(list);
             size_t ndb = 0;
-            zdb_database_info *dbs = zdb_database_list(g_ctx.config, &ndb);
+            edb_database_info *dbs = edb_database_list(g_ctx.config, &ndb);
             cJSON *arr2 = cJSON_CreateArray();
             for (size_t d = 0; dbs && d < ndb; d++) {
                 size_t cnt = 0;
-                zdb_partition_info *parts = zdb_partition_list(
+                edb_partition_info *parts = edb_partition_list(
                     g_ctx.config, dbs[d].name, &cnt);
                 for (size_t i = 0; parts && i < cnt; i++) {
                     cJSON *o = cJSON_CreateObject();
@@ -1483,13 +1483,13 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_partition_create(g_ctx.config, database->valuestring,
+        bool ok = edb_partition_create(g_ctx.config, database->valuestring,
                                        name->valuestring, create_mask,
                                        update_mask, read_mask, delete_mask);
         if (ok) {
-            zdb_shard_settings settings;
+            edb_shard_settings settings;
             if (partition_settings_from_json(body, &settings)) {
-                zdb_partition_set_settings(g_ctx.config,
+                edb_partition_set_settings(g_ctx.config,
                                            database->valuestring,
                                            name->valuestring, &settings);
             }
@@ -1500,7 +1500,7 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             return true;
         }
         respond_json(res, 201, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"created\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"created\":true}");
         return true;
     }
     if (strcmp(req->method, "PUT") == 0) {
@@ -1535,14 +1535,14 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             cJSON_Delete(body);
             return true;
         }
-        bool ok = zdb_partition_set_masks(g_ctx.config, database->valuestring,
+        bool ok = edb_partition_set_masks(g_ctx.config, database->valuestring,
                                           name->valuestring, create_mask,
                                           update_mask, read_mask,
                                           delete_mask);
         if (ok) {
-            zdb_shard_settings settings;
+            edb_shard_settings settings;
             if (partition_settings_from_json(body, &settings)) {
-                zdb_partition_set_settings(g_ctx.config,
+                edb_partition_set_settings(g_ctx.config,
                                            database->valuestring,
                                            name->valuestring, &settings);
             }
@@ -1553,7 +1553,7 @@ static bool handle_admin_partitions(const zdb_http_request *req,
             return true;
         }
         respond_json(res, 200, NULL);
-        res->body = zdb_http_body_printf(&res->body_len, "{\"updated\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"updated\":true}");
         return true;
     }
     respond_error(res, 405, "method not allowed");
@@ -1563,8 +1563,8 @@ static bool handle_admin_partitions(const zdb_http_request *req,
 /* Generic DELETE handler for single-entity admin resources:
  * /admin/{databases|groups|users}/<name> and
  * /admin/partitions/<database>/<name> */
-static bool handle_admin_delete(const zdb_http_request *req,
-                                zdb_http_response *res)
+static bool handle_admin_delete(const edb_http_request *req,
+                                edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
@@ -1573,11 +1573,11 @@ static bool handle_admin_delete(const zdb_http_request *req,
     bool ok = false;
 
     if (strncmp(p, "/admin/databases/", 17) == 0) {
-        ok = zdb_database_delete(g_ctx.config, p + 17);
+        ok = edb_database_delete(g_ctx.config, p + 17);
     } else if (strncmp(p, "/admin/groups/", 14) == 0) {
-        ok = zdb_group_delete(g_ctx.config, p + 14);
+        ok = edb_group_delete(g_ctx.config, p + 14);
     } else if (strncmp(p, "/admin/users/", 13) == 0) {
-        ok = zdb_user_delete(g_ctx.config, p + 13);
+        ok = edb_user_delete(g_ctx.config, p + 13);
     } else if (strncmp(p, "/admin/partitions/", 18) == 0) {
         char database[128];
         char name[256];
@@ -1586,7 +1586,7 @@ static bool handle_admin_delete(const zdb_http_request *req,
                           "expected /admin/partitions/<database>/<name>");
             return true;
         }
-        ok = zdb_partition_delete(g_ctx.config, database, name);
+        ok = edb_partition_delete(g_ctx.config, database, name);
     } else {
         respond_error(res, 404, "unknown resource");
         return true;
@@ -1598,15 +1598,15 @@ static bool handle_admin_delete(const zdb_http_request *req,
     }
     res->status = 200;
     res->content_type = "application/json";
-    res->body = zdb_http_body_printf(&res->body_len, "{\"deleted\":true}");
+    res->body = edb_http_body_printf(&res->body_len, "{\"deleted\":true}");
     return true;
 }
 
 /* GET /admin/keyspaces: the registry of used
  * database/partition/keyspace triples (populated transparently by
  * writes). Optional ?database=<name> narrows the listing. */
-static bool handle_admin_keyspaces(const zdb_http_request *req,
-                                   zdb_http_response *res)
+static bool handle_admin_keyspaces(const edb_http_request *req,
+                                   edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
@@ -1615,7 +1615,7 @@ static bool handle_admin_keyspaces(const zdb_http_request *req,
     bool have_db = query_param(req, "database", dbfilter, sizeof(dbfilter));
 
     size_t n = 0;
-    zdb_keyspace_info *list = zdb_keyspace_list(g_ctx.config, &n);
+    edb_keyspace_info *list = edb_keyspace_list(g_ctx.config, &n);
     cJSON *arr = cJSON_CreateArray();
     for (size_t i = 0; list && i < n; i++) {
         if (have_db && strcmp(list[i].database, dbfilter) != 0) {
@@ -1633,8 +1633,8 @@ static bool handle_admin_keyspaces(const zdb_http_request *req,
 }
 
 /* GET /admin/analytics: aggregated cluster-wide workload/performance. */
-static bool handle_admin_analytics(const zdb_http_request *req,
-                                   zdb_http_response *res)
+static bool handle_admin_analytics(const edb_http_request *req,
+                                   edb_http_response *res)
 {
     if (strcmp(req->method, "GET") != 0) {
         respond_error(res, 405, "method not allowed");
@@ -1643,14 +1643,14 @@ static bool handle_admin_analytics(const zdb_http_request *req,
     if (!require_admin_auth(req, res)) {
         return true;
     }
-    cJSON *report = zdb_analytics_report(g_analytics);
+    cJSON *report = edb_analytics_report(g_analytics);
     respond_json(res, 200, report ? report : cJSON_CreateObject());
     return true;
 }
 
 /* POST /admin/benchmark: run a throwaway workload benchmark. */
-static bool handle_admin_benchmark(const zdb_http_request *req,
-                                   zdb_http_response *res)
+static bool handle_admin_benchmark(const edb_http_request *req,
+                                   edb_http_response *res)
 {
     if (strcmp(req->method, "POST") != 0) {
         respond_error(res, 405, "method not allowed");
@@ -1669,6 +1669,7 @@ static bool handle_admin_benchmark(const zdb_http_request *req,
     const char *journal_mode = "TRUNCATE";
     int partitions = 10;
     int records = 100000;
+    int threads = 0;
     if (body && cJSON_IsObject(body)) {
         const cJSON *j;
         j = cJSON_GetObjectItemCaseSensitive(body, "replication_factor");
@@ -1681,19 +1682,21 @@ static bool handle_admin_benchmark(const zdb_http_request *req,
         if (cJSON_IsNumber(j)) partitions = (int)j->valuedouble;
         j = cJSON_GetObjectItemCaseSensitive(body, "records");
         if (cJSON_IsNumber(j)) records = (int)j->valuedouble;
+        j = cJSON_GetObjectItemCaseSensitive(body, "threads");
+        if (cJSON_IsNumber(j)) threads = (int)j->valuedouble;
     }
     cJSON_Delete(body);
-    cJSON *report = zdb_benchmark_run(g_ctx.config, replication_factor,
+    cJSON *report = edb_benchmark_run(g_ctx.config, replication_factor,
                                       cache_size, journal_mode, partitions,
-                                      records);
+                                      records, threads);
     respond_json(res, 200, report ? report : cJSON_CreateObject());
     return true;
 }
 
 /* GET /admin/cluster: membership, leader, generation and range table.
  * POST /admin/join {addr, port}: dial the seed peer and merge meshes. */
-static bool handle_admin_cluster(const zdb_http_request *req,
-                                 zdb_http_response *res)
+static bool handle_admin_cluster(const edb_http_request *req,
+                                 edb_http_response *res)
 {
     if (strcmp(req->method, "GET") == 0) {
         if (!require_admin_auth(req, res)) {
@@ -1705,22 +1708,22 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             return true;
         }
         cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "node_id", zdb_cluster_self_id(g_cluster));
-        const char *leader = zdb_cluster_leader(g_cluster);
+        cJSON_AddStringToObject(o, "node_id", edb_cluster_self_id(g_cluster));
+        const char *leader = edb_cluster_leader(g_cluster);
         cJSON_AddStringToObject(o, "leader", leader ? leader : "none");
         cJSON_AddBoolToObject(o, "is_leader",
-                              zdb_cluster_is_leader(g_cluster));
+                              edb_cluster_is_leader(g_cluster));
         /* stage 6e: live/target structure versions, rebalance lock state
          * and per-node compliance for observability */
-        long long tgen = zdb_cluster_target_generation(g_cluster);
+        long long tgen = edb_cluster_target_generation(g_cluster);
         cJSON_AddNumberToObject(o, "generation",
-                                (double)zdb_cluster_generation(g_cluster));
+                                (double)edb_cluster_generation(g_cluster));
         cJSON_AddNumberToObject(o, "live_version",
-                                (double)zdb_cluster_generation(g_cluster));
+                                (double)edb_cluster_generation(g_cluster));
         cJSON_AddNumberToObject(o, "target_version", (double)tgen);
         cJSON_AddBoolToObject(o, "rebalance_in_progress", tgen > 0);
         char *lockjson =
-            zdb_setting_get(g_ctx.config, "cluster.rebalance_lock");
+            edb_setting_get(g_ctx.config, "cluster.rebalance_lock");
         if (lockjson) {
             cJSON *jl = cJSON_Parse(lockjson);
             free(lockjson);
@@ -1736,8 +1739,8 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             cJSON_AddNullToObject(o, "rebalance_lock");
         }
 
-        zdb_peer_info peers[64];
-        size_t n = zdb_cluster_peers(g_cluster, peers, 64);
+        edb_peer_info peers[64];
+        size_t n = edb_cluster_peers(g_cluster, peers, 64);
         cJSON *arr = cJSON_AddArrayToObject(o, "nodes");
         for (size_t i = 0; arr && i < n; i++) {
             cJSON *p = cJSON_CreateObject();
@@ -1755,9 +1758,9 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             cJSON_AddItemToArray(arr, p);
         }
 
-        zdb_range_info tranges[64];
+        edb_range_info tranges[64];
         size_t nt =
-            zdb_cluster_target_ranges(g_cluster, tranges, 64);
+            edb_cluster_target_ranges(g_cluster, tranges, 64);
         cJSON *tarr = cJSON_AddArrayToObject(o, "target_ranges");
         for (size_t i = 0; tarr && i < nt; i++) {
             cJSON *r = cJSON_CreateObject();
@@ -1769,8 +1772,8 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             cJSON_AddItemToArray(tarr, r);
         }
 
-        zdb_range_info ranges[64];
-        size_t nr = zdb_cluster_ranges(g_cluster, ranges, 64);
+        edb_range_info ranges[64];
+        size_t nr = edb_cluster_ranges(g_cluster, ranges, 64);
         cJSON *rarr = cJSON_AddArrayToObject(o, "ranges");
         for (size_t i = 0; rarr && i < nr; i++) {
             cJSON *r = cJSON_CreateObject();
@@ -1798,18 +1801,18 @@ static bool handle_admin_cluster(const zdb_http_request *req,
 static bool catchup_from_holder(const char key[33], const char *partition,
                                 const char *keyspace)
 {
-    char holders[64][ZDB_NODE_ID_MAX];
-    size_t count = zdb_cluster_holders(g_cluster, key, holders, 64);
-    zdb_peer_info peers[64];
-    size_t npeers = zdb_cluster_peers(g_cluster, peers, 64);
+    char holders[64][EDB_NODE_ID_MAX];
+    size_t count = edb_cluster_holders(g_cluster, key, holders, 64);
+    edb_peer_info peers[64];
+    size_t npeers = edb_cluster_peers(g_cluster, peers, 64);
     for (size_t i = 0; i < count; i++) {
-        if (strcmp(holders[i], zdb_cluster_self_id(g_cluster)) == 0) {
+        if (strcmp(holders[i], edb_cluster_self_id(g_cluster)) == 0) {
             continue;
         }
         for (size_t p = 0; p < npeers; p++) {
             if (strcmp(peers[p].id, holders[i]) == 0 && peers[p].addr[0] &&
                 peers[p].port > 0 &&
-                zdb_repl_catchup_required(g_repl, peers[p].addr,
+                edb_repl_catchup_required(g_repl, peers[p].addr,
                                            peers[p].port, partition,
                                            keyspace)) {
                 return true;
@@ -1821,8 +1824,8 @@ static bool catchup_from_holder(const char key[33], const char *partition,
 
 
 
-static bool handle_admin_join(const zdb_http_request *req,
-                              zdb_http_response *res)
+static bool handle_admin_join(const edb_http_request *req,
+                              edb_http_response *res)
 {
     if (strcmp(req->method, "POST") != 0) {
         respond_error(res, 405, "method not allowed");
@@ -1863,23 +1866,23 @@ static bool handle_admin_join(const zdb_http_request *req,
     uint8_t enc_key[32], mac_key[32];
     bool key_set = false;
     if (secret_str) {
-        if (zdb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
+        if (edb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
             cJSON_Delete(body);
             respond_error(res, 400, "invalid cluster secret");
             return true;
         }
-        zstp_set_mesh_key(enc_key, mac_key);
+        estp_set_mesh_key(enc_key, mac_key);
         key_set = true;
     }
-    int rc = zdb_cluster_join(g_cluster, addr->valuestring,
+    int rc = edb_cluster_join(g_cluster, addr->valuestring,
                               port->valueint);
-    char seed_addr[ZDB_ADDR_MAX];
+    char seed_addr[EDB_ADDR_MAX];
     int seed_port = port->valueint;
     snprintf(seed_addr, sizeof(seed_addr), "%s", addr->valuestring);
     cJSON_Delete(body);
     if (rc == -2) {
         if (key_set) {
-            zstp_set_mesh_key(NULL, NULL);
+            estp_set_mesh_key(NULL, NULL);
         }
         respond_error(res, 409, "rebalance in progress: one node may"
                                 " join at a time; retry later");
@@ -1887,7 +1890,7 @@ static bool handle_admin_join(const zdb_http_request *req,
     }
     if (rc == -3) {
         if (key_set) {
-            zstp_set_mesh_key(NULL, NULL);
+            estp_set_mesh_key(NULL, NULL);
         }
         respond_error(res, 410, "this node has been removed from the"
                                 " cluster; re-join to be re-admitted");
@@ -1895,13 +1898,13 @@ static bool handle_admin_join(const zdb_http_request *req,
     }
     if (rc != 0) {
         if (key_set) {
-            zstp_set_mesh_key(NULL, NULL);
+            estp_set_mesh_key(NULL, NULL);
         }
         respond_error(res, 502, "cannot reach seed peer (wrong secret?)");
         return true;
     }
     if (key_set) {
-        zdb_cluster_persist_keys(zdb_engine_path(g_ctx.engine), enc_key,
+        edb_cluster_persist_keys(edb_engine_path(g_ctx.engine), enc_key,
                                  mac_key);
     }
     respond_json(res, 200, NULL);
@@ -1915,13 +1918,13 @@ static bool handle_admin_join(const zdb_http_request *req,
      * ourselves compliant and the leader promotes automatically. */
     bool synced = true;
     char fail_detail[128] = "";
-    zdb_cluster_set_auto_compliant(g_cluster, false);
+    edb_cluster_set_auto_compliant(g_cluster, false);
 
     const char *sys_ks[8];
-    size_t nsys = zdb_config_system_keyspaces(sys_ks, 8);
+    size_t nsys = edb_config_system_keyspaces(sys_ks, 8);
     for (size_t i = 0; i < nsys && synced; i++) {
-        if (!zdb_repl_catchup(g_repl, seed_addr, seed_port,
-                              ZDB_SYSTEM_DB, sys_ks[i])) {
+        if (!edb_repl_catchup(g_repl, seed_addr, seed_port,
+                              EDB_SYSTEM_DB, sys_ks[i])) {
             synced = false;
             snprintf(fail_detail, sizeof(fail_detail),
                      "config sync failed for %s", sys_ks[i]);
@@ -1930,32 +1933,32 @@ static bool handle_admin_join(const zdb_http_request *req,
 
     bool pending = false;
     for (int i = 0; i < 100 && !pending; i++) {
-        pending = zdb_cluster_target_generation(g_cluster) > 0;
+        pending = edb_cluster_target_generation(g_cluster) > 0;
         if (!pending) {
             struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 * 1000000L };
             nanosleep(&delay, NULL);
         }
     }
-    if (synced && pending && zdb_cluster_needs_sync(g_cluster)) {
+    if (synced && pending && edb_cluster_needs_sync(g_cluster)) {
         size_t nks = 0;
-        zdb_keyspace_info *kss =
-            zdb_keyspace_list(g_ctx.config, &nks);
+        edb_keyspace_info *kss =
+            edb_keyspace_list(g_ctx.config, &nks);
         for (size_t i = 0; kss && i < nks && synced; i++) {
             char key[33];
             char path[1024];
-            if (!zdb_shard_path(g_ctx.engine, kss[i].partition,
+            if (!edb_shard_path(g_ctx.engine, kss[i].partition,
                                 kss[i].name, path, sizeof(path), key) ||
-                zdb_config_is_system_key(g_ctx.config, key)) {
+                edb_config_is_system_key(g_ctx.config, key)) {
                 continue;
             }
             const char *towner =
-                zdb_cluster_target_owner(g_cluster, key);
+                edb_cluster_target_owner(g_cluster, key);
             if (!towner ||
-                strcmp(towner, zdb_cluster_self_id(g_cluster)) != 0) {
+                strcmp(towner, edb_cluster_self_id(g_cluster)) != 0) {
                 continue;
             }
             if (!catchup_from_holder(key, kss[i].partition, kss[i].name) ||
-                !zdb_shard_validate(g_ctx.engine, kss[i].partition,
+                !edb_shard_validate(g_ctx.engine, kss[i].partition,
                                     kss[i].name)) {
                 synced = false;
                 snprintf(fail_detail, sizeof(fail_detail),
@@ -1966,12 +1969,12 @@ static bool handle_admin_join(const zdb_http_request *req,
         free(kss);
     }
     if (synced) {
-        zdb_cluster_mark_compliant(g_cluster);
+        edb_cluster_mark_compliant(g_cluster);
     } else {
         /* roll the cluster back to the live structure */
-        zdb_cluster_request_void(g_cluster);
+        edb_cluster_request_void(g_cluster);
     }
-    zdb_cluster_set_auto_compliant(g_cluster, true);
+    edb_cluster_set_auto_compliant(g_cluster, true);
 
     if (!synced) {
         respond_error(res, 500, fail_detail[0] ? fail_detail
@@ -1980,14 +1983,14 @@ static bool handle_admin_join(const zdb_http_request *req,
         return true;
     }
     free(res->body);
-    res->body = zdb_http_body_printf(&res->body_len,
+    res->body = edb_http_body_printf(&res->body_len,
                                      "{\"joined\":true,\"synced\":true}");
     return true;
 }
 
 /* POST /admin/remove-node {node_id}: tombstone a node and re-shard. */
-static bool handle_admin_remove_node(const zdb_http_request *req,
-                                     zdb_http_response *res)
+static bool handle_admin_remove_node(const edb_http_request *req,
+                                     edb_http_response *res)
 {
     if (strcmp(req->method, "POST") != 0) {
         respond_error(res, 405, "method not allowed");
@@ -2013,7 +2016,7 @@ static bool handle_admin_remove_node(const zdb_http_request *req,
         cJSON_Delete(body);
         return true;
     }
-    if (!zdb_cluster_remove_node(g_cluster, jid->valuestring)) {
+    if (!edb_cluster_remove_node(g_cluster, jid->valuestring)) {
         cJSON_Delete(body);
         respond_error(res, 404, "node not found (or cannot remove self)");
         return true;
@@ -2021,12 +2024,12 @@ static bool handle_admin_remove_node(const zdb_http_request *req,
     cJSON_Delete(body);
     res->status = 200;
     res->content_type = "application/json";
-    res->body = zdb_http_body_printf(&res->body_len, "{\"removed\":true}");
+    res->body = edb_http_body_printf(&res->body_len, "{\"removed\":true}");
     return true;
 }
 
-static bool handle_settings(const zdb_http_request *req,
-                            zdb_http_response *res)
+static bool handle_settings(const edb_http_request *req,
+                            edb_http_response *res)
 {
     if (!require_admin_auth(req, res)) {
         return true;
@@ -2039,12 +2042,12 @@ static bool handle_settings(const zdb_http_request *req,
         if (!*rest) {
             /* list all settings */
             size_t n = 0;
-            char **names = zdb_setting_list(g_ctx.config, &n);
+            char **names = edb_setting_list(g_ctx.config, &n);
             cJSON *arr = cJSON_CreateArray();
             for (size_t i = 0; names && i < n; i++) {
                 cJSON *o = cJSON_CreateObject();
                 cJSON_AddStringToObject(o, "name", names[i]);
-                char *value = zdb_setting_get(g_ctx.config, names[i]);
+                char *value = edb_setting_get(g_ctx.config, names[i]);
                 cJSON *parsed = value ? cJSON_Parse(value) : NULL;
                 if (parsed) {
                     cJSON_AddItemToObject(o, "value", parsed);
@@ -2055,12 +2058,12 @@ static bool handle_settings(const zdb_http_request *req,
                 free(value);
                 cJSON_AddItemToArray(arr, o);
             }
-            zdb_free_strings(names);
+            edb_free_strings(names);
             respond_json(res, 200, arr);
             return true;
         }
         rest++;   /* skip '/' */
-        char *value = zdb_setting_get(g_ctx.config, rest);
+        char *value = edb_setting_get(g_ctx.config, rest);
         if (!value) {
             respond_error(res, 404, "unknown setting");
             return true;
@@ -2087,7 +2090,7 @@ static bool handle_settings(const zdb_http_request *req,
         }
         char *printed = cJSON_PrintUnformatted(check);
         cJSON_Delete(check);
-        if (!zdb_setting_set(g_ctx.config, rest, printed ? printed : "null")) {
+        if (!edb_setting_set(g_ctx.config, rest, printed ? printed : "null")) {
             free(printed);
             respond_error(res, 500, "setting store failed");
             return true;
@@ -2095,7 +2098,7 @@ static bool handle_settings(const zdb_http_request *req,
         free(printed);
         res->status = 200;
         res->content_type = "application/json";
-        res->body = zdb_http_body_printf(&res->body_len,
+        res->body = edb_http_body_printf(&res->body_len,
                                          "{\"set\":\"%s\"}", rest);
         return true;
     }
@@ -2105,13 +2108,13 @@ static bool handle_settings(const zdb_http_request *req,
             respond_error(res, 400, "expected /admin/settings/<name>");
             return true;
         }
-        if (!zdb_setting_delete(g_ctx.config, rest + 1)) {
+        if (!edb_setting_delete(g_ctx.config, rest + 1)) {
             respond_error(res, 404, "unknown setting");
             return true;
         }
         res->status = 200;
         res->content_type = "application/json";
-        res->body = zdb_http_body_printf(&res->body_len, "{\"deleted\":true}");
+        res->body = edb_http_body_printf(&res->body_len, "{\"deleted\":true}");
         return true;
     }
 
@@ -2119,12 +2122,12 @@ static bool handle_settings(const zdb_http_request *req,
     return true;
 }
 
-static bool handle_status(const zdb_http_request *req,
-                          zdb_http_response *res)
+static bool handle_status(const edb_http_request *req,
+                          edb_http_response *res)
 {
     (void)req;
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "service", "zestydb");
+    cJSON_AddStringToObject(o, "service", "epsilondb");
     cJSON_AddStringToObject(o, "version", "0.1.0");
     cJSON_AddBoolToObject(o, "clustered", g_cluster != NULL);
     respond_json(res, 200, o);
@@ -2134,11 +2137,11 @@ static bool handle_status(const zdb_http_request *req,
 /* ------------------------------------------------------------------ */
 /* admin console authentication                                        */
 
-static const char *bearer_token(const zdb_http_request *req, char out[256])
+static const char *bearer_token(const edb_http_request *req, char out[256])
 {
-    const char *hdr = zdb_http_header(req, "Authorization");
+    const char *hdr = edb_http_header(req, "Authorization");
     if (!hdr) {
-        hdr = zdb_http_header(req, "authorization");
+        hdr = edb_http_header(req, "authorization");
     }
     if (hdr) {
         const char *value = strncmp(hdr, "Bearer ", 7) == 0 ? hdr + 7 : hdr;
@@ -2149,7 +2152,7 @@ static const char *bearer_token(const zdb_http_request *req, char out[256])
     return NULL;
 }
 
-static void respond_groups_json(zdb_http_response *res, int status,
+static void respond_groups_json(edb_http_response *res, int status,
                                 const char *token, const char *username,
                                 uint64_t groups)
 {
@@ -2165,10 +2168,10 @@ static void respond_groups_json(zdb_http_response *res, int status,
     respond_json(res, status, o);
 }
 
-static bool handle_console_state(const zdb_http_request *req,
-                                 zdb_http_response *res)
+static bool handle_console_state(const edb_http_request *req,
+                                 edb_http_response *res)
 {
-    bool setup_required = g_ctx.config && !zdb_admin_exists(g_ctx.config);
+    bool setup_required = g_ctx.config && !edb_admin_exists(g_ctx.config);
     bool authenticated = false;
     char username[128] = "";
     uint64_t groups = 0;
@@ -2179,8 +2182,8 @@ static bool handle_console_state(const zdb_http_request *req,
     }
     size_t peers = 0;
     if (g_cluster) {
-        zdb_peer_info info[64];
-        peers = zdb_cluster_peers(g_cluster, info, 64);
+        edb_peer_info info[64];
+        peers = edb_cluster_peers(g_cluster, info, 64);
     }
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "setup_required", setup_required);
@@ -2192,8 +2195,8 @@ static bool handle_console_state(const zdb_http_request *req,
     return true;
 }
 
-static bool handle_admin_login(const zdb_http_request *req,
-                               zdb_http_response *res)
+static bool handle_admin_login(const edb_http_request *req,
+                               edb_http_response *res)
 {
     if (strcmp(req->method, "POST") != 0) {
         respond_error(res, 405, "method not allowed");
@@ -2208,14 +2211,14 @@ static bool handle_admin_login(const zdb_http_request *req,
     const cJSON *username = cJSON_GetObjectItemCaseSensitive(body, "username");
     const cJSON *password = cJSON_GetObjectItemCaseSensitive(body, "password");
     if (!cJSON_IsString(username) || !cJSON_IsString(password) ||
-        !zdb_user_verify_password(g_ctx.config, username->valuestring,
+        !edb_user_verify_password(g_ctx.config, username->valuestring,
                                   password->valuestring)) {
         cJSON_Delete(body);
         respond_error(res, 401, "invalid credentials");
         return true;
     }
-    zdb_user_info user;
-    if (!zdb_user_get(g_ctx.config, username->valuestring, &user)) {
+    edb_user_info user;
+    if (!edb_user_get(g_ctx.config, username->valuestring, &user)) {
         cJSON_Delete(body);
         respond_error(res, 401, "invalid credentials");
         return true;
@@ -2299,24 +2302,24 @@ static const demo_record DEMO_RECORDS[] = {
  * it when the node adopts the shared cluster data. */
 static void seed_demo_data(void)
 {
-    zdb_database_create(g_ctx.config, "demo", 1);
+    edb_database_create(g_ctx.config, "demo", 1);
     size_t n = sizeof(DEMO_RECORDS) / sizeof(DEMO_RECORDS[0]);
     for (size_t i = 0; i < n; i++) {
         const demo_record *r = &DEMO_RECORDS[i];
-        zdb_put(g_ctx.engine, r->partition, r->keyspace, r->id, r->json, -1);
-        zdb_partition_ensure(g_ctx.config, "demo", r->partition,
+        edb_put(g_ctx.engine, r->partition, r->keyspace, r->id, r->json, -1);
+        edb_partition_ensure(g_ctx.config, "demo", r->partition,
                              r->keyspace, NULL);
     }
 }
 
-static bool handle_admin_setup(const zdb_http_request *req,
-                               zdb_http_response *res)
+static bool handle_admin_setup(const edb_http_request *req,
+                               edb_http_response *res)
 {
     if (strcmp(req->method, "POST") != 0) {
         respond_error(res, 405, "method not allowed");
         return true;
     }
-    if (g_ctx.config && zdb_admin_exists(g_ctx.config)) {
+    if (g_ctx.config && edb_admin_exists(g_ctx.config)) {
         respond_error(res, 409, "admin already configured");
         return true;
     }
@@ -2354,29 +2357,29 @@ static bool handle_admin_setup(const zdb_http_request *req,
             : NULL;
     uint8_t enc_key[32], mac_key[32];
     if (secret_str) {
-        if (zdb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
+        if (edb_cluster_derive_keys(secret_str, enc_key, mac_key) != 0) {
             cJSON_Delete(body);
             respond_error(res, 400, "invalid cluster secret");
             return true;
         }
-        zdb_cluster_persist_keys(zdb_engine_path(g_ctx.engine), enc_key,
+        edb_cluster_persist_keys(edb_engine_path(g_ctx.engine), enc_key,
                                  mac_key);
-        zstp_set_mesh_key(enc_key, mac_key);
+        estp_set_mesh_key(enc_key, mac_key);
     }
     /* First run: create the default SysAdmins group (bit 1) and add the
      * admin user to it, then set the admin password. */
-    zdb_group_create(g_ctx.config, "SysAdmins");
-    zdb_group_info sysadmins;
+    edb_group_create(g_ctx.config, "SysAdmins");
+    edb_group_info sysadmins;
     uint64_t admin_groups = 1ULL;
-    if (zdb_group_get(g_ctx.config, "SysAdmins", &sysadmins)) {
+    if (edb_group_get(g_ctx.config, "SysAdmins", &sysadmins)) {
         admin_groups = 1ULL << (sysadmins.bit_position - 1);
     }
-    if (!zdb_user_create(g_ctx.config, name, admin_groups)) {
+    if (!edb_user_create(g_ctx.config, name, admin_groups)) {
         cJSON_Delete(body);
         respond_error(res, 409, "could not create admin user");
         return true;
     }
-    if (!zdb_user_set_password(g_ctx.config, name, password->valuestring)) {
+    if (!edb_user_set_password(g_ctx.config, name, password->valuestring)) {
         cJSON_Delete(body);
         respond_error(res, 500, "could not store password");
         return true;
@@ -2389,8 +2392,8 @@ static bool handle_admin_setup(const zdb_http_request *req,
     return true;
 }
 
-static bool handle_admin_logout(const zdb_http_request *req,
-                                zdb_http_response *res)
+static bool handle_admin_logout(const edb_http_request *req,
+                                edb_http_response *res)
 {
     char token[256];
     const char *presented = bearer_token(req, token);
@@ -2398,82 +2401,82 @@ static bool handle_admin_logout(const zdb_http_request *req,
         session_destroy(presented);
     }
     respond_json(res, 200, NULL);
-    res->body = zdb_http_body_printf(&res->body_len, "{\"ok\":true}");
+    res->body = edb_http_body_printf(&res->body_len, "{\"ok\":true}");
     return true;
 }
 
 /* ------------------------------------------------------------------ */
 
-bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
-                      zdb_config *config)
+bool edb_api_register(edb_http_server *srv, edb_engine *engine,
+                      edb_config *config)
 {
     if (!srv || !engine || !config) {
         return false;
     }
     g_ctx.engine = engine;
     g_ctx.config = config;
-    zdb_config_set_replicator(config, g_repl ? api_replicate_config : NULL,
+    edb_config_set_replicator(config, g_repl ? api_replicate_config : NULL,
                               g_repl);
-    zdb_config_register_settings(config);
+    edb_config_register_settings(config);
 
     bool ok = true;
-    ok &= zdb_http_add_handler(srv, "PUT", "/data/", handle_data_put);
-    ok &= zdb_http_add_handler(srv, "DELETE", "/data/", handle_data_delete);
+    ok &= edb_http_add_handler(srv, "PUT", "/data/", handle_data_put);
+    ok &= edb_http_add_handler(srv, "DELETE", "/data/", handle_data_delete);
     /* GET: id lookups and .../all|ids (collect checks the last segment) */
-    ok &= zdb_http_add_handler(srv, "GET", "/data/", handle_data_collect);
-    ok &= zdb_http_add_handler(srv, "POST", "/data/", handle_data_collect);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/databases",
+    ok &= edb_http_add_handler(srv, "GET", "/data/", handle_data_collect);
+    ok &= edb_http_add_handler(srv, "POST", "/data/", handle_data_collect);
+    ok &= edb_http_add_handler(srv, "GET", "/admin/databases",
                                handle_admin_databases);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/databases",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/databases",
                                handle_admin_databases);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/groups",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/groups",
                                handle_admin_groups);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/groups",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/groups",
                                handle_admin_groups);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/users",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/users",
                                handle_admin_users);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/users",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/users",
                                handle_admin_users);
-    ok &= zdb_http_add_handler(srv, "PUT", "/admin/users",
+    ok &= edb_http_add_handler(srv, "PUT", "/admin/users",
                                handle_admin_users);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/partitions",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/partitions",
                                handle_admin_partitions);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/partitions",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/partitions",
                                handle_admin_partitions);
-    ok &= zdb_http_add_handler(srv, "PUT", "/admin/partitions",
+    ok &= edb_http_add_handler(srv, "PUT", "/admin/partitions",
                                handle_admin_partitions);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/keyspaces",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/keyspaces",
                                handle_admin_keyspaces);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/analytics",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/analytics",
                                handle_admin_analytics);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/benchmark",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/benchmark",
                                handle_admin_benchmark);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/cluster",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/cluster",
                                handle_admin_cluster);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/join",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/join",
                                handle_admin_join);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/remove-node",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/remove-node",
                                handle_admin_remove_node);
     /* deletes use the trailing-slash form so list routes stay intact;
      * longest-prefix matching sends /admin/users/<name> here */
-    ok &= zdb_http_add_handler(srv, "DELETE", "/admin/",
+    ok &= edb_http_add_handler(srv, "DELETE", "/admin/",
                                handle_admin_delete);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/settings",
+    ok &= edb_http_add_handler(srv, "GET", "/admin/settings",
                                handle_settings);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/settings",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/settings",
                                handle_settings);
-    ok &= zdb_http_add_handler(srv, "PUT", "/admin/settings",
+    ok &= edb_http_add_handler(srv, "PUT", "/admin/settings",
                                handle_settings);
-    ok &= zdb_http_add_handler(srv, "DELETE", "/admin/settings",
+    ok &= edb_http_add_handler(srv, "DELETE", "/admin/settings",
                                handle_settings);
-    ok &= zdb_http_add_handler(srv, "GET", "/status", handle_status);
-    ok &= zdb_http_add_handler(srv, "GET", "/admin/console/state",
+    ok &= edb_http_add_handler(srv, "GET", "/status", handle_status);
+    ok &= edb_http_add_handler(srv, "GET", "/admin/console/state",
                                handle_console_state);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/login",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/login",
                                handle_admin_login);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/setup",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/setup",
                                handle_admin_setup);
-    ok &= zdb_http_add_handler(srv, "POST", "/admin/logout",
+    ok &= edb_http_add_handler(srv, "POST", "/admin/logout",
                                handle_admin_logout);
     return ok;
 }

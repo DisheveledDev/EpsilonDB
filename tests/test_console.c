@@ -158,7 +158,7 @@ int main(int argc, char **argv)
     char *body = NULL;
     int s = http_request("GET", "/admin", NULL, NULL, &body);
     CHECK(s == 200);
-    CHECK(body_has(body, "<html") && body_has(body, "ZestyDB Admin"));
+    CHECK(body_has(body, "<html") && body_has(body, "EpsilonDB Admin"));
 
     /* first-time state: no admin yet */
     s = http_request("GET", "/admin/console/state", NULL, NULL, &body);

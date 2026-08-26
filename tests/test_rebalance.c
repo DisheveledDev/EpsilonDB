@@ -3,9 +3,9 @@
  * Covers, on top of 6a/6c:
  *   - gossip-based compliance: a node marking itself compliant is visible
  *     to the leader, which then promotes the pending target automatically
- *     (no manual zdb_cluster_promote_target call).
- *   - the engine shard GC primitive (zdb_shard_gc) and the cluster-level
- *     zdb_cluster_gc_redundant (removes a shard no longer owned by this
+ *     (no manual edb_cluster_promote_target call).
+ *   - the engine shard GC primitive (edb_shard_gc) and the cluster-level
+ *     edb_cluster_gc_redundant (removes a shard no longer owned by this
  *     node, never the reserved __system__ config shards).
  *
  * Plain assert-style harness like test_replication. */
@@ -16,9 +16,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../src/engine/zesty_config.h"
-#include "../src/socket/zesty_cluster.h"
-#include "../src/socket/zesty_repl.h"
+#include "../src/engine/epsilon_config.h"
+#include "../src/socket/epsilon_cluster.h"
+#include "../src/socket/epsilon_repl.h"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -33,10 +33,10 @@ static int g_failures = 0;
     } while (0)
 
 typedef struct {
-    zdb_engine *engine;
-    zdb_config *cfg;
-    zdb_cluster *cluster;
-    zdb_repl *repl;
+    edb_engine *engine;
+    edb_config *cfg;
+    edb_cluster *cluster;
+    edb_repl *repl;
     char dir[256];
 } node;
 
@@ -72,14 +72,14 @@ static bool test_apply_change(void *ud, const cJSON *change)
         long long ttl_abs = cJSON_IsNumber(jttl)
                                 ? (long long)jttl->valuedouble
                                 : -1;
-        bool ok = zdb_replica_put(n->engine, jpart->valuestring,
+        bool ok = edb_replica_put(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring,
                                   value_json, ttl_abs, ts);
         free(value_json);
         return ok;
     }
     if (strcmp(jop->valuestring, "delete") == 0) {
-        return zdb_replica_delete(n->engine, jpart->valuestring,
+        return edb_replica_delete(n->engine, jpart->valuestring,
                                   jks->valuestring, jid->valuestring, ts);
     }
     return false;
@@ -102,7 +102,7 @@ static cJSON *test_read_request(void *ud, const cJSON *request)
         return NULL;
     }
     if (strcmp(jq->valuestring, "all_ts") == 0) {
-        cJSON *rows = zdb_all_ts(n->engine, jpart->valuestring,
+        cJSON *rows = edb_all_ts(n->engine, jpart->valuestring,
                                  jks->valuestring, NULL);
         cJSON_AddItemToObject(out, "rows", rows ? rows
                                                 : cJSON_CreateArray());
@@ -121,21 +121,21 @@ static void node_start(node *n, const char *dir, int port)
     if (system(cmd) != 0) {
         /* best effort */
     }
-    n->engine = zdb_engine_open(dir);
-    n->cfg = zdb_config_open(n->engine);
-    char id[ZDB_NODE_ID_MAX];
-    n->cluster = zdb_cluster_start(n->cfg, "127.0.0.1", port, id);
-    n->repl = zdb_repl_start(n->cluster, n->cfg, dir);
-    zdb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
+    n->engine = edb_engine_open(dir);
+    n->cfg = edb_config_open(n->engine);
+    char id[EDB_NODE_ID_MAX];
+    n->cluster = edb_cluster_start(n->cfg, "127.0.0.1", port, id);
+    n->repl = edb_repl_start(n->cluster, n->cfg, dir);
+    edb_repl_set_handlers(n->repl, test_apply_change, test_read_request,
                           n);
 }
 
 static void node_stop(node *n)
 {
-    zdb_repl_stop(n->repl);
-    zdb_cluster_stop(n->cluster);
-    zdb_config_close(n->cfg);
-    zdb_engine_close(n->engine);
+    edb_repl_stop(n->repl);
+    edb_cluster_stop(n->cluster);
+    edb_config_close(n->cfg);
+    edb_engine_close(n->engine);
     n->repl = NULL;
     n->cluster = NULL;
     n->cfg = NULL;
@@ -174,10 +174,10 @@ typedef struct {
     size_t want;
 } converge_ctx;
 
-static size_t online_peers(zdb_cluster *cl)
+static size_t online_peers(edb_cluster *cl)
 {
-    zdb_peer_info peers[16];
-    size_t n = zdb_cluster_peers(cl, peers, 16);
+    edb_peer_info peers[16];
+    size_t n = edb_cluster_peers(cl, peers, 16);
     size_t online = 0;
     for (size_t i = 0; i < n; i++) {
         if (peers[i].online) {
@@ -210,13 +210,13 @@ typedef struct {
  * the final wave is promoted automatically via gossiped compliance. */
 static void complete_wave(node *nodes[], size_t n)
 {
-    const char *lid = zdb_cluster_leader(nodes[0]->cluster);
+    const char *lid = edb_cluster_leader(nodes[0]->cluster);
     if (!lid) {
         return;
     }
     node *leader = NULL;
     for (size_t i = 0; i < n; i++) {
-        if (strcmp(lid, zdb_cluster_self_id(nodes[i]->cluster)) == 0) {
+        if (strcmp(lid, edb_cluster_self_id(nodes[i]->cluster)) == 0) {
             leader = nodes[i];
             break;
         }
@@ -226,14 +226,14 @@ static void complete_wave(node *nodes[], size_t n)
     }
     char val[32];
     snprintf(val, sizeof(val), "%lld",
-             zdb_cluster_target_generation(leader->cluster));
+             edb_cluster_target_generation(leader->cluster));
     for (size_t i = 0; i < n; i++) {
         char dn[96];
         snprintf(dn, sizeof(dn), "rebalance.done.%.63s",
-                 zdb_cluster_self_id(nodes[i]->cluster));
-        zdb_setting_set(leader->cfg, dn, val);
+                 edb_cluster_self_id(nodes[i]->cluster));
+        edb_setting_set(leader->cfg, dn, val);
     }
-    zdb_cluster_promote_target(leader->cluster);
+    edb_cluster_promote_target(leader->cluster);
     settle();
 }
 
@@ -245,19 +245,19 @@ static bool promoted(void *ctxp)
     if (p->n == 0) {
         return false;
     }
-    long long gen = zdb_cluster_generation(p->nodes[0]->cluster);
+    long long gen = edb_cluster_generation(p->nodes[0]->cluster);
     if (gen == 0) {
         return false;
     }
-    zdb_range_info r[8];
+    edb_range_info r[8];
     for (size_t i = 0; i < p->n; i++) {
-        if (zdb_cluster_generation(p->nodes[i]->cluster) != gen) {
+        if (edb_cluster_generation(p->nodes[i]->cluster) != gen) {
             return false;
         }
-        if (zdb_cluster_target_generation(p->nodes[i]->cluster) != 0) {
+        if (edb_cluster_target_generation(p->nodes[i]->cluster) != 0) {
             return false;
         }
-        if (zdb_cluster_ranges(p->nodes[i]->cluster, r, 8) !=
+        if (edb_cluster_ranges(p->nodes[i]->cluster, r, 8) !=
             p->want_slices) {
             return false;
         }
@@ -276,53 +276,53 @@ int main(void)
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
         system(cmd);
-        zdb_engine *e = zdb_engine_open(dir);
+        edb_engine *e = edb_engine_open(dir);
         CHECK(e != NULL);
-        CHECK(zdb_put(e, "main", "kv", "id-0", "{\"n\":0}", -1));
-        CHECK(zdb_put(e, "other", "docs", "d-0", "{\"d\":0}", -1));
+        CHECK(edb_put(e, "main", "kv", "id-0", "{\"n\":0}", -1));
+        CHECK(edb_put(e, "other", "docs", "d-0", "{\"d\":0}", -1));
 
         char keys[8][33];
-        size_t nk = zdb_engine_shard_keys(e, keys, 8);
+        size_t nk = edb_engine_shard_keys(e, keys, 8);
         CHECK(nk == 2);
 
         char key[33];
         char path[1024];
-        CHECK(zdb_shard_path(e, "main", "kv", path, sizeof(path), key));
-        CHECK(zdb_shard_gc(e, key));
+        CHECK(edb_shard_path(e, "main", "kv", path, sizeof(path), key));
+        CHECK(edb_shard_gc(e, key));
         /* the handle is gone and the file removed */
-        CHECK(zdb_shard_is_open(e, "main", "kv") == false);
+        CHECK(edb_shard_is_open(e, "main", "kv") == false);
         struct stat st;
         CHECK(stat(path, &st) != 0);
         /* the other shard is untouched */
-        CHECK(zdb_get(e, "other", "docs", "d-0") != NULL);
+        CHECK(edb_get(e, "other", "docs", "d-0") != NULL);
 
-        zdb_engine_close(e);
+        edb_engine_close(e);
     }
 
     /* --- integration: 3 stable nodes, then a 4th joins ---------------- */
     node a, b, c, d;
     snprintf(dir, sizeof(dir), "tests/data/rebalance/a");
     node_start(&a, dir, port_base);
-    zdb_cluster_set_auto_compliant(a.cluster, false);
-    zdb_database_create(a.cfg, "app", 2);
+    edb_cluster_set_auto_compliant(a.cluster, false);
+    edb_database_create(a.cfg, "app", 2);
 
     snprintf(dir, sizeof(dir), "tests/data/rebalance/b");
     node_start(&b, dir, port_base + 1);
-    zdb_cluster_set_auto_compliant(b.cluster, false);
-    zdb_database_create(b.cfg, "app", 2);
+    edb_cluster_set_auto_compliant(b.cluster, false);
+    edb_database_create(b.cfg, "app", 2);
 
     snprintf(dir, sizeof(dir), "tests/data/rebalance/c");
     node_start(&c, dir, port_base + 2);
-    zdb_cluster_set_auto_compliant(c.cluster, false);
-    zdb_database_create(c.cfg, "app", 2);
+    edb_cluster_set_auto_compliant(c.cluster, false);
+    edb_database_create(c.cfg, "app", 2);
 
-    CHECK(zdb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
+    CHECK(edb_cluster_join(b.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc2 = { { &a, &b, NULL, NULL }, 2 };
     CHECK(wait_for(15, mesh_converged, &cc2));
     settle();
     complete_wave((node *[]){ &a, &b }, 2);
 
-    CHECK(zdb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
+    CHECK(edb_cluster_join(c.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc3 = { { &a, &b, &c, NULL }, 3 };
     CHECK(wait_for(15, mesh_converged, &cc3));
     settle();
@@ -332,7 +332,7 @@ int main(void)
     {
         bool cleared = false;
         for (int i = 0; i < 100 && !cleared; i++) {
-            cleared = zdb_cluster_target_generation(a.cluster) == 0;
+            cleared = edb_cluster_target_generation(a.cluster) == 0;
             if (!cleared) {
                 usleep(100 * 1000);
             }
@@ -349,7 +349,7 @@ int main(void)
         snprintf(value, sizeof(value), "{\"n\":%d}", i);
         build_put(change, sizeof(change), "app", "main", "kv", id,
                   (long long)time(NULL), value);
-        CHECK(zdb_repl_write(a.repl, "app", change) == ZDB_REPL_OK);
+        CHECK(edb_repl_write(a.repl, "app", change) == EDB_REPL_OK);
     }
 
     /* --- join a 4th node; it catches up and everyone reports compliant
@@ -357,16 +357,16 @@ int main(void)
      * the test has driven the catch-up explicitly) */
     snprintf(dir, sizeof(dir), "tests/data/rebalance/d");
     node_start(&d, dir, port_base + 3);
-    zdb_cluster_set_auto_compliant(d.cluster, false);
-    zdb_database_create(d.cfg, "app", 2);
-    CHECK(zdb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
+    edb_cluster_set_auto_compliant(d.cluster, false);
+    edb_database_create(d.cfg, "app", 2);
+    CHECK(edb_cluster_join(d.cluster, "127.0.0.1", port_base) == 0);
     converge_ctx cc4 = { { &a, &b, &c, &d }, 4 };
     CHECK(wait_for(15, mesh_converged, &cc4));
     settle();
     {
         bool pending = false;
         for (int i = 0; i < 100 && !pending; i++) {
-            pending = zdb_cluster_target_generation(a.cluster) > 0;
+            pending = edb_cluster_target_generation(a.cluster) > 0;
             if (!pending) {
                 usleep(100 * 1000);
             }
@@ -375,17 +375,17 @@ int main(void)
     }
 
     /* d catches up the moved shard from its live owner */
-    CHECK(zdb_repl_catchup(d.repl, "127.0.0.1", port_base, "main", "kv"));
-    zdb_cluster_set_auto_compliant(d.cluster, true);
+    CHECK(edb_repl_catchup(d.repl, "127.0.0.1", port_base, "main", "kv"));
+    edb_cluster_set_auto_compliant(d.cluster, true);
 
     /* every node reports compliance (d caught up; a/b/c were current) */
-    zdb_cluster_set_auto_compliant(a.cluster, true);
-    zdb_cluster_set_auto_compliant(b.cluster, true);
-    zdb_cluster_set_auto_compliant(c.cluster, true);
-    zdb_cluster_mark_compliant(a.cluster);
-    zdb_cluster_mark_compliant(b.cluster);
-    zdb_cluster_mark_compliant(c.cluster);
-    zdb_cluster_mark_compliant(d.cluster);
+    edb_cluster_set_auto_compliant(a.cluster, true);
+    edb_cluster_set_auto_compliant(b.cluster, true);
+    edb_cluster_set_auto_compliant(c.cluster, true);
+    edb_cluster_mark_compliant(a.cluster);
+    edb_cluster_mark_compliant(b.cluster);
+    edb_cluster_mark_compliant(c.cluster);
+    edb_cluster_mark_compliant(d.cluster);
 
     /* --- automatic promotion via gossiped compliance ----------------- */
     promote_view pv = { { &a, &b, &c, &d }, 4, 4 };
@@ -395,24 +395,24 @@ int main(void)
     /* rebalance lock released by promotion (the lock lives in the
      * leader's own settings store) */
     {
-        const char *lid = zdb_cluster_leader(a.cluster);
+        const char *lid = edb_cluster_leader(a.cluster);
         node *leader = NULL;
-        if (lid && strcmp(lid, zdb_cluster_self_id(a.cluster)) == 0) {
+        if (lid && strcmp(lid, edb_cluster_self_id(a.cluster)) == 0) {
             leader = &a;
         } else if (lid &&
-                   strcmp(lid, zdb_cluster_self_id(b.cluster)) == 0) {
+                   strcmp(lid, edb_cluster_self_id(b.cluster)) == 0) {
             leader = &b;
         } else if (lid &&
-                   strcmp(lid, zdb_cluster_self_id(c.cluster)) == 0) {
+                   strcmp(lid, edb_cluster_self_id(c.cluster)) == 0) {
             leader = &c;
         } else if (lid &&
-                   strcmp(lid, zdb_cluster_self_id(d.cluster)) == 0) {
+                   strcmp(lid, edb_cluster_self_id(d.cluster)) == 0) {
             leader = &d;
         }
         CHECK(leader != NULL);
         if (leader) {
             char *lock =
-                zdb_setting_get(leader->cfg, "cluster.rebalance_lock");
+                edb_setting_get(leader->cfg, "cluster.rebalance_lock");
             CHECK(lock == NULL);
             free(lock);
         }
@@ -422,21 +422,21 @@ int main(void)
     {
         char key[33];
         char path[1024];
-        CHECK(zdb_shard_path(a.engine, "main", "kv", path, sizeof(path),
+        CHECK(edb_shard_path(a.engine, "main", "kv", path, sizeof(path),
                              key));
-        const char *owner = zdb_cluster_owner(a.cluster, key);
+        const char *owner = edb_cluster_owner(a.cluster, key);
         CHECK(owner != NULL);
         node *holder = NULL;
-        if (strcmp(owner, zdb_cluster_self_id(a.cluster)) == 0) {
+        if (strcmp(owner, edb_cluster_self_id(a.cluster)) == 0) {
             holder = &a;
-        } else if (strcmp(owner, zdb_cluster_self_id(b.cluster)) == 0) {
+        } else if (strcmp(owner, edb_cluster_self_id(b.cluster)) == 0) {
             holder = &b;
-        } else if (strcmp(owner, zdb_cluster_self_id(c.cluster)) == 0) {
+        } else if (strcmp(owner, edb_cluster_self_id(c.cluster)) == 0) {
             holder = &c;
         } else {
             holder = &d;
         }
-        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL);
+        cJSON *all = edb_all_ts(holder->engine, "main", "kv", NULL);
         CHECK(all && cJSON_GetArraySize(all) == 100);
         cJSON_Delete(all);
     }
@@ -445,31 +445,31 @@ int main(void)
     {
         char key[33];
         char path[1024];
-        CHECK(zdb_shard_path(a.engine, "main", "kv", path, sizeof(path),
+        CHECK(edb_shard_path(a.engine, "main", "kv", path, sizeof(path),
                              key));
-        const char *owner = zdb_cluster_owner(a.cluster, key);
+        const char *owner = edb_cluster_owner(a.cluster, key);
         CHECK(owner != NULL);
 
         node *nodes[] = { &a, &b, &c, &d };
-        char holders[4][ZDB_NODE_ID_MAX];
-        size_t holder_count = zdb_cluster_holders(a.cluster, key, holders, 4);
+        char holders[4][EDB_NODE_ID_MAX];
+        size_t holder_count = edb_cluster_holders(a.cluster, key, holders, 4);
         node *victim = NULL;
         for (size_t i = 0; i < 4 && !victim; i++) {
             bool holder_node = false;
             for (size_t h = 0; h < holder_count && h < 2; h++) {
-                if (strcmp(zdb_cluster_self_id(nodes[i]->cluster),
+                if (strcmp(edb_cluster_self_id(nodes[i]->cluster),
                            holders[h]) == 0) {
                     holder_node = true;
                 }
             }
-            cJSON *copy = zdb_get(nodes[i]->engine, "main", "kv", "id-0000");
+            cJSON *copy = edb_get(nodes[i]->engine, "main", "kv", "id-0000");
             if (!holder_node && copy) {
                 victim = nodes[i];
             }
             cJSON_Delete(copy);
         }
         CHECK(victim != NULL);
-        CHECK(zdb_cluster_gc_redundant(victim->cluster) >= 1);
+        CHECK(edb_cluster_gc_redundant(victim->cluster) >= 1);
 
         /* the file is gone from the victim */
         char vpath[1024];
@@ -479,21 +479,21 @@ int main(void)
 
         /* data still safe on the owner */
         node *holder = NULL;
-        if (strcmp(owner, zdb_cluster_self_id(a.cluster)) == 0) {
+        if (strcmp(owner, edb_cluster_self_id(a.cluster)) == 0) {
             holder = &a;
-        } else if (strcmp(owner, zdb_cluster_self_id(b.cluster)) == 0) {
+        } else if (strcmp(owner, edb_cluster_self_id(b.cluster)) == 0) {
             holder = &b;
-        } else if (strcmp(owner, zdb_cluster_self_id(c.cluster)) == 0) {
+        } else if (strcmp(owner, edb_cluster_self_id(c.cluster)) == 0) {
             holder = &c;
         } else {
             holder = &d;
         }
-        cJSON *all = zdb_all_ts(holder->engine, "main", "kv", NULL);
+        cJSON *all = edb_all_ts(holder->engine, "main", "kv", NULL);
         CHECK(all && cJSON_GetArraySize(all) == 100);
         cJSON_Delete(all);
 
         /* the victim's own config (system shards) is intact */
-        char *ranges = zdb_setting_get(victim->cfg, "cluster.ranges");
+        char *ranges = edb_setting_get(victim->cfg, "cluster.ranges");
         CHECK(ranges != NULL);
         free(ranges);
     }

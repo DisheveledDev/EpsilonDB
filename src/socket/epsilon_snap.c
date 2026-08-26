@@ -1,4 +1,4 @@
-/* zesty_snap.c - stage 6b shard snapshot transfer. See zesty_snap.h.
+/* epsilon_snap.c - stage 6b shard snapshot transfer. See epsilon_snap.h.
  *
  * Transport: a dedicated short-lived peer connection per snapshot,
  * mirroring the replication layer's one-shot RPC style:
@@ -15,11 +15,11 @@
  * Receiver side: bytes land in "<key>.sqlite.incoming" and are renamed
  * over the live path only after the full transfer arrived. The engine's
  * cached handle is invalidated afterwards so subsequent reads reopen
- * from disk; zdb_shard_invalidate runs PRAGMA integrity_check on the
+ * from disk; edb_shard_invalidate runs PRAGMA integrity_check on the
  * result and reports failure through ok:false in the final ack.
  */
 
-#include "zesty_snap.h"
+#include "epsilon_snap.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -34,9 +34,9 @@
 #include <unistd.h>
 
 #include "../../vendor/cjson/cJSON.h"
-#include "../engine/zesty_engine.h"
+#include "../engine/epsilon_engine.h"
 #include "../sqlite/sqlite3.h"
-#include "zstp_wire.h"
+#include "estp_wire.h"
 
 #define SNAP_CONNECT_TIMEOUT_MS 1500
 #define SNAP_IO_DEADLINE_MS    60000
@@ -159,8 +159,8 @@ done:
     return rc;
 }
 
-void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
-                    zdb_engine *engine)
+void edb_snap_serve(int fd, uint32_t payload_len, const char *payload,
+                    edb_engine *engine)
 {
     cJSON *req = payload ? cJSON_ParseWithLength(payload, payload_len)
                          : NULL;
@@ -177,7 +177,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
     char tmp[1100] = "";
 
     do {
-        const char *dir = zdb_engine_path(engine);
+        const char *dir = edb_engine_path(engine);
         if (!engine || !key || !dir) {
             break;
         }
@@ -222,7 +222,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         char *meta_str = json_print(meta);
         cJSON_Delete(meta);
         if (!meta_str ||
-            zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, meta_str,
+            estp_send_frame_raw(fd, ESTP_SNAP_ACK, meta_str,
                                 strlen(meta_str), NULL) != 0) {
             free(meta_str);
             fclose(f);
@@ -231,13 +231,13 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         free(meta_str);
         ok = true;
 
-        static _Thread_local unsigned char chunk[ZSTP_MAX_PAYLOAD];
+        static _Thread_local unsigned char chunk[ESTP_MAX_PAYLOAD];
         for (;;) {
             size_t n = fread(chunk, 1, sizeof(chunk), f);
             if (n == 0) {
                 break;
             }
-            if (zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, chunk, n, NULL) != 0) {
+            if (estp_send_frame_raw(fd, ESTP_SNAP_DATA, chunk, n, NULL) != 0) {
                 ok = false;
                 break;
             }
@@ -248,7 +248,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         fclose(f);
 
         /* EOF marker terminates the data stream */
-        sent_eof = zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, NULL, 0, NULL) == 0;
+        sent_eof = estp_send_frame_raw(fd, ESTP_SNAP_DATA, NULL, 0, NULL) == 0;
         ok = ok && sent_eof;
         unlink(tmp);
         tmp[0] = '\0';
@@ -261,9 +261,9 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
      * and an EOF marker before the final acknowledgement */
     if (ok && !sent_eof) {
         const char *meta = "{\"ok\":true,\"size\":0}";
-        ok = zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, meta, strlen(meta),
+        ok = estp_send_frame_raw(fd, ESTP_SNAP_ACK, meta, strlen(meta),
                                  NULL) == 0 &&
-             zstp_send_frame_raw(fd, ZSTP_SNAP_DATA, NULL, 0, NULL) == 0;
+             estp_send_frame_raw(fd, ESTP_SNAP_DATA, NULL, 0, NULL) == 0;
     }
 
     cJSON *ack = cJSON_CreateObject();
@@ -272,7 +272,7 @@ void zdb_snap_serve(int fd, uint32_t payload_len, const char *payload,
         char *ack_str = json_print(ack);
         cJSON_Delete(ack);
         if (ack_str) {
-            zstp_send_frame_raw(fd, ZSTP_SNAP_ACK, ack_str, strlen(ack_str),
+            estp_send_frame_raw(fd, ESTP_SNAP_ACK, ack_str, strlen(ack_str),
                                 NULL);
             free(ack_str);
         }
@@ -290,7 +290,7 @@ static int snap_fetch(const char *addr, int port, const char key[33],
         return -1;
     }
 
-    int fd = zstp_dial(addr, port);
+    int fd = estp_dial(addr, port);
     if (fd < 0) {
         return -1;
     }
@@ -315,7 +315,7 @@ static int snap_fetch(const char *addr, int port, const char key[33],
     char *hello_str = json_print(hello);
     cJSON_Delete(hello);
     if (!hello_str ||
-        zstp_send_frame(fd, ZSTP_HELLO, hello_str, NULL) != 0) {
+        estp_send_frame(fd, ESTP_HELLO, hello_str, NULL) != 0) {
         free(hello_str);
         goto done;
     }
@@ -329,7 +329,7 @@ static int snap_fetch(const char *addr, int port, const char key[33],
     cJSON_AddBoolToObject(req, "allow_missing", allow_missing);
     char *req_str = json_print(req);
     cJSON_Delete(req);
-    if (!req_str || zstp_send_frame(fd, ZSTP_SNAP_REQ, req_str, NULL) != 0) {
+    if (!req_str || estp_send_frame(fd, ESTP_SNAP_REQ, req_str, NULL) != 0) {
         free(req_str);
         goto done;
     }
@@ -358,16 +358,16 @@ static int snap_fetch(const char *addr, int port, const char key[33],
         }
         char *frame = NULL;
         uint32_t frame_len = 0;
-        int type = zstp_recv_frame_raw(fd, &frame, &frame_len);
+        int type = estp_recv_frame_raw(fd, &frame, &frame_len);
         if (type < 0) {
             free(frame);
             goto done;
         }
-        if (!metadata_seen && (type == ZSTP_HELLO || type == ZSTP_STATE)) {
+        if (!metadata_seen && (type == ESTP_HELLO || type == ESTP_STATE)) {
             free(frame);
             continue;
         }
-        if (type == ZSTP_SNAP_ACK) {
+        if (type == ESTP_SNAP_ACK) {
             cJSON *ack = frame ? cJSON_Parse(frame) : NULL;
             free(frame);
             const cJSON *ok = ack
@@ -397,7 +397,7 @@ static int snap_fetch(const char *addr, int port, const char key[33],
             cJSON_Delete(ack);
             break;
         }
-        if (type != ZSTP_SNAP_DATA || !metadata_seen || eof_seen ||
+        if (type != ESTP_SNAP_DATA || !metadata_seen || eof_seen ||
             (frame_len > 0 && !frame) ||
             received_size > expected_size ||
             (uint64_t)frame_len > expected_size - received_size) {
@@ -434,13 +434,13 @@ done:
     return rc;
 }
 
-int zdb_snap_fetch(const char *addr, int port, const char key[33],
+int edb_snap_fetch(const char *addr, int port, const char key[33],
                    const char *dest_dir)
 {
     return snap_fetch(addr, port, key, dest_dir, true);
 }
 
-int zdb_snap_fetch_required(const char *addr, int port, const char key[33],
+int edb_snap_fetch_required(const char *addr, int port, const char key[33],
                             const char *dest_dir)
 {
     return snap_fetch(addr, port, key, dest_dir, false);

@@ -126,7 +126,7 @@ static void sha256_final(sha256_ctx *ctx, uint8_t out[32])
     }
 }
 
-void zdb_sha256(const void *data, size_t len, uint8_t out[32])
+void edb_sha256(const void *data, size_t len, uint8_t out[32])
 {
     sha256_ctx ctx;
     sha256_init(&ctx);
@@ -134,10 +134,10 @@ void zdb_sha256(const void *data, size_t len, uint8_t out[32])
     sha256_final(&ctx, out);
 }
 
-char *zdb_sha256_hex(const void *data, size_t len, char out[65])
+char *edb_sha256_hex(const void *data, size_t len, char out[65])
 {
     uint8_t digest[32];
-    zdb_sha256(data, len, digest);
+    edb_sha256(data, len, digest);
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) {
         out[i * 2] = hex[digest[i] >> 4];

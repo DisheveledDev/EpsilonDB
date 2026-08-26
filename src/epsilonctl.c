@@ -1,10 +1,10 @@
-/* zestyctl - ZestyDB command line client.
+/* epsilonctl - EpsilonDB command line client.
  *
  * Connects to a node's HTTP endpoint and issues admin/data requests.
  *
- * Usage: zestyctl [-s socket] | [-h host] [-p port] [-u user] <command> [args...]
+ * Usage: epsilonctl [-s socket] | [-h host] [-p port] [-u user] <command> [args...]
  *
- * By default zestyctl connects to the server's local admin socket (no
+ * By default epsilonctl connects to the server's local admin socket (no
  * authentication; treated as admin). Pass -h/-p to talk to a remote node's
  * HTTP port instead, in which case -u is required for privileged commands.
  *
@@ -33,7 +33,7 @@
  * A body argument of "-" reads JSON from stdin (CLI mode only).
  * Mask 0 = allow all groups.
  *
- * Running zestyctl with no command opens a full-screen interactive
+ * Running epsilonctl with no command opens a full-screen interactive
  * console (alternate screen, nano-style): ASCII banner with a live
  * server info panel, colour-coded tabular query output, a command bar
  * at the bottom with ^X/^L/^C/arrow-key editing and command history.
@@ -65,7 +65,7 @@
 #include "../vendor/cjson/cJSON.h"
 
 #define RESP_CAP (4 * 1024 * 1024)
-#define DEFAULT_ADMIN_SOCK "zesty-admin.sock"
+#define DEFAULT_ADMIN_SOCK "epsilon-admin.sock"
 
 static const char *g_host = NULL;      /* set => TCP HTTP mode */
 static int g_port = 8123;
@@ -120,8 +120,8 @@ static int http_request(const char *method, const char *path,
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             if (!g_quiet_stderr) {
                 fprintf(stderr,
-                        "zestyctl: cannot connect to admin socket '%s'\n"
-                        "(is zestyd running here? use -h/-p for a remote node)\n",
+                        "epsilonctl: cannot connect to admin socket '%s'\n"
+                        "(is epsilond running here? use -h/-p for a remote node)\n",
                         g_sockpath);
             }
             close(fd);
@@ -137,14 +137,14 @@ static int http_request(const char *method, const char *path,
         addr.sin_port = htons((uint16_t)g_port);
         if (inet_pton(AF_INET, g_host, &addr.sin_addr) != 1) {
             if (!g_quiet_stderr) {
-                fprintf(stderr, "zestyctl: invalid host '%s'\n", g_host);
+                fprintf(stderr, "epsilonctl: invalid host '%s'\n", g_host);
             }
             close(fd);
             return -1;
         }
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             if (!g_quiet_stderr) {
-                fprintf(stderr, "zestyctl: cannot connect to %s:%d\n", g_host,
+                fprintf(stderr, "epsilonctl: cannot connect to %s:%d\n", g_host,
                         g_port);
             }
             close(fd);
@@ -635,7 +635,7 @@ static int run(const char *method, const char *path, const char *body)
 static void print_usage(void)
 {
     static const char *lines[] = {
-        "usage: zestyctl [-s socket] | [-h host -p port -u user]",
+        "usage: epsilonctl [-s socket] | [-h host -p port -u user]",
         "                <command> [args...]",
         "",
         "server:",
@@ -664,13 +664,13 @@ static void print_usage(void)
         "  ids <db>/<partition>/<keyspace> [--filter <json>]...",
         "  query <db>/<partition>/<keyspace> [--filter <json>]...",
         "",
-        "cluster (requires zestyd -n <peer_port>):",
+        "cluster (requires epsilond -n <peer_port>):",
         "  join node <addr> <port> [secret]   join an existing mesh via seed",
         "  remove node <id>                  tombstone a node + re-shard",
         "  list nodes | cluster        membership, leader and ranges",
         "",
         "performance:",
-        "  bench [records] [replication_factor] [cache_size] [journal_mode]",
+        "  bench [records] [replication_factor] [cache_size] [journal_mode] [threads]",
         NULL,
     };
     for (int i = 0; lines[i]; i++) {
@@ -816,10 +816,15 @@ static int execute_command(int argc, char **argv)
         }
         long cache = argi + 2 < argc ? strtol(argv[argi + 2], NULL, 10) : 0;
         const char *journal = argi + 3 < argc ? argv[argi + 3] : "TRUNCATE";
+        long threads = argi + 4 < argc ? strtol(argv[argi + 4], NULL, 10) : 0;
+        if (threads < 0) {
+            threads = 0;
+        }
         snprintf(body, sizeof(body),
                  "{\"records\":%ld,\"replication_factor\":%ld,"
-                 "\"cache_size\":%ld,\"journal_mode\":\"%s\"}",
-                 records, rf, cache, journal);
+                 "\"cache_size\":%ld,\"journal_mode\":\"%s\","
+                 "\"threads\":%ld}",
+                 records, rf, cache, journal, threads);
         return run("POST", "/admin/benchmark", body);
     }
 
@@ -1013,7 +1018,7 @@ static int execute_command(int argc, char **argv)
         if (strcmp(cmd, "put") == 0) {
             char *doc = body_from_arg(argi < argc ? argv[argi] : "-");
             if (!doc) {
-                out_line("zestyctl: no document supplied");
+                out_line("epsilonctl: no document supplied");
                 return 1;
             }
             size_t length = strlen(path);
@@ -1050,7 +1055,7 @@ static int execute_command(int argc, char **argv)
         char *body = build_filter_body(filters, filter_count);
         free((void *)filters);
         if (filter_count > 0 && !body) {
-            out_line("zestyctl: each --filter must be a JSON object");
+            out_line("epsilonctl: each --filter must be a JSON object");
             return 1;
         }
         const char *method = filter_count > 0 || strcmp(cmd, "query") == 0
@@ -1438,7 +1443,7 @@ static void shell_loop(void)
     int hist_pos = -1;   /* -1 = editing fresh input */
 
     if (!isatty(STDIN_FILENO) || !enable_raw_mode()) {
-        fprintf(stderr, "zestyctl: interactive console requires a "
+        fprintf(stderr, "epsilonctl: interactive console requires a "
                         "terminal\n");
         return;
     }
@@ -1452,7 +1457,7 @@ static void shell_loop(void)
 
     printf("\033[?1049h\033[H\033[2J");   /* alternate screen buffer */
 
-    sb_push(&sb, "\033[1;36mZestyDB console\033[0m - type help for"
+    sb_push(&sb, "\033[1;36mEpsilonDB console\033[0m - type help for"
                  " commands, CTRL+X exits");
     refresh_server_info();
 
