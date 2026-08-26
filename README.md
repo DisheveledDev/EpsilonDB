@@ -212,23 +212,41 @@ The server writes a timestamped log to `/var/log/epsilondb/epsilondb.log`
 server falls back to logging on the console. The log is rotated once per
 day (renamed with a date suffix and gzip-compressed).
 
-## Installing as a service (macOS)
+## Installing as a service (Linux / macOS)
 
-`epsilonctl install` walks you through the server parameters and writes a
-`launchd` agent (`~/Library/LaunchAgents/com.epsilondb.server.plist`):
+`epsilonctl install` walks you through the server parameters, copies the
+built binaries (`epsilond`, `epsilonctl`, `epsilonbkup`, `epsilonbench`)
+into `/usr/bin` (falling back to `/usr/local/bin` when `/usr/bin` is not
+writable), and installs a service that runs the installed `epsilond`:
 
     bin/epsilonctl install
 
+- **Linux**: writes `/etc/systemd/system/epsilon.service` and activates it
+  (`systemctl enable --now epsilon`). The unit passes the HTTP bind
+  address, ports and data path through to `epsilond`. The data directory
+  defaults to `/var/lib/epsilon` (created with mode 750); the log goes to
+  `/var/log/epsilondb/epsilondb.log`. Run as root (or via sudo) so the
+  unit can be written and started.
+- **macOS**: writes a `launchd` agent
+  (`~/Library/LaunchAgents/com.epsilondb.server.plist`); the data
+  directory defaults to `<cwd>/data`.
+
 It asks for the HTTP bind address, HTTP port, cluster peer port
 (0 = single node) and advertised address, then the data directory and log
-path. It reports which TCP ports to open in a firewall, how to run the
-service via `launchctl`, and offers to open the admin console in your
-browser. Run it again any time:
+path. The data-directory question defaults to `/var/lib/epsilon` on Linux,
+so the database files land in the standard system location; if you prefer
+to run `epsilond` manually without `-d`, the server creates `./data` in
+the current working directory. The installer reports which TCP ports to
+open in a firewall, how to manage the service, and offers to open the
+admin console in your browser. Rebuild and run it again any time to
+upgrade the installed binaries:
 
     bin/epsilonctl setup
 
-`setup` re-asks the same questions, rewrites the service file, and pushes
-the new parameters to the running server as settings (`server.bind`,
+`setup` re-asks the same questions, re-copies the rebuilt binaries over
+the installed ones (upgrading the service binary the unit points at),
+rewrites the service file (restarting `epsilon` on Linux), and pushes the
+new parameters to the running server as settings (`server.bind`,
 `server.http_port`, `server.peer_port`, `server.advertise`,
 `server.data_dir`, `server.log_path`) — restart the service afterwards so
 they take effect.

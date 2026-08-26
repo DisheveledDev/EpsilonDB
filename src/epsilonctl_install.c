@@ -3,10 +3,13 @@
  * see epsilonctl_internal.h.
  */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -121,15 +124,148 @@ static void launch_browser(const char *host, int port)
     }
 }
 
-/* Creates (or recreates) the local launchd service unit. `here` is the
- * directory containing the epsilond binary; the data dir defaults to
- * <here>/data when NULL. Returns true on success. */
-static bool install_launchd(const char *here, const char *bind, int port,
-                            int peer_port, const char *advertise,
-                            const char *data_dir, const char *log_path)
+/* Writes every byte of buf to fd, looping on partial writes. */
+static bool write_all(int fd, const void *buf, size_t len)
 {
-    char binpath[1024];
-    snprintf(binpath, sizeof(binpath), "%s/epsilond", here);
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
+/* Copies one file over another, replacing the destination (used to
+ * install/upgrade the binaries; the destination is made executable). */
+static bool copy_file_over(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY);
+    if (in < 0) {
+        return false;
+    }
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) {
+        close(in);
+        return false;
+    }
+    char buf[65536];
+    ssize_t n;
+    bool ok = true;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (!write_all(out, buf, (size_t)n)) {
+            ok = false;
+            break;
+        }
+    }
+    if (n < 0) {
+        ok = false;
+    }
+    fchmod(out, 0755);
+    close(out);
+    close(in);
+    return ok;
+}
+
+/* Locates the directory holding the built binaries, relative to the
+ * epsilonctl executable or the current directory. Fills `out`. */
+static void source_bin_dir(const char *argv0, char *out, size_t cap)
+{
+    char dir[1024] = ".";
+    if (argv0 && argv0[0] && strchr(argv0, '/')) {
+        snprintf(dir, sizeof(dir), "%s", argv0);
+        char *slash = strrchr(dir, '/');
+        if (slash == dir) {
+            snprintf(dir, sizeof(dir), "/");
+        } else if (slash) {
+            *slash = '\0';
+        }
+    }
+    static const char *const rels[] = { "bin", "../bin" };
+    for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
+        char cand[1100];
+        snprintf(cand, sizeof(cand), "%s/%s/epsilond", dir, rels[i]);
+        if (access(cand, R_OK) == 0) {
+            snprintf(out, cap, "%s/%s", dir, rels[i]);
+            return;
+        }
+    }
+    if (access("bin/epsilond", R_OK) == 0) {
+        snprintf(out, cap, "bin");
+        return;
+    }
+    snprintf(out, cap, "%s/bin", dir);
+}
+
+/* Installs (or upgrades) the built binaries to /usr/bin, falling back to
+ * /usr/local/bin when /usr/bin is not writable. Fills `prefix` with the
+ * chosen directory. Returns the number of binaries installed. */
+static int install_binaries(const char *src_dir, char *prefix, size_t cap)
+{
+    static const char *const names[] = { "epsilond", "epsilonctl",
+                                         "epsilonbkup", "epsilonbench" };
+    const char *chosen = NULL;
+    if (access("/usr/bin", W_OK) == 0) {
+        chosen = "/usr/bin";
+    } else if (access("/usr/local/bin", W_OK) == 0) {
+        chosen = "/usr/local/bin";
+    } else {
+        printf("  (neither /usr/bin nor /usr/local/bin is writable; "
+               "binaries stay in %s)\n", src_dir);
+        return 0;
+    }
+    snprintf(prefix, cap, "%s", chosen);
+    int installed = 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char src[1100], dst[1100];
+        snprintf(src, sizeof(src), "%s/%s", src_dir, names[i]);
+        snprintf(dst, sizeof(dst), "%s/%s", chosen, names[i]);
+        if (access(src, R_OK) != 0) {
+            continue;
+        }
+        if (copy_file_over(src, dst)) {
+            installed++;
+        } else {
+            printf("  could not install %s to %s\n", names[i], dst);
+        }
+    }
+    return installed;
+}
+
+/* The data directory the service should use. On Linux the system-wide
+ * location is /var/lib/epsilon; elsewhere it defaults to <cwd>/data (the
+ * server's own -d default creates ./data in the working directory). */
+static void default_data_dir(char *out, size_t cap, const char *here)
+{
+#ifdef __APPLE__
+    if (here && *here) {
+        snprintf(out, cap, "%s/data", here);
+    } else {
+        snprintf(out, cap, "./data");
+    }
+#else
+    (void)here;
+    snprintf(out, cap, "/var/lib/epsilon");
+#endif
+}
+
+#ifdef __APPLE__
+/* Creates (or recreates) the local launchd service unit. `here` is the
+ * working directory for the service and `binpath` the absolute path of
+ * the epsilond binary to run (usually the installed /usr/bin copy, so
+ * re-running install upgrades the service binary). Returns true on
+ * success. */
+static bool install_launchd(const char *here, const char *binpath,
+                            const char *bind, int port, int peer_port,
+                            const char *advertise, const char *data_dir,
+                            const char *log_path)
+{
     char data_elems[512];
     snprintf(data_elems, sizeof(data_elems),
              "    <string>-d</string><string>%s</string>\n", data_dir);
@@ -184,6 +320,110 @@ static bool install_launchd(const char *here, const char *bind, int port,
     return true;
 }
 
+#else
+/* Creates a directory if it does not exist yet. */
+static void ensure_dir(const char *path)
+{
+    if (mkdir(path, 0750) != 0 && errno != EEXIST) {
+        printf("  (could not create %s: %s)\n", path, strerror(errno));
+    }
+}
+
+/* Builds the systemd unit file text for the server. */
+static void systemd_unit_text(char *out, size_t cap, const char *binpath,
+                              const char *bind, int port, int peer_port,
+                              const char *advertise, const char *data_dir,
+                              const char *log_path)
+{
+    char peer_extra[256] = "";
+    if (peer_port > 0) {
+        snprintf(peer_extra, sizeof(peer_extra),
+                 "  -n %d -A %s\n", peer_port, advertise);
+    }
+    snprintf(out, cap,
+             "[Unit]\n"
+             "Description=EpsilonDB distributed key/value database server\n"
+             "After=network.target\n"
+             "\n"
+             "[Service]\n"
+             "Type=simple\n"
+             "ExecStart=%s -p %d -b %s -d %s -l %s\n"
+             "%s"
+             "Restart=always\n"
+             "RestartSec=3\n"
+             "\n"
+             "[Install]\n"
+             "WantedBy=multi-user.target\n",
+             binpath, port, bind, data_dir, log_path, peer_extra);
+}
+
+/* Writes and activates a systemd unit for the server. The unit passes
+ * the data path and all ports through to epsilond, so re-running install
+ * after a rebuild upgrades the running service. Returns true when the
+ * unit was written (activation may need privileges). */
+static bool install_systemd(const char *binpath, const char *bind, int port,
+                            int peer_port, const char *advertise,
+                            const char *data_dir, const char *log_path)
+{
+    ensure_dir(data_dir);
+    char logdir[1024];
+    snprintf(logdir, sizeof(logdir), "%s", log_path);
+    char *slash = strrchr(logdir, '/');
+    if (slash) {
+        *slash = '\0';
+        ensure_dir(logdir);
+    }
+
+    char unit[4096];
+    systemd_unit_text(unit, sizeof(unit), binpath, bind, port, peer_port,
+                      advertise, data_dir, log_path);
+
+    const char *path = "/etc/systemd/system/epsilon.service";
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        printf("  could not write %s (run as root?); unit file:\n%s\n",
+               path, unit);
+        printf("  activate with:\n");
+        printf("    sudo tee %s > /dev/null <<'EOF'\n%sEOF\n", path, unit);
+        printf("    sudo systemctl daemon-reload && "
+               "sudo systemctl enable --now epsilon\n");
+        return false;
+    }
+    fputs(unit, fp);
+    fclose(fp);
+    printf("  wrote %s\n", path);
+
+    if (system("systemctl daemon-reload >/dev/null 2>&1") != 0) {
+        printf("  (systemctl not available; enable manually with "
+               "`systemctl enable --now epsilon`)\n");
+        return true;
+    }
+    if (system("systemctl enable --now epsilon >/dev/null 2>&1") != 0) {
+        printf("  (could not enable/start the service; check "
+               "`systemctl status epsilon`)\n");
+        return true;
+    }
+    printf("  service enabled and started (systemctl status epsilon)\n");
+    return true;
+}
+
+#endif
+/* Platform service installer: launchd on macOS, systemd on Linux. */
+static bool install_service(const char *here, const char *binpath,
+                            const char *bind, int port, int peer_port,
+                            const char *advertise, const char *data_dir,
+                            const char *log_path)
+{
+#ifdef __APPLE__
+    return install_launchd(here, binpath, bind, port, peer_port, advertise,
+                           data_dir, log_path);
+#else
+    (void)here;
+    return install_systemd(binpath, bind, port, peer_port, advertise,
+                           data_dir, log_path);
+#endif
+}
+
 static const char *peer_arg_text(int peer_port, const char *advertise)
 {
     static char buf[160];
@@ -195,12 +435,12 @@ static const char *peer_arg_text(int peer_port, const char *advertise)
     return buf;
 }
 
-/* One-shot install: ask for the server parameters, write the launchd
- * service and report how to open ports / connect. */
+/* One-shot install: ask for the server parameters, copy the binaries to
+ * /usr/bin, write the launchd service and report how to open ports /
+ * connect. Re-running it (or setup) after a rebuild upgrades the
+ * installed binaries. */
 int cmd_install(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
     char bind[64] = "127.0.0.1";
     int port = 8123;
     int peer_port = 0;
@@ -224,9 +464,9 @@ int cmd_install(int argc, char **argv)
         snprintf(advertise, sizeof(advertise), "%s", bind);
     }
     if (getcwd(here, sizeof(here))) {
-        snprintf(data_dir, sizeof(data_dir), "%s/data", here);
+        default_data_dir(data_dir, sizeof(data_dir), here);
     } else {
-        snprintf(data_dir, sizeof(data_dir), "./data");
+        default_data_dir(data_dir, sizeof(data_dir), ".");
     }
     if (!ask_yes_no("Use the data directory", true)) {
         ask_addr("Data directory", data_dir, sizeof(data_dir), data_dir);
@@ -236,18 +476,41 @@ int cmd_install(int argc, char **argv)
         ask_addr("Log file path", log_path, sizeof(log_path), log_path);
     }
 
+    printf("\nInstalling the binaries...\n");
+    char src_dir[1024], prefix[64];
+    source_bin_dir(argc > 0 ? argv[0] : NULL, src_dir, sizeof(src_dir));
+    int installed = install_binaries(src_dir, prefix, sizeof(prefix));
+    if (installed > 0) {
+        printf("  installed %d binaries in %s\n", installed, prefix);
+    }
+
     printf("\nInstalling the service...\n");
-    if (!install_launchd(here, bind, port, peer_port, advertise,
+    char binpath[1024];
+    if (installed > 0) {
+        snprintf(binpath, sizeof(binpath), "%s/epsilond", prefix);
+    } else {
+        snprintf(binpath, sizeof(binpath), "%s/epsilond", src_dir);
+    }
+    if (!install_service(here, binpath, bind, port, peer_port, advertise,
                          data_dir, log_path)) {
         return 1;
     }
+#ifdef __APPLE__
     printf("  run it with:\n");
     printf("    launchctl load -w %s/Library/LaunchAgents/com.epsilondb.server.plist\n",
            getenv("HOME") ? getenv("HOME") : ".");
+#else
+    printf("  manage the service with:\n");
+    printf("    systemctl status|restart|stop epsilon\n");
+#endif
     printf("  or start it in the foreground with:\n");
-    printf("    %s/epsilond -p %d -b %s %s-d %s -l %s\n",
-           here, port, bind, peer_arg_text(peer_port, advertise),
+    printf("    %s -p %d -b %s %s-d %s -l %s\n",
+           binpath, port, bind, peer_arg_text(peer_port, advertise),
            data_dir, log_path);
+    if (installed > 0) {
+        printf("  note: rebuild and re-run `epsilonctl install` to upgrade "
+               "the installed binaries\n");
+    }
 
     printf("\nPorts / firewall:\n");
     printf("  - open TCP %d (HTTP API + admin console) to anyone who needs it\n",
@@ -277,12 +540,11 @@ int cmd_install(int argc, char **argv)
  * settings. */
 int cmd_setup(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
     printf("\nEpsilonDB reconfiguration\n");
     printf("--------------------------\n");
-    printf("Re-ask the server parameters, update the launchd service and\n");
-    printf("push the new values to the running server's settings.\n\n");
+    printf("Re-ask the server parameters, upgrade the installed binaries,\n");
+    printf("update the launchd service and push the new values to the\n");
+    printf("running server's settings.\n\n");
 
     char bind[64] = "127.0.0.1";
     int port = 8123;
@@ -293,9 +555,9 @@ int cmd_setup(int argc, char **argv)
     char here[1024];
 
     if (getcwd(here, sizeof(here))) {
-        snprintf(data_dir, sizeof(data_dir), "%s/data", here);
+        default_data_dir(data_dir, sizeof(data_dir), here);
     } else {
-        snprintf(data_dir, sizeof(data_dir), "./data");
+        default_data_dir(data_dir, sizeof(data_dir), ".");
     }
     snprintf(log_path, sizeof(log_path), "/var/log/epsilondb/epsilondb.log");
 
@@ -315,16 +577,35 @@ int cmd_setup(int argc, char **argv)
         ask_addr("Log file path", log_path, sizeof(log_path), log_path);
     }
 
+    printf("\nUpgrading the installed binaries...\n");
+    char src_dir[1024], prefix[64];
+    source_bin_dir(argc > 0 ? argv[0] : NULL, src_dir, sizeof(src_dir));
+    int installed = install_binaries(src_dir, prefix, sizeof(prefix));
+    if (installed > 0) {
+        printf("  upgraded %d binaries in %s\n", installed, prefix);
+    }
+
     printf("\nUpdating the service...\n");
-    if (!install_launchd(here, bind, port, peer_port, advertise,
+    char binpath[1024];
+    if (installed > 0) {
+        snprintf(binpath, sizeof(binpath), "%s/epsilond", prefix);
+    } else {
+        snprintf(binpath, sizeof(binpath), "%s/epsilond", src_dir);
+    }
+    if (!install_service(here, binpath, bind, port, peer_port, advertise,
                          data_dir, log_path)) {
         return 1;
     }
+#ifdef __APPLE__
     printf("  restart it with:\n");
     printf("    launchctl unload %s/Library/LaunchAgents/com.epsilondb.server.plist\n"
            "    launchctl load -w %s/Library/LaunchAgents/com.epsilondb.server.plist\n",
            getenv("HOME") ? getenv("HOME") : ".",
            getenv("HOME") ? getenv("HOME") : ".");
+#else
+    printf("  restart it with:\n");
+    printf("    sudo systemctl restart epsilon\n");
+#endif
 
     printf("\nUpdating the running server...\n");
     char body[512];
