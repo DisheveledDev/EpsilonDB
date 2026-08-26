@@ -32,6 +32,8 @@ typedef struct edb_shard {
     edb_shard_settings settings;
     long long last_vacuum_ts;
     long long last_reindex_ts;
+    long long last_cache_ts;   /* last Auto Cache re-evaluation */
+    long long applied_cache_kb;/* page-cache size currently in force */
 } edb_shard;
 
 edb_shard *edb_shard_open(const char *path, const char *key,

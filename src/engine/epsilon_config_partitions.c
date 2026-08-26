@@ -39,6 +39,7 @@ bool edb_partition_create(edb_config *cfg, const char *database,
     edb_shard_settings defaults;
     edb_shard_settings_default(&defaults);
     set_json_i64(obj, "cache_size", defaults.cache_size);
+    set_json_bool(obj, "auto_cache", defaults.auto_cache);
     cJSON_AddStringToObject(obj, "journal_mode", defaults.journal_mode);
     set_json_i64(obj, "vacuum_seconds", defaults.vacuum_seconds);
     set_json_i64(obj, "reindex_seconds", defaults.reindex_seconds);
@@ -85,6 +86,7 @@ bool edb_partition_set_masks(edb_config *cfg, const char *database,
     set_json_u64(obj, "read_mask", read_mask);
     set_json_u64(obj, "delete_mask", delete_mask);
     set_json_i64(obj, "cache_size", existing.cache_size);
+    set_json_bool(obj, "auto_cache", existing.auto_cache);
     cJSON_AddStringToObject(obj, "journal_mode", existing.journal_mode);
     set_json_i64(obj, "vacuum_seconds", existing.vacuum_seconds);
     set_json_i64(obj, "reindex_seconds", existing.reindex_seconds);
@@ -112,6 +114,7 @@ bool edb_partition_get(edb_config *cfg, const char *database,
     out->read_mask = json_u64(obj, "read_mask");
     out->delete_mask = json_u64(obj, "delete_mask");
     out->cache_size = json_i64(obj, "cache_size");
+    out->auto_cache = json_bool(obj, "auto_cache", true);
     copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
               "journal_mode");
     if (out->journal_mode[0] == '\0') {
@@ -148,6 +151,7 @@ bool edb_partition_set_settings(edb_config *cfg, const char *database,
     set_json_u64(obj, "read_mask", existing.read_mask);
     set_json_u64(obj, "delete_mask", existing.delete_mask);
     set_json_i64(obj, "cache_size", settings->cache_size);
+    set_json_bool(obj, "auto_cache", settings->auto_cache);
     cJSON_AddStringToObject(obj, "journal_mode", settings->journal_mode);
     set_json_i64(obj, "vacuum_seconds", settings->vacuum_seconds);
     set_json_i64(obj, "reindex_seconds", settings->reindex_seconds);
@@ -286,6 +290,7 @@ edb_partition_info *edb_partition_list(edb_config *cfg, const char *database,
         out[n].read_mask = json_u64(item, "read_mask");
         out[n].delete_mask = json_u64(item, "delete_mask");
         out[n].cache_size = json_i64(item, "cache_size");
+        out[n].auto_cache = json_bool(item, "auto_cache", true);
         copy_name(out[n].journal_mode, sizeof(out[n].journal_mode), item,
                   "journal_mode");
         if (out[n].journal_mode[0] == '\0') {

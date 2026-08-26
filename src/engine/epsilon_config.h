@@ -109,7 +109,8 @@ typedef struct {
     uint64_t update_mask;
     uint64_t read_mask;
     uint64_t delete_mask;
-    long long cache_size;       /* SQLite cache_size; 0 = default */
+    long long cache_size;       /* SQLite cache_size; 0 = defer to auto_cache */
+    bool auto_cache;            /* Auto Cache sizing; on by default */
     char journal_mode[16];      /* DELETE | TRUNCATE | WAL */
     long long vacuum_seconds;   /* 0 = never */
     long long reindex_seconds;  /* 0 = never */

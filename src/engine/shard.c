@@ -185,7 +185,8 @@ void edb_shard_settings_default(edb_shard_settings *out)
     if (!out) {
         return;
     }
-    out->cache_size = 0;          /* 0 = auto: scaled from the shard size */
+    out->cache_size = 0;          /* 0 = defer to auto_cache */
+    out->auto_cache = true;       /* Auto Cache on by default */
     snprintf(out->journal_mode, sizeof(out->journal_mode), "TRUNCATE");
     out->vacuum_seconds = 604800;  /* weekly */
     out->reindex_seconds = 86400;  /* daily */
@@ -197,10 +198,15 @@ void edb_shard_settings_default(edb_shard_settings *out)
 #define EDB_CACHE_AUTO_MIN_KB 2048
 #define EDB_CACHE_AUTO_MAX_KB 262144
 
-/* Effective page-cache size (KiB) for a shard connection: the configured
- * value when set (negative = SQLite default, no pragma), otherwise 10% of
- * the on-disk shard size so bigger shards get proportionally bigger
- * caches. The file may not exist yet on first open; the floor applies. */
+/* How often an open shard re-evaluates its Auto Cache size. Shards grow
+ * slowly relative to their cache, and re-applying the pragma costs a
+ * page-cache flush, so this is deliberately infrequent. */
+#define EDB_CACHE_RECHECK_SECS 86400   /* daily */
+
+/* Effective page-cache size (KiB) for a shard connection. See the
+ * precedence rules on edb_shard_settings. Returns 0 to mean "apply no
+ * pragma and leave SQLite's own default in place". The file may not exist
+ * yet on first open; the floor applies. */
 static long long effective_cache_kb(const char *path,
                                     const edb_shard_settings *s)
 {
@@ -210,7 +216,7 @@ static long long effective_cache_kb(const char *path,
     if (s->cache_size > 0) {
         return s->cache_size;
     }
-    if (s->cache_size < 0) {
+    if (s->cache_size < 0 || !s->auto_cache) {
         return 0;
     }
     long long kb = EDB_CACHE_AUTO_MIN_KB;
@@ -234,7 +240,8 @@ static long long effective_cache_kb(const char *path,
  * negative-value convention (abs(N) * 1024 bytes). */
 static int configure_connection(sqlite3 *db, const char *key,
                                 const char *path,
-                                const edb_shard_settings *s)
+                                const edb_shard_settings *s,
+                                long long *applied_kb_out)
 {
     char sql[256];
     char *err = NULL;
@@ -263,7 +270,41 @@ static int configure_connection(sqlite3 *db, const char *key,
             return -1;
         }
     }
+    if (applied_kb_out) {
+        *applied_kb_out = cache_kb;
+    }
     return 0;
+}
+
+/* Re-evaluates the Auto Cache size for an already-open shard and applies it
+ * if it changed. Caller holds sh->lock.
+ *
+ * PRAGMA cache_size takes effect on a live connection, so this deliberately
+ * does not close and reopen the database: no in-flight operation is blocked
+ * beyond the pragma itself, and prepared statements stay valid. */
+static void refresh_auto_cache_locked(edb_shard *sh, long long now)
+{
+    if (!sh->db || sh->settings.cache_size != 0 || !sh->settings.auto_cache) {
+        return;
+    }
+    long long want = effective_cache_kb(sh->path, &sh->settings);
+    if (want <= 0 || want == sh->applied_cache_kb) {
+        sh->last_cache_ts = now;
+        return;
+    }
+    char sql[64];
+    char *err = NULL;
+    snprintf(sql, sizeof(sql), "PRAGMA cache_size=-%lld;", want);
+    if (sqlite3_exec(sh->db, sql, NULL, NULL, &err) == SQLITE_OK) {
+        edb_log("INFO", "shard %s: auto cache %lld KiB -> %lld KiB", sh->key,
+                sh->applied_cache_kb, want);
+        sh->applied_cache_kb = want;
+    } else {
+        edb_log("ERROR", "shard %s: auto cache pragma failed: %s", sh->key,
+                err ? err : "?");
+        sqlite3_free(err);
+    }
+    sh->last_cache_ts = now;
 }
 
 /* Runs the idempotent schema setup on an open connection. */
@@ -337,7 +378,8 @@ edb_shard *edb_shard_open(const char *path, const char *key,
     }
 
     sqlite3_busy_timeout(sh->db, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(sh->db, sh->key, path, &sh->settings) != 0 ||
+    if (configure_connection(sh->db, sh->key, path, &sh->settings,
+                             &sh->applied_cache_kb) != 0 ||
         setup_schema(sh->db, sh->key) != 0) {
         edb_shard_free(sh);
         return NULL;
@@ -345,6 +387,7 @@ edb_shard *edb_shard_open(const char *path, const char *key,
 
     sh->last_vacuum_ts = now_epoch();
     sh->last_reindex_ts = now_epoch();
+    sh->last_cache_ts = now_epoch();
     return sh;
 }
 
@@ -372,7 +415,9 @@ bool edb_shard_reopen(edb_shard *sh, const edb_shard_settings *settings)
         return false;
     }
     sqlite3_busy_timeout(fresh, EDB_BUSY_TIMEOUT_MS);
-    if (configure_connection(fresh, sh->key, sh->path, settings) != 0 ||
+    long long applied_kb = 0;
+    if (configure_connection(fresh, sh->key, sh->path, settings,
+                             &applied_kb) != 0 ||
         setup_schema(fresh, sh->key) != 0) {
         sqlite3_close(fresh);
         pthread_mutex_unlock(&sh->lock);
@@ -381,8 +426,10 @@ bool edb_shard_reopen(edb_shard *sh, const edb_shard_settings *settings)
     sqlite3 *old = sh->db;
     sh->db = fresh;
     sh->settings = *settings;
+    sh->applied_cache_kb = applied_kb;
     sh->last_vacuum_ts = now_epoch();
     sh->last_reindex_ts = now_epoch();
+    sh->last_cache_ts = now_epoch();
     if (old) {
         sqlite3_close_v2(old);
     }
@@ -914,6 +961,9 @@ bool edb_shard_cleanup(edb_shard *sh)
                     err ? err : "?");
             sqlite3_free(err);
         }
+    }
+    if (ok && now - sh->last_cache_ts >= EDB_CACHE_RECHECK_SECS) {
+        refresh_auto_cache_locked(sh, now);
     }
 
     pthread_mutex_unlock(&sh->lock);

@@ -159,8 +159,19 @@ void edb_free_strings(char **strings);
 /* --- per-partition SQLite tuning -------------------------------------- */
 
 typedef struct {
-    long long cache_size;      /* KiB; >0 = explicit, 0 = auto (scaled from
-                                  shard size), <0 = SQLite default */
+    /* Effective page-cache size in KiB.
+     *   > 0  explicit size, always honoured (an operator who sets a number
+     *        means it), regardless of auto_cache.
+     *   = 0  defer to auto_cache: on  -> scale from the shard size,
+     *                             off -> leave SQLite's own default.
+     *   < 0  legacy "use the SQLite default", kept so existing configs
+     *        keep their behaviour. */
+    long long cache_size;
+    /* Auto Cache: size the page cache from the shard file (10% of it,
+     * floored at the SQLite default of 2 MiB and capped at 256 MiB) and
+     * re-evaluate it periodically. On by default. Only consulted when
+     * cache_size == 0. */
+    bool auto_cache;
     char journal_mode[16];     /* "DELETE" | "TRUNCATE" | "WAL" */
     long long vacuum_seconds;  /* re-VACUUM interval; 0 = never */
     long long reindex_seconds; /* re-REINDEX interval; 0 = never */

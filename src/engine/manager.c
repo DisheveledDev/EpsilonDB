@@ -197,6 +197,7 @@ static bool settings_differ(const edb_shard_settings *a,
                             const edb_shard_settings *b)
 {
     return a->cache_size != b->cache_size ||
+           a->auto_cache != b->auto_cache ||
            strcmp(a->journal_mode, b->journal_mode) != 0 ||
            a->vacuum_seconds != b->vacuum_seconds ||
            a->reindex_seconds != b->reindex_seconds;

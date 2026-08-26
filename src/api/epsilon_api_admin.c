@@ -240,6 +240,14 @@ static bool partition_settings_from_json(const cJSON *body,
         out->cache_size = (long long)cs->valuedouble;
         present = true;
     }
+    const cJSON *ac = cJSON_GetObjectItemCaseSensitive(body, "auto_cache");
+    if (cJSON_IsBool(ac)) {
+        out->auto_cache = cJSON_IsTrue(ac);
+        present = true;
+    } else if (cJSON_IsNumber(ac)) {
+        out->auto_cache = ac->valuedouble != 0;
+        present = true;
+    }
     const cJSON *jm = cJSON_GetObjectItemCaseSensitive(body, "journal_mode");
     if (cJSON_IsString(jm) && jm->valuestring) {
         snprintf(out->journal_mode, sizeof(out->journal_mode), "%s",
@@ -263,6 +271,7 @@ static void partition_add_settings_json(cJSON *o,
                                         const edb_partition_info *p)
 {
     cJSON_AddNumberToObject(o, "cache_size", (double)p->cache_size);
+    cJSON_AddBoolToObject(o, "auto_cache", p->auto_cache);
     cJSON_AddStringToObject(o, "journal_mode", p->journal_mode);
     cJSON_AddNumberToObject(o, "vacuum_seconds", (double)p->vacuum_seconds);
     cJSON_AddNumberToObject(o, "reindex_seconds", (double)p->reindex_seconds);

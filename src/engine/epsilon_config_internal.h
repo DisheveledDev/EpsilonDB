@@ -43,6 +43,8 @@ uint64_t json_u64(const cJSON *obj, const char *field);
 void set_json_u64(cJSON *obj, const char *field, uint64_t v);
 long long json_i64(const cJSON *obj, const char *field);
 void set_json_i64(cJSON *obj, const char *field, long long v);
+bool json_bool(const cJSON *obj, const char *field, bool fallback);
+void set_json_bool(cJSON *obj, const char *field, bool v);
 
 /* --- entity helpers -------------------------------------------------- */
 bool internal_cluster_setting(const char *keyspace, const char *id);

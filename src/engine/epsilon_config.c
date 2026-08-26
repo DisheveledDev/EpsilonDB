@@ -127,9 +127,39 @@ void set_json_i64(cJSON *obj, const char *field, long long v)
     cJSON_AddStringToObject(obj, field, buf);
 }
 
+/* Reads a boolean that may be stored as a JSON bool, a number, or one of
+ * the strings the settings store uses. Returns `fallback` when the field is
+ * absent, so records written before the field existed keep their old
+ * behaviour. */
+bool json_bool(const cJSON *obj, const char *field, bool fallback)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, field);
+    if (!item || cJSON_IsNull(item)) {
+        return fallback;
+    }
+    if (cJSON_IsBool(item)) {
+        return cJSON_IsTrue(item);
+    }
+    if (cJSON_IsNumber(item)) {
+        return item->valuedouble != 0;
+    }
+    if (cJSON_IsString(item) && item->valuestring) {
+        return strcmp(item->valuestring, "1") == 0 ||
+               strcmp(item->valuestring, "true") == 0 ||
+               strcmp(item->valuestring, "TRUE") == 0;
+    }
+    return fallback;
+}
+
+void set_json_bool(cJSON *obj, const char *field, bool v)
+{
+    cJSON_AddStringToObject(obj, field, v ? "1" : "0");
+}
+
 static void copy_settings(const cJSON *obj, edb_shard_settings *out)
 {
     out->cache_size = json_i64(obj, "cache_size");
+    out->auto_cache = json_bool(obj, "auto_cache", true);
     copy_name(out->journal_mode, sizeof(out->journal_mode), obj,
               "journal_mode");
     if (out->journal_mode[0] == '\0') {

@@ -167,8 +167,9 @@ static void test_partitions_and_perms(void)
     CHECK(p.create_mask == 0 && p.delete_mask == admins &&
           p.read_mask == (readers | writers | admins));
 
-    /* stored defaults: cache auto (0), vacuum weekly, reindex daily */
-    CHECK(p.cache_size == 0 && p.vacuum_seconds == 604800 &&
+    /* stored defaults: cache auto (0), Auto Cache on, vacuum weekly,
+     * reindex daily */
+    CHECK(p.cache_size == 0 && p.auto_cache && p.vacuum_seconds == 604800 &&
           p.reindex_seconds == 86400);
 
     /* mask semantics: 0 allows everything */
@@ -190,6 +191,46 @@ static void test_partitions_and_perms(void)
     CHECK(edb_partition_get(cfg, "app", "cache", &p));
     CHECK(p.read_mask == admins && p.create_mask == admins);
     CHECK(!edb_partition_set_masks(cfg, "app", "missing", 0, 0, 0, 0));
+
+    /* --- Auto Cache setting ------------------------------------------- */
+    edb_shard_settings s;
+    edb_shard_settings_default(&s);
+    /* on by default */
+    CHECK(s.auto_cache && s.cache_size == 0);
+
+    /* turning it off persists and survives a round trip */
+    s.auto_cache = false;
+    CHECK(edb_partition_set_settings(cfg, "app", "cache", &s));
+    CHECK(edb_partition_get(cfg, "app", "cache", &p));
+    CHECK(p.auto_cache == false && p.cache_size == 0);
+
+    /* turning it back on persists too */
+    s.auto_cache = true;
+    CHECK(edb_partition_set_settings(cfg, "app", "cache", &s));
+    CHECK(edb_partition_get(cfg, "app", "cache", &p));
+    CHECK(p.auto_cache == true);
+
+    /* an explicit size is kept alongside the flag; precedence (explicit
+     * wins over auto) is enforced in the engine, not the config store */
+    s.cache_size = 4096;
+    CHECK(edb_partition_set_settings(cfg, "app", "cache", &s));
+    CHECK(edb_partition_get(cfg, "app", "cache", &p));
+    CHECK(p.cache_size == 4096 && p.auto_cache == true);
+
+    /* a partition record written before auto_cache existed must read back
+     * as enabled, so upgrades keep today's behaviour */
+    {
+        const char *legacy =
+            "{\"database\":\"app\",\"name\":\"legacy\","
+            "\"cache_size\":\"0\",\"journal_mode\":\"TRUNCATE\"}";
+        CHECK(edb_put(eng, EDB_SYSTEM_DB, "config_partitions", "app/legacy",
+                      legacy, -1));
+        edb_partition_info lp;
+        CHECK(edb_partition_get(cfg, "app", "legacy", &lp));
+        CHECK(lp.auto_cache == true);
+        /* remove it again so the listing assertions below still see one */
+        CHECK(edb_partition_delete(cfg, "app", "legacy"));
+    }
 
     /* listing filters by database */
     CHECK(edb_partition_create(cfg, "other", "cache", 0, 0, 0, 0));
