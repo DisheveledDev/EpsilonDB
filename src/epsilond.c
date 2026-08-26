@@ -71,6 +71,39 @@ static void print_banner(void)
     printf("%s", r);
 }
 
+/* Prints a short how-to-connect notice after the server is up. The peer
+ * port (clustering) may be 0 = disabled. */
+static void print_connect_info(const char *bind, int port, int peer_port,
+                               const char *data_dir)
+{
+    const char *g = use_colour() ? C_GREEN : "";
+    const char *y = use_colour() ? C_YELLOW : "";
+    const char *r = use_colour() ? C_RESET : "";
+
+    printf("\n%sEpsilonDB is running.%s\n", g, r);
+    printf("  Admin console:   %shttp://%s:%d/admin%s (browser UI; first visit\n",
+           g, bind, port, r);
+    printf("                   creates the admin user, then sign in)\n");
+    printf("  REST API:        %shttp://%s:%d%s\n", g, bind, port, r);
+    printf("  Local admin CLI: %sepsilonctl%s (or: epsilonctl -h %s -p %d)\n",
+           g, r, bind, port);
+    printf("  Data directory:  %s\n", data_dir);
+    printf("\n%sFirewall / remote access:%s\n", y, r);
+    printf("  - %s%s:%d%s must be reachable by anyone using the API or console.\n",
+           g, bind, port, r);
+    printf("  - TLS is terminated by a reverse proxy in front of the HTTP port\n");
+    printf("    (no TLS in the server); put nginx/caddy on %d if you need it.\n",
+           port);
+    printf("  - The Unix admin socket (epsilonctl default) is local-only and is\n");
+    printf("    never exposed over the network.\n");
+    if (peer_port > 0) {
+        printf("  - Cluster peer port %d must be open between nodes\n",
+               peer_port);
+    }
+    printf("%s", r);
+    fflush(stdout);
+}
+
 static void print_usage(const char *prog)
 {
     printf("EpsilonDB - distributed key/value database server\n");
@@ -240,6 +273,9 @@ int main(int argc, char **argv)
         edb_log("WARN", "failed to register admin console");
     }
     (void)admin_dir;
+
+    print_connect_info(bind_addr ? bind_addr : "0.0.0.0", port, peer_port,
+                       data_dir);
 
     if (!edb_api_register(srv, engine, config)) {
         edb_log("ERROR", "failed to register API routes");

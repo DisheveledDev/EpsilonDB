@@ -196,11 +196,37 @@ Options: `-p port` (HTTP, default 8123), `-b addr` (bind address),
 `./epsilon-admin.sock`). Add `-n port` to enable clustering (peer port) and
 `-A addr` to override the advertised address.
 
+On startup the server prints a short "how to connect" notice with the admin
+console and REST URLs, plus a reminder to open the HTTP port (and the peer
+port for cluster nodes) in any firewall, and to put a TLS-terminating
+reverse proxy in front of the HTTP port for encrypted remote access.
+
 The server writes a timestamped log to `/var/log/epsilondb/epsilondb.log`
 (create the directory first, or run with privileges to write there). Use
 `-l path` to override the log file; when the file cannot be opened the
 server falls back to logging on the console. The log is rotated once per
 day (renamed with a date suffix and gzip-compressed).
+
+## Installing as a service (macOS)
+
+`epsilonctl install` walks you through the server parameters and writes a
+`launchd` agent (`~/Library/LaunchAgents/com.epsilondb.server.plist`):
+
+    bin/epsilonctl install
+
+It asks for the HTTP bind address, HTTP port, cluster peer port
+(0 = single node) and advertised address, then the data directory and log
+path. It reports which TCP ports to open in a firewall, how to run the
+service via `launchctl`, and offers to open the admin console in your
+browser. Run it again any time:
+
+    bin/epsilonctl setup
+
+`setup` re-asks the same questions, rewrites the service file, and pushes
+the new parameters to the running server as settings (`server.bind`,
+`server.http_port`, `server.peer_port`, `server.advertise`,
+`server.data_dir`, `server.log_path`) — restart the service afterwards so
+they take effect.
 
 ## Admin console
 
