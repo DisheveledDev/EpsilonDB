@@ -1743,6 +1743,9 @@ static bool handle_admin_cluster(const zdb_http_request *req,
             cJSON_AddStringToObject(p, "addr", peers[i].addr);
             cJSON_AddNumberToObject(p, "port", peers[i].port);
             cJSON_AddBoolToObject(p, "online", peers[i].online);
+            cJSON_AddBoolToObject(p, "removed", peers[i].removed);
+            cJSON_AddNumberToObject(p, "last_seen",
+                                    (double)peers[i].last_seen);
             if (peers[i].compliant_gen > 0) {
                 cJSON_AddNumberToObject(p, "compliant",
                                         (double)peers[i].compliant_gen);
@@ -1891,6 +1894,14 @@ static bool handle_admin_join(const zdb_http_request *req,
                                 " join at a time; retry later");
         return true;
     }
+    if (rc == -3) {
+        if (key_set) {
+            zstp_set_mesh_key(NULL, NULL);
+        }
+        respond_error(res, 410, "this node has been removed from the"
+                                " cluster; re-join to be re-admitted");
+        return true;
+    }
     if (rc != 0) {
         if (key_set) {
             zstp_set_mesh_key(NULL, NULL);
@@ -1980,6 +1991,46 @@ static bool handle_admin_join(const zdb_http_request *req,
     free(res->body);
     res->body = zdb_http_body_printf(&res->body_len,
                                      "{\"joined\":true,\"synced\":true}");
+    return true;
+}
+
+/* POST /admin/remove-node {node_id}: tombstone a node and re-shard. */
+static bool handle_admin_remove_node(const zdb_http_request *req,
+                                     zdb_http_response *res)
+{
+    if (strcmp(req->method, "POST") != 0) {
+        respond_error(res, 405, "method not allowed");
+        return true;
+    }
+    if (!require_admin_auth(req, res)) {
+        return true;
+    }
+    if (!g_cluster) {
+        respond_error(res, 400, "clustering disabled"
+                                " (start with -n <peer_port>)");
+        return true;
+    }
+    cJSON *body = NULL;
+    if (!body_json(req, &body) || !cJSON_IsObject(body)) {
+        respond_error(res, 400, "JSON body required: {node_id}");
+        cJSON_Delete(body);
+        return true;
+    }
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(body, "node_id");
+    if (!cJSON_IsString(jid) || !jid->valuestring || !*jid->valuestring) {
+        respond_error(res, 400, "node_id (string) required");
+        cJSON_Delete(body);
+        return true;
+    }
+    if (!zdb_cluster_remove_node(g_cluster, jid->valuestring)) {
+        cJSON_Delete(body);
+        respond_error(res, 404, "node not found (or cannot remove self)");
+        return true;
+    }
+    cJSON_Delete(body);
+    res->status = 200;
+    res->content_type = "application/json";
+    res->body = zdb_http_body_printf(&res->body_len, "{\"removed\":true}");
     return true;
 }
 
@@ -2405,6 +2456,8 @@ bool zdb_api_register(zdb_http_server *srv, zdb_engine *engine,
                                handle_admin_cluster);
     ok &= zdb_http_add_handler(srv, "POST", "/admin/join",
                                handle_admin_join);
+    ok &= zdb_http_add_handler(srv, "POST", "/admin/remove-node",
+                               handle_admin_remove_node);
     /* deletes use the trailing-slash form so list routes stay intact;
      * longest-prefix matching sends /admin/users/<name> here */
     ok &= zdb_http_add_handler(srv, "DELETE", "/admin/",

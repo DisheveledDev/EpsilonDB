@@ -41,6 +41,8 @@ typedef struct {
     int port;
     long long last_seen;      /* epoch seconds, from gossip */
     bool online;              /* mesh connection alive */
+    bool removed;             /* tombstoned: permanently out of the cluster
+                               * until explicitly re-joined */
     long long compliant_gen;  /* stage 6d: highest target gen this node
                                * has reported compliance for (0 = none) */
 } zdb_peer_info;
@@ -102,6 +104,13 @@ size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
  * because a rebalance wave is pending (one join at a time; retry after
  * the wave completes). Blocks up to a few seconds. */
 int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port);
+
+/* Marks a peer as removed (tombstoned) so it is excluded from placement
+ * and refused on reconnect. If this node is the leader, the live structure
+ * is immediately re-sharded over the remaining online members. Returns
+ * true when the peer existed. Safe to call on any node; the leader reacts
+ * to the gossiped tombstone otherwise. */
+bool zdb_cluster_remove_node(zdb_cluster *cl, const char *node_id);
 
 /* Installs a per-cluster dispatcher for inbound REPL/QUERY frames.
  * Overrides the process-wide fallback for this cluster's connections;

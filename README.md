@@ -115,6 +115,54 @@ writes keep committing on the surviving quorum, cached changes are replayed
 when the node returns, and if the leader itself disappears the remaining
 nodes elect a new one and carry on.
 
+## Why SQLite
+
+Each shard is a single SQLite database file, and that choice is deliberate:
+SQLite's design maps almost one-to-one onto what a ZestyDB shard needs, so
+we get a battle-tested storage layer instead of writing one ourselves.
+
+**One file per shard.** A shard is `(partition, keyspace)` — small,
+self-contained, and movable. SQLite is a single-file format with no server
+process, no configuration, and no daemon to operate. Snapshotting a shard
+for rebalancing is the online backup API; garbage-collecting a shard after a
+move is deleting one file. Because every shard is small and independent,
+each file's overhead and blast radius is bounded: a corrupt or full disk
+affects one shard, never the cluster.
+
+**Filtering, in the database.** ZestyDB's typed JSON filters (dotted paths,
+`eq`/`ne`/`gt`/`gte`/`lt`/`lte`, type-aware values) are evaluated directly
+against the stored document by SQLite's JSON1 functions, close to the data.
+A raw key/value store would force us to scan and parse every document in our
+own C and reimplement JSON type coercion; SQLite already does that, and keeps
+the door open to expression indexes on hot JSON paths later.
+
+**TTL, soft deletes and cleanup as SQL.** TTL is an indexed integer column;
+a delete is `UPDATE Data SET ttl = now - 5`; the 60-second cleanup pass is a
+single `DELETE ... WHERE ttl < ?` with a two-hour grace window so offline
+nodes can replay missed changes. Ordered iteration
+(`ORDER BY timestamp ASC`) for `ids`/`all`/`query` falls out of the B-tree
+for free, as does VACUUM/REINDEX maintenance after update-heavy periods.
+
+**Transactional snapshot transfer.** Rebalancing copies a live shard with the
+`sqlite3_backup_*` API, which streams a transactionally-consistent image
+while writes keep flowing — never a raw file copy. `synchronous=FULL` (and a
+configurable journal mode: DELETE/TRUNCATE/WAL) makes every commit and every
+transferred copy crash-safe.
+
+**A concurrency model that matches.** Each shard is serialized by one mutex
+and opened with `SQLITE_OPEN_FULLMUTEX`. SQLite's locking is sometimes cited
+as a limitation in shared-database deployments; here it is a feature, because
+a shard already has exactly one writer at a time by design.
+
+**Bulletproof by construction.** SQLite is the most widely deployed database
+engine in the world — inside phones, browsers, embedded devices and servers —
+and is tested to an unusual degree (the SQLite team reports 100% MC/DC branch
+coverage, with far more test code than library code). It is vendored here as a
+single amalgamation compiled straight into `zestyd`, so there is no external
+dependency, no version skew, and no runtime to monitor. The result is a
+storage layer that has been exercised on billions of devices and keeps
+ZestyDB's own footprint small and dependable.
+
 ## Build
 
 Requires a C11 compiler, POSIX.1-2008 (pthreads). No external

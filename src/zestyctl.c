@@ -666,6 +666,7 @@ static void print_usage(void)
         "",
         "cluster (requires zestyd -n <peer_port>):",
         "  join node <addr> <port> [secret]   join an existing mesh via seed",
+        "  remove node <id>                  tombstone a node + re-shard",
         "  list nodes | cluster        membership, leader and ranges",
         "",
         "performance:",
@@ -890,6 +891,12 @@ static int execute_command(int argc, char **argv)
                      argv[argi], argv[argi + 1]);
         }
         return run("POST", "/admin/join", body);
+    }
+    if (sub && strcmp(cmd, "remove") == 0 && strcmp(sub, "node") == 0 &&
+        argi < argc) {
+        char body[192];
+        snprintf(body, sizeof(body), "{\"node_id\":\"%s\"}", argv[argi]);
+        return run("POST", "/admin/remove-node", body);
     }
 
     /* ---- create/delete entities ---- */

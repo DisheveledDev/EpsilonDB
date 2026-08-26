@@ -50,6 +50,7 @@
 
 #define HEARTBEAT_SECONDS     3
 #define OFFLINE_AFTER_SECONDS 12
+#define REMOVE_AFTER_SECONDS  7200   /* auto-remove a node offline this long */
 #define MAINTAINER_TICK_MS    500
 #define MAX_PEERS             64
 #define MAX_CONN_THREADS      128
@@ -483,6 +484,9 @@ static cJSON *state_to_json(const zdb_cluster *cl)
         cJSON_AddNumberToObject(n, "port", cl->peers[i].port);
         cJSON_AddNumberToObject(n, "last_seen",
                                 (double)cl->peers[i].last_seen);
+        if (cl->peers[i].removed) {
+            cJSON_AddBoolToObject(n, "removed", true);
+        }
         if (cl->peers[i].compliant_gen > 0) {
             cJSON_AddNumberToObject(n, "compliant",
                                     (double)cl->peers[i].compliant_gen);
@@ -529,6 +533,11 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
 {
     bool changed = false;
 
+    const cJSON *jsender = cJSON_GetObjectItemCaseSensitive(doc, "sender");
+    bool from_leader = cJSON_IsString(jsender) && jsender->valuestring &&
+                       cl->leader[0] &&
+                       strcmp(jsender->valuestring, cl->leader) == 0;
+
     const cJSON *nodes = cJSON_GetObjectItemCaseSensitive(doc, "nodes");
     if (cJSON_IsArray(nodes)) {
         const cJSON *item = NULL;
@@ -543,6 +552,8 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
                 cJSON_GetObjectItemCaseSensitive(item, "last_seen");
             const cJSON *jcompliant =
                 cJSON_GetObjectItemCaseSensitive(item, "compliant");
+            const cJSON *jremoved =
+                cJSON_GetObjectItemCaseSensitive(item, "removed");
             if (!cJSON_IsString(jid) || !jid->valuestring ||
                 !*jid->valuestring ||
                 strlen(jid->valuestring) >= ZDB_NODE_ID_MAX) {
@@ -605,6 +616,16 @@ static bool merge_state(zdb_cluster *cl, const cJSON *doc)
             }
             if (compliant > mine->compliant_gen) {
                 mine->compliant_gen = compliant;
+                changed = true;
+            }
+            /* removal is sticky (any sender can propagate it); only the
+             * leader may clear a tombstone (explicit re-join) */
+            if (cJSON_IsTrue(jremoved) && !mine->removed) {
+                mine->removed = true;
+                changed = true;
+            } else if (!cJSON_IsTrue(jremoved) && mine->removed &&
+                       from_leader) {
+                mine->removed = false;
                 changed = true;
             }
         }
@@ -885,7 +906,7 @@ static bool is_online_view(const zdb_cluster *cl, const char *id)
     }
     for (size_t i = 0; i < cl->npeers; i++) {
         if (strcmp(cl->peers[i].id, id) == 0) {
-            return cl->peers[i].online;
+            return cl->peers[i].online && !cl->peers[i].removed;
         }
     }
     return false;
@@ -1024,6 +1045,52 @@ static void promote_target_locked(zdb_cluster *cl)
     cl->ntarget_ranges = 0;
 }
 
+/* Leader-only: re-shard the live table directly over the current online,
+ * non-removed members (used when a node leaves or is removed — there is no
+ * transfer possible to a departed node, so the live table shrinks in place
+ * rather than via a target wave). Voids any pending target. Caller holds
+ * cl->lock. */
+static void shrink_live_locked(zdb_cluster *cl)
+{
+    cl->target_generation = 0;
+    cl->ntarget_ranges = 0;
+    zdb_setting_delete(cl->cfg, SETTING_LOCK);
+
+    const char *ids[MAX_PEERS];
+    size_t n = 0;
+    for (size_t i = 0; i < cl->npeers; i++) {
+        if (is_online_view(cl, cl->peers[i].id)) {
+            ids[n++] = cl->peers[i].id;
+        }
+    }
+    for (size_t i = 1; i < n; i++) {
+        const char *key = ids[i];
+        size_t j = i;
+        while (j > 0 && strcmp(ids[j - 1], key) > 0) {
+            ids[j] = ids[j - 1];
+            j--;
+        }
+        ids[j] = key;
+    }
+    if (n == 0) {
+        return;
+    }
+    if (n != cl->nranges) {
+        if (n > cl->ranges_cap) {
+            zdb_range_info *grown =
+                realloc(cl->ranges, n * sizeof(*grown));
+            if (!grown) {
+                return;
+            }
+            cl->ranges = grown;
+            cl->ranges_cap = n;
+        }
+        cl->nranges = build_slices(ids, n, cl->ranges, n);
+        cl->generation++;
+        cl->gc_after = epoch_now() + OFFLINE_AFTER_SECONDS;
+    }
+}
+
 bool zdb_cluster_publish_target(zdb_cluster *cl)
 {
     if (!cl) {
@@ -1057,7 +1124,8 @@ static void conn_unref_locked(zdb_cluster *cl, peer_conn *c)
 
 /* Builds and sends HELLO (+STATE when requested) on a connection.
  * Returns 0 on success. */
-static int send_hello_state(zdb_cluster *cl, int fd, bool with_state)
+static int send_hello_state(zdb_cluster *cl, int fd, bool with_state,
+                            bool joining)
 {
     char *hello = NULL;
     char *state = NULL;
@@ -1068,6 +1136,9 @@ static int send_hello_state(zdb_cluster *cl, int fd, bool with_state)
         cJSON_AddStringToObject(h, "node_id", cl->self_id);
         cJSON_AddStringToObject(h, "addr", cl->self_addr);
         cJSON_AddNumberToObject(h, "port", cl->self_port);
+        if (joining) {
+            cJSON_AddBoolToObject(h, "join", true);
+        }
         hello = cJSON_PrintUnformatted(h);
         cJSON_Delete(h);
     }
@@ -1205,6 +1276,9 @@ static void *conn_thread(void *arg)
                 cJSON_GetObjectItemCaseSensitive(h, "addr");
             const cJSON *jport =
                 cJSON_GetObjectItemCaseSensitive(h, "port");
+            const cJSON *jjoin =
+                cJSON_GetObjectItemCaseSensitive(h, "join");
+            bool joining = cJSON_IsTrue(jjoin);
             bool is_self = false;
             if (cJSON_IsString(jid) && jid->valuestring &&
                 strlen(jid->valuestring) < ZDB_NODE_ID_MAX) {
@@ -1222,15 +1296,41 @@ static void *conn_thread(void *arg)
             if (!is_self && c->node_id[0] &&
                 strcmp(c->node_id, "ephemeral") != 0) {
                 bool known = false;
+                bool removed = false;
                 pthread_mutex_lock(&cl->lock);
                 for (size_t i = 0; i < cl->npeers; i++) {
                     if (strcmp(cl->peers[i].id, c->node_id) == 0) {
                         known = true;
+                        if (cl->peers[i].removed) {
+                            if (joining) {
+                                /* explicit re-join clears the tombstone
+                                 * and re-admits as a fresh member */
+                                cl->peers[i].removed = false;
+                                cl->peers[i].last_seen = 0;
+                            } else {
+                                removed = true;
+                            }
+                        }
                         break;
                     }
                 }
                 bool busy = cl->target_generation > 0;
                 pthread_mutex_unlock(&cl->lock);
+                if (removed) {
+                    cJSON *r = cJSON_CreateObject();
+                    cJSON_AddStringToObject(r, "node_id", cl->self_id);
+                    cJSON_AddStringToObject(r, "reject", "removed");
+                    char *rs = r ? cJSON_PrintUnformatted(r) : NULL;
+                    cJSON_Delete(r);
+                    zstp_send(c->fd, ZSTP_HELLO, rs ? rs : "{}", NULL);
+                    free(rs);
+                    close(c->fd);
+                    free(c);
+                    pthread_mutex_lock(&cl->lock);
+                    reader_exiting_locked(cl);
+                    pthread_mutex_unlock(&cl->lock);
+                    return NULL;
+                }
                 if (!known && busy) {
                     cJSON *r = cJSON_CreateObject();
                     cJSON_AddStringToObject(r, "node_id", cl->self_id);
@@ -1300,7 +1400,7 @@ static void *conn_thread(void *arg)
         return NULL;
     }
 
-    send_hello_state(cl, c->fd, true);
+    send_hello_state(cl, c->fd, true, false);
 
     pthread_mutex_lock(&cl->lock);
     c->last_recv = epoch_now();
@@ -1575,7 +1675,7 @@ static void *acceptor_main(void *arg)
         }
 
         /* announce ourselves before entering the read loop */
-        send_hello_state(cl, fd, false);
+        send_hello_state(cl, fd, false, false);
 
         peer_conn *c = calloc(1, sizeof(*c));
         if (!c) {
@@ -1669,7 +1769,7 @@ static void maintainer_tick(zdb_cluster *cl)
 
         int fd = dial_peer(p.addr, p.port);
         if (fd >= 0) {
-            send_hello_state(cl, fd, false);
+            send_hello_state(cl, fd, false, false);
             peer_conn *c = calloc(1, sizeof(*c));
             if (c) {
                 c->fd = fd;
@@ -1714,6 +1814,34 @@ static void maintainer_tick(zdb_cluster *cl)
     pthread_mutex_unlock(&cl->lock);
     if (gc_ready) {
         zdb_cluster_gc_redundant(cl);
+    }
+
+    /* auto-remove peers that have been offline for long enough: the
+     * leader tombstones them and re-shards the live table so their
+     * ranges are re-absorbed by the remaining members */
+    bool removed_any = false;
+    pthread_mutex_lock(&cl->lock);
+    if (leader_is_self_locked(cl)) {
+        long long now = epoch_now();
+        for (size_t i = 0; i < cl->npeers; i++) {
+            if (strcmp(cl->peers[i].id, cl->self_id) == 0 ||
+                cl->peers[i].removed || cl->peers[i].online ||
+                cl->peers[i].last_seen <= 0) {
+                continue;
+            }
+            if (now - cl->peers[i].last_seen >= REMOVE_AFTER_SECONDS) {
+                cl->peers[i].removed = true;
+                removed_any = true;
+            }
+        }
+        if (removed_any) {
+            shrink_live_locked(cl);
+            persist_state(cl);
+        }
+    }
+    pthread_mutex_unlock(&cl->lock);
+    if (removed_any) {
+        gossip_state(cl);
     }
 }
 
@@ -2069,10 +2197,10 @@ size_t zdb_cluster_holders(zdb_cluster *cl, const char *md5hex,
 /* One-shot join: dial the seed, exchange HELLO+STATE both ways so both
  * membership views merge, then hang up (the maintainer re-dials).
  * Returns 0 on success, -2 when the seed refused because a rebalance
- * wave is pending. */
+ * wave is pending, -3 when this node has been removed from the cluster. */
 static int join_exchange(zdb_cluster *cl, int fd)
 {
-    send_hello_state(cl, fd, true);
+    send_hello_state(cl, fd, true, true);
 
     /* read frames for a short while to absorb their state. A wrong (or
      * missing) secret makes every inbound frame fail authentication, so
@@ -2092,9 +2220,10 @@ static int join_exchange(zdb_cluster *cl, int fd)
             const cJSON *jr =
                 h ? cJSON_GetObjectItemCaseSensitive(h, "reject") : NULL;
             if (cJSON_IsString(jr) && jr->valuestring) {
+                int rc = strcmp(jr->valuestring, "removed") == 0 ? -3 : -2;
                 cJSON_Delete(h);
                 free(payload);
-                return -2;
+                return rc;
             }
             cJSON_Delete(h);
         } else if (t == ZSTP_STATE && payload) {
@@ -2127,6 +2256,37 @@ int zdb_cluster_join(zdb_cluster *cl, const char *seed_addr, int seed_port)
     int rc = join_exchange(cl, fd);
     close(fd);
     return rc;
+}
+
+bool zdb_cluster_remove_node(zdb_cluster *cl, const char *node_id)
+{
+    if (!cl || !node_id || !*node_id ||
+        strcmp(node_id, cl->self_id) == 0) {
+        return false;
+    }
+    bool found = false;
+    bool am_leader = false;
+    pthread_mutex_lock(&cl->lock);
+    for (size_t i = 0; i < cl->npeers; i++) {
+        if (strcmp(cl->peers[i].id, node_id) == 0) {
+            cl->peers[i].removed = true;
+            found = true;
+            break;
+        }
+    }
+    if (found) {
+        am_leader = leader_is_self_locked(cl);
+        if (am_leader) {
+            shrink_live_locked(cl);
+        }
+        persist_state(cl);
+    }
+    pthread_mutex_unlock(&cl->lock);
+
+    if (found) {
+        gossip_state(cl);
+    }
+    return found;
 }
 
 void zdb_cluster_set_dispatcher(zdb_cluster *cl,
