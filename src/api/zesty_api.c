@@ -2329,10 +2329,15 @@ static bool handle_admin_setup(const zdb_http_request *req,
     const cJSON *username = cJSON_GetObjectItemCaseSensitive(body, "username");
     const cJSON *password = cJSON_GetObjectItemCaseSensitive(body, "password");
     const cJSON *secret = cJSON_GetObjectItemCaseSensitive(body, "secret");
-    const char *name = cJSON_IsString(username) && username->valuestring &&
-                               *username->valuestring
-                           ? username->valuestring
-                           : "admin";
+    /* copy out of the body: the body is freed below and the name must
+     * survive until the response is built */
+    char name[128];
+    const char *username_str =
+        cJSON_IsString(username) && username->valuestring &&
+                *username->valuestring
+            ? username->valuestring
+            : "admin";
+    snprintf(name, sizeof(name), "%s", username_str);
     if (!cJSON_IsString(password) || !password->valuestring ||
         strlen(password->valuestring) < 4 ||
         strlen(password->valuestring) > 256) {
