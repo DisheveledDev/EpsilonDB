@@ -270,12 +270,14 @@ static void map_add_ks(eql_rowmap *m, const eql_table *t,
 }
 
 static bool map_take(eql_rowmap *m, const eql_table *t,
-                     sqlite3_int64 rowid, char id_out[EQL_ID_CAP])
+                     sqlite3_int64 rowid, char id_out[EQL_ID_CAP],
+                     char ks_out[128])
 {
     for (size_t i = m->n; i > 0; i--) {
         eql_rowrec *e = &m->r[i - 1];
         if (e->t == t && e->rowid == rowid) {
             memcpy(id_out, e->id, EQL_ID_CAP);
+            snprintf(ks_out, 128, "%s", e->ks);
             memmove(&m->r[i - 1], &m->r[i], (m->n - i) * sizeof(*m->r));
             m->n--;
             return true;
@@ -445,9 +447,11 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
                 sc.pos = save2;
                 break;
             }
+            bool more_pw = more[2][0] == '\0';
             bool dup2 = false;
             for (int i = 0; i < ntables + found; i++) {
-                if (same_shard(&tables[i], more[0], more[1], more[2])) {
+                if (same_shard(&tables[i], more[0], more[1], more[2]) &&
+                    tables[i].pw == more_pw) {
                     dup2 = true;
                     break;
                 }
@@ -458,8 +462,14 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
                 snprintf(t->db, sizeof(t->db), "%s", more[0]);
                 snprintf(t->part, sizeof(t->part), "%s", more[1]);
                 snprintf(t->ks, sizeof(t->ks), "%s", more[2]);
-                snprintf(t->dotted, sizeof(t->dotted), "%s.%s.%s", t->db,
-                         t->part, t->ks);
+                if (more_pw) {
+                    snprintf(t->dotted, sizeof(t->dotted), "%s.%s", t->db,
+                             t->part);
+                } else {
+                    snprintf(t->dotted, sizeof(t->dotted), "%s.%s.%s",
+                             t->db, t->part, t->ks);
+                }
+                t->pw = more_pw;
                 snprintf(t->alias, sizeof(t->alias), "eql_t%d",
                          ntables + found);
                 found++;
@@ -552,6 +562,43 @@ static char *rewrite_sql(const char *sql, const eql_table *tables,
                     sc.pos = probe.pos;
                     matched = true;
                     break;
+                }
+            }
+        }
+        if (!matched) {
+            /* two-segment (partition-wide) candidate: only when the text
+             * really stops after the second segment, so a 3-part dotted
+             * reference is never swallowed by a pw table that shares its
+             * db/part prefix (the pw alias must win only for db.part) */
+            eql_scan probe2 = { sc.sql, sc.pos, sc.len };
+            char p2segs[2][256];
+            bool pw_ok = read_ident(&probe2, p2segs[0], sizeof(p2segs[0]));
+            if (pw_ok) {
+                skip_spaces_comments(&probe2);
+                pw_ok = probe2.pos < probe2.len &&
+                        probe2.sql[probe2.pos] == '.';
+                if (pw_ok) {
+                    probe2.pos++;
+                    skip_spaces_comments(&probe2);
+                    pw_ok = read_ident(&probe2, p2segs[1],
+                                       sizeof(p2segs[1]));
+                }
+            }
+            if (pw_ok) {
+                char cand2[EQL_MAX_NAME];
+                snprintf(cand2, sizeof(cand2), "%s.%s", p2segs[0],
+                         p2segs[1]);
+                for (size_t ti = 0; ti < ntables; ti++) {
+                    if (tables[ti].pw &&
+                        strcmp(cand2, tables[ti].dotted) == 0) {
+                        const char *alias = tables[ti].alias;
+                        while (*alias && o < cap) {
+                            out[o++] = *alias++;
+                        }
+                        sc.pos = probe2.pos;
+                        matched = true;
+                        break;
+                    }
                 }
             }
         }
@@ -741,15 +788,16 @@ static void scan_insert_columns(const char *sql, eql_table *tables,
  * values), mirroring REST read semantics: quorum merge when replication
  * applies, local otherwise. Returns array of value objects; ids_out
  * carries the record keys. */
-static cJSON *fetch_docs(const edb_eql_ctx *ctx, const eql_table *t,
-                         char ***ids_out, size_t *nids_out)
+static cJSON *fetch_shard_docs(const edb_eql_ctx *ctx, const char *db,
+                               const char *part, const char *ks,
+                               char ***ids_out, size_t *nids_out)
 {
     *ids_out = NULL;
     *nids_out = 0;
     cJSON *meta = ctx->repl
-                      ? edb_repl_read_query_meta(ctx->repl, t->db, t->part,
-                                                 t->ks, NULL)
-                      : edb_query_ts(ctx->engine, t->part, t->ks, NULL);
+                      ? edb_repl_read_query_meta(ctx->repl, db, part,
+                                                 ks, NULL)
+                      : edb_query_ts(ctx->engine, part, ks, NULL);
     if (!meta) {
         return cJSON_CreateArray();
     }
@@ -797,6 +845,136 @@ static cJSON *fetch_docs(const edb_eql_ctx *ctx, const eql_table *t,
     cJSON_Delete(meta);
     *ids_out = ids;
     *nids_out = n;
+    return docs;
+}
+
+/* Partition-wide fetch: merges every registered keyspace of one
+ * partition into a single document/id list. ks_out receives one owning
+ * keyspace name per row (index-aligned with the ids array) so write-back
+ * can route each record to its real shard. Returns NULL docs only on
+ * unrecoverable allocation failure; an unregistered partition yields an
+ * empty result like the REST reads. */
+static cJSON *fetch_docs(const edb_eql_ctx *ctx, eql_table *t,
+                         char ***ids_out, size_t *nids_out,
+                         char ***ks_out, size_t *nks_out)
+{
+    *ks_out = NULL;
+    *nks_out = 0;
+    if (!t->pw) {
+        cJSON *docs = fetch_shard_docs(ctx, t->db, t->part, t->ks,
+                                       ids_out, nids_out);
+        return docs;
+    }
+
+    size_t total = 0;
+    edb_keyspace_info *list = edb_keyspace_list(ctx->config, &total);
+    if (!list) {
+        return cJSON_CreateArray();
+    }
+    size_t nkeys = 0;
+    for (size_t i = 0; i < total && nkeys < 64; i++) {
+        if (strcmp(list[i].database, t->db) == 0 &&
+            strcmp(list[i].partition, t->part) == 0) {
+            snprintf(t->keyspaces[nkeys], sizeof(t->keyspaces[0]), "%s",
+                     list[i].name);
+            nkeys++;
+        }
+    }
+    free(list);
+    t->nkeys = nkeys;
+    if (!nkeys) {
+        return cJSON_CreateArray();
+    }
+
+    size_t cap = 16, n = 0;
+    char **ids = malloc(cap * sizeof(*ids));
+    char **kss = malloc(cap * sizeof(*kss));
+    cJSON *docs = cJSON_CreateArray();
+    if (!ids || !kss || !docs) {
+        free(ids);
+        free(kss);
+        cJSON_Delete(docs);
+        return NULL;
+    }
+    for (size_t k = 0; k < nkeys; k++) {
+        char **shard_ids = NULL;
+        size_t shard_n = 0;
+        cJSON *shard_docs =
+            fetch_shard_docs(ctx, t->db, t->part, t->keyspaces[k],
+                             &shard_ids, &shard_n);
+        if (!shard_docs) {
+            for (size_t i = 0; i < n; i++) {
+                free(ids[i]);
+                free(kss[i]);
+            }
+            free(ids);
+            free(kss);
+            cJSON_Delete(docs);
+            return NULL;
+        }
+        for (size_t r = 0; r < shard_n; r++) {
+            if (n == cap) {
+                size_t grown = cap * 2;
+                char **gi = realloc(ids, grown * sizeof(*gi));
+                char **gk = realloc(kss, grown * sizeof(*gk));
+                if (!gi || !gk) {
+                    free(gi ? gi : ids);
+                    free(gk ? gk : kss);
+                    /* on partial growth the stale pointer must not leak:
+                     * whichever realloc succeeded is covered by the other
+                     * branch's free of the original block only when the
+                     * original is still valid; the safe path is to abort
+                     * with what we own */
+                    cJSON_Delete(shard_docs);
+                    for (size_t i = 0; i < n; i++) {
+                        free(ids[i]);
+                        free(kss[i]);
+                    }
+                    if (gi) {
+                        ids = gi;
+                    }
+                    if (gk) {
+                        kss = gk;
+                    }
+                    for (size_t i = 0; i < n; i++) {
+                        free(ids[i]);
+                        free(kss[i]);
+                    }
+                    free(ids);
+                    free(kss);
+                    cJSON_Delete(docs);
+                    return NULL;
+                }
+                ids = gi;
+                kss = gk;
+                cap = grown;
+            }
+            ids[n] = shard_ids[r];
+            kss[n] = strdup(t->keyspaces[k]);
+            if (!kss[n]) {
+                free(shard_ids[r]);
+                continue;
+            }
+            n++;
+            /* move the row document over so the caller's column union
+             * sees every key of every merged keyspace */
+            cJSON *shard_row = cJSON_GetArrayItem(shard_docs, (int)r);
+            cJSON *row_copy = cJSON_Duplicate(shard_row, 1);
+            if (!row_copy) {
+                free(ids[n - 1]);
+                free(kss[n - 1]);
+                n--;
+                continue;
+            }
+            cJSON_AddItemToArray(docs, row_copy);
+        }
+        free(shard_ids);
+        cJSON_Delete(shard_docs);
+    }
+    *ids_out = ids;
+    *nids_out = n;
+    *ks_out = kss;
+    *nks_out = n;
     return docs;
 }
 
@@ -872,9 +1050,12 @@ static void bind_json(sqlite3_stmt *stmt, int index, const cJSON *v)
 
 /* Creates the shadow table for a shard and inserts its documents.
  * Returns 0 on success, an HTTP-style code otherwise. Takes ownership of
- * docs (frees it); ids/nids are borrowed. */
+ * docs (frees it); ids/nids are borrowed. row_ks (index-aligned with ids,
+ * NULL for single-shard tables) supplies the owning keyspace per row so
+ * the row map can route pw write-back to the right shard. */
 static int materialize(sqlite3 *db, const eql_table *t, cJSON *docs,
-                       char **ids, size_t nids, eql_rowmap *map)
+                       char **ids, size_t nids, const char *const *row_ks,
+                       eql_rowmap *map)
 {
     char sql[4096];
     size_t used = 0;
@@ -951,7 +1132,8 @@ static int materialize(sqlite3 *db, const eql_table *t, cJSON *docs,
             status = 500;
             break;
         }
-        map_add_ks(map, t, sqlite3_last_insert_rowid(db), ids[r], t->ks);
+        map_add_ks(map, t, sqlite3_last_insert_rowid(db), ids[r],
+                   row_ks ? row_ks[r] : t->ks);
     }
     sqlite3_finalize(stmt);
     cJSON_Delete(docs);
@@ -1048,7 +1230,8 @@ static int deny_authorizer(void *ud, int action, const char *a1,
  * when a repl service is attached, local engine otherwise. Retries
  * transient failures; LWW conditional apply keeps replays idempotent. */
 static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
-                            const char *id, cJSON *value, int *out_code)
+                            const char *ks, const char *id, cJSON *value,
+                            int *out_code)
 {
     long long ts = (long long)time(NULL);
     char *text = NULL;
@@ -1057,7 +1240,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
          * reuse it without duplicating ownership into the envelope */
         char *vtxt = cJSON_PrintUnformatted(value);
         size_t cap = strlen(vtxt ? vtxt : "") + EQL_ID_CAP +
-                     strlen(t->db) + strlen(t->part) + strlen(t->ks) + 128;
+                     strlen(t->db) + strlen(t->part) + strlen(ks) + 128;
         text = malloc(cap);
         if (!text) {
             free(vtxt);
@@ -1066,7 +1249,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         }
         snprintf(text, cap,
                  "{\"op\":\"put\",\"db\":\"%s\",\"partition\":\"%s\",\"keyspace\":\"%s\",\"id\":\"%s\",\"value\":%s,\"ttl_abs\":-1,\"ts\":%lld}",
-                 t->db, t->part, t->ks, id, vtxt ? vtxt : "", ts);
+                 t->db, t->part, ks, id, vtxt ? vtxt : "", ts);
         free(vtxt);
     } else {
         cJSON *change = cJSON_CreateObject();
@@ -1077,7 +1260,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         cJSON_AddStringToObject(change, "op", "delete");
         cJSON_AddStringToObject(change, "db", t->db);
         cJSON_AddStringToObject(change, "partition", t->part);
-        cJSON_AddStringToObject(change, "keyspace", t->ks);
+        cJSON_AddStringToObject(change, "keyspace", ks);
         cJSON_AddStringToObject(change, "id", id);
         char tsbuf[32];
         snprintf(tsbuf, sizeof(tsbuf), "%lld", ts);
@@ -1107,7 +1290,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
             char *body = cJSON_PrintUnformatted(value);
 
             bool ok = body &&
-                      edb_put(ctx->engine, t->part, t->ks, id, body, -1);
+                      edb_put(ctx->engine, t->part, ks, id, body, -1);
 
             free(body);
             code = ok ? 200 : 500;
@@ -1115,7 +1298,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
                 break;
             }
         } else {
-            code = edb_delete(ctx->engine, t->part, t->ks, id) ? 200 : 500;
+            code = edb_delete(ctx->engine, t->part, ks, id) ? 200 : 500;
             if (code == 200) {
                 break;
             }
@@ -1129,7 +1312,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         /* keep the config registry in sync like REST puts do so new
          * databases/partitions/keyspaces created by EQL statements appear
          * in admin listings; replication fans the records to peers */
-        edb_partition_ensure(ctx->config, t->db, t->part, t->ks, NULL);
+        edb_partition_ensure(ctx->config, t->db, t->part, ks, NULL);
     }
     return 0;
 }
@@ -1260,12 +1443,13 @@ static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
         const eql_dml_ev *ev = &buf->ev[e];
         if (ev->op == SQLITE_DELETE) {
             char id[EQL_ID_CAP];
-            if (!map_take(map, ev->t, ev->rowid, id)) {
+            char ks[128];
+            if (!map_take(map, ev->t, ev->rowid, id, ks)) {
                 cJSON_AddItemToArray(failed, cJSON_CreateString("-"));
                 continue;
             }
             int code = 0;
-            replicate_record(ctx, ev->t, id, NULL, &code);
+            replicate_record(ctx, ev->t, ks, id, NULL, &code);
             cJSON_AddItemToArray(code == 200 ? applied : failed,
                                  cJSON_CreateString(id));
             continue;
@@ -1282,7 +1466,8 @@ static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
         if (sqlite3_step(rd) != SQLITE_ROW) {
             sqlite3_reset(rd);
             char stale[EQL_ID_CAP];
-            bool known = map_take(map, ev->t, ev->rowid, stale);
+            char stale_ks[128];
+            bool known = map_take(map, ev->t, ev->rowid, stale, stale_ks);
             cJSON_AddItemToArray(known ? applied : failed,
                                  cJSON_CreateString(known ? stale : "-"));
             continue;
@@ -1291,13 +1476,14 @@ static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
         const unsigned char *idtxt = sqlite3_column_text(rd, 0);
         snprintf(cur_id, EQL_ID_CAP, "%s", idtxt ? (const char *)idtxt : "");
         char old_id[EQL_ID_CAP];
-        bool had_old = map_take(map, ev->t, ev->rowid, old_id);
-        map_add_ks(map, ev->t, ev->rowid, cur_id, "");
+        char old_ks[128];
+        bool had_old = map_take(map, ev->t, ev->rowid, old_id, old_ks);
+        map_add_ks(map, ev->t, ev->rowid, cur_id, old_ks);
 
         /* UPDATE renaming the primary key = delete old key + put new one */
         if (had_old && strcmp(old_id, cur_id) != 0) {
             int code = 0;
-            replicate_record(ctx, ev->t, old_id, NULL, &code);
+            replicate_record(ctx, ev->t, old_ks, old_id, NULL, &code);
             cJSON_AddItemToArray(code == 200 ? applied : failed,
                                  cJSON_CreateString(old_id));
         }
@@ -1309,7 +1495,9 @@ static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
             continue;
         }
         int code = 0;
-        replicate_record(ctx, ev->t, cur_id, doc, &code);
+        replicate_record(ctx, ev->t,
+                         had_old ? old_ks : (ev->t->pw ? "" : ev->t->ks),
+                         cur_id, doc, &code);
         cJSON_AddItemToArray(code == 200 ? applied : failed,
                              cJSON_CreateString(cur_id));
     }
@@ -1361,6 +1549,21 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
             "no Database.Partition.Keyspace reference found in FROM/JOIN");
         free(tables);
         return 400;
+    }
+
+    /* INSERT has no per-row keyspace to attribute: the shadow table merges
+     * every keyspace of the partition, so there is nowhere to put the
+     * new record. Require an explicit keyspace like the REST API. */
+    if (kind == EQL_KIND_INSERT) {
+        for (int i = 0; i < ntables; i++) {
+            if (tables[i].pw) {
+                *json_out = error_response(
+                    "INSERT requires an explicit Database.Partition."
+                    "Keyspace reference");
+                free(tables);
+                return 400;
+            }
+        }
     }
 
     edb_permission need = EDB_PERM_READ;
@@ -1417,8 +1620,11 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
 
     for (int i = 0; i < ntables && status == 200; i++) {
         size_t nids = 0;
+        size_t nks = 0;
         char **ids = NULL;
-        cJSON *docs = fetch_docs(ctx, &tables[i], &ids, &nids);
+        char **row_ks = NULL;
+        cJSON *docs = fetch_docs(ctx, &tables[i], &ids, &nids, &row_ks,
+                                 &nks);
         if (!docs) {
             status = 500;
             break;
@@ -1427,7 +1633,8 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
         cJSON_ArrayForEach(doc, docs) {
             union_columns(&tables[i], doc);
         }
-        status = materialize(db, &tables[i], docs, ids, nids, &rowmap);
+        status = materialize(db, &tables[i], docs, ids, nids,
+                             (const char *const *)row_ks, &rowmap);
         if (status == 0) {
             status = 200;
         }
@@ -1435,6 +1642,12 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
             free(ids[k]);
         }
         free(ids);
+        if (row_ks) {
+            for (size_t k = 0; k < nks; k++) {
+                free(row_ks[k]);
+            }
+            free(row_ks);
+        }
     }
     if (status != 200) {
         map_free(&rowmap);

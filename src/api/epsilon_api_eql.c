@@ -32,8 +32,31 @@ static long long eql_now_us(void)
     return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
 }
 
+/* Records one analytics event of the statement's class against a single
+ * partition/keyspace pair. */
+static void record_ks_event(eql_kind kind, const char *part, const char *ks,
+                            long long latency)
+{
+    switch (kind) {
+    case EQL_KIND_INSERT:
+        edb_analytics_record_write(g_analytics, part, ks, false, latency);
+        break;
+    case EQL_KIND_UPDATE:
+        edb_analytics_record_write(g_analytics, part, ks, true, latency);
+        break;
+    case EQL_KIND_DELETE:
+        edb_analytics_record_delete(g_analytics, part, ks, latency);
+        break;
+    default:   /* SELECT / EXPLAIN: treated as collection reads */
+        edb_analytics_record_query(g_analytics, part, ks, NULL, 0, latency);
+        break;
+    }
+}
+
 /* Splits a dotted db.partition.keyspace reference and records one analytics
- * event of the statement's class against it. */
+ * event of the statement's class against it. A two-segment (partition-wide)
+ * reference is expanded to every keyspace registered under that partition,
+ * with the shard's latency share split evenly across them. */
 static void record_ref(eql_kind kind, const char *ref, long long elapsed,
                        size_t nrefs)
 {
@@ -45,32 +68,40 @@ static void record_ref(eql_kind kind, const char *ref, long long elapsed,
     char scratch[512];
     snprintf(scratch, sizeof(scratch), "%s", p1);
     char *dot2 = strrchr(scratch, '.');
-    if (!dot2) {
-        return;
-    }
-    *dot2 = '\0';
-    const char *ks = dot2 + 1;
     /* whole-statement latency spread over referenced shards so a join
      * across three shards does not triple-count the wall time */
     long long per_shard =
         nrefs > 1 ? (long long)(elapsed / (double)nrefs + 0.5) : elapsed;
-    switch (kind) {
-    case EQL_KIND_INSERT:
-        edb_analytics_record_write(g_analytics, scratch, ks, false,
-                                   per_shard);
-        break;
-    case EQL_KIND_UPDATE:
-        edb_analytics_record_write(g_analytics, scratch, ks, true,
-                                   per_shard);
-        break;
-    case EQL_KIND_DELETE:
-        edb_analytics_record_delete(g_analytics, scratch, ks, per_shard);
-        break;
-    default:   /* SELECT / EXPLAIN: treated as collection reads */
-        edb_analytics_record_query(g_analytics, scratch, ks, NULL, 0,
-                                   elapsed);
-        break;
+    if (!dot2) {
+        /* partition-wide: attribute to each keyspace of the partition */
+        char db[128];
+        snprintf(db, sizeof(db), "%.*s", (int)(p1 - ref - 1), ref);
+        size_t total = 0;
+        edb_keyspace_info *list = edb_keyspace_list(g_ctx.config, &total);
+        size_t nks = 0;
+        for (size_t i = 0; list && i < total; i++) {
+            if (strcmp(list[i].database, db) == 0 &&
+                strcmp(list[i].partition, scratch) == 0) {
+                nks++;
+            }
+        }
+        if (!nks) {
+            free(list);
+            return;
+        }
+        long long per_ks = per_shard / (long long)nks;
+        for (size_t i = 0; list && i < total; i++) {
+            if (strcmp(list[i].database, db) == 0 &&
+                strcmp(list[i].partition, scratch) == 0) {
+                record_ks_event(kind, scratch, list[i].name, per_ks);
+            }
+        }
+        free(list);
+        return;
     }
+    *dot2 = '\0';
+    const char *ks = dot2 + 1;
+    record_ks_event(kind, scratch, ks, per_shard);
 }
 
 static bool handle_eql_common(const edb_http_request *req,

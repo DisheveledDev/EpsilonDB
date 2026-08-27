@@ -174,6 +174,15 @@ static void seed_data(const edb_eql_ctx *ctx)
 
                   "{\"name\":\"Ken\",\"dept\":\"research\"}", -1));
 
+    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+                               "employees", NULL));
+
+    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+                               "managers", NULL));
+
+    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+                               "ghosts", NULL));
+
 }
 
 
@@ -798,6 +807,111 @@ static void test_classification_and_refs(void)
     CHECK(n == 0);
 }
 
+/* eql-f: partition-wide (db.partition) references merge every keyspace
+ * of the partition into one shadow table; DML routes each row back to
+ * its owning keyspace through the row map. Uses a private engine so the
+ * mutations below cannot pollute the shared-seed tests. */
+static void test_partition_wide(void)
+{
+    edb_eql_ctx ctx;
+    rm_rf("tests/data/eql_pw");
+    ctx.engine = edb_engine_open("tests/data/eql_pw");
+    CHECK(ctx.engine != NULL);
+    ctx.config = edb_config_open(ctx.engine);
+    CHECK(ctx.config != NULL);
+    ctx.repl = NULL;
+    CHECK(edb_partition_create(ctx.config, "Demo", "People",
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL));
+    for (int i = 0; i < NEMPLOYEES; i++) {
+        CHECK(edb_put(ctx.engine, "People", "employees", employees[i][0],
+                      employees[i][1], -1));
+    }
+    CHECK(edb_put(ctx.engine, "People", "managers", "mgr01",
+                  "{\"name\":\"Joan\",\"dept\":\"eng\"}", -1));
+    CHECK(edb_put(ctx.engine, "People", "managers", "mgr02",
+                  "{\"name\":\"Ken\",\"dept\":\"research\"}", -1));
+    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+                               "employees", NULL));
+    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+                               "managers", NULL));
+
+    /* merged SELECT: rows from employees + managers, union of columns */
+    char *out = run_ok(&ctx, "SELECT id, name, dept FROM Demo.People "
+                             "ORDER BY id");
+    CHECK(out != NULL && json_has(out, "\"emp001\""));
+    CHECK(json_has(out, "\"mgr01\"") && json_has(out, "\"eng\""));
+    CHECK(json_has(out, "\"Grace\"") && json_has(out, "\"Joan\""));
+    free(out);
+
+    /* merged COUNT across both keyspaces: 5 employees + 2 managers */
+    out = run_ok(&ctx, "SELECT COUNT(*) FROM Demo.People");
+    CHECK(out != NULL && json_has(out, "[7]"));
+    free(out);
+
+    /* WHERE across keyspaces */
+    out = run_ok(&ctx, "SELECT id FROM Demo.People WHERE dept = 'eng'");
+    CHECK(out != NULL && json_has(out, "\"mgr01\""));
+    CHECK(!json_has(out, "\"mgr02\""));
+    free(out);
+
+    /* join a pw reference with a specific keyspace table */
+    out = run_ok(&ctx, "SELECT e.id FROM Demo.People e "
+                       "JOIN Demo.People.managers m ON e.manager = m.id "
+                       "WHERE m.dept = 'eng' ORDER BY e.id");
+    CHECK(out != NULL && json_has(out, "\"emp001\""));
+    CHECK(json_has(out, "\"emp003\"") && json_has(out, "\"emp004\""));
+    free(out);
+
+    /* 3-part text is never swallowed by a pw table sharing the prefix:
+     * the specific keyspace still resolves to its own shard */
+    out = run_ok(&ctx, "SELECT COUNT(*) FROM Demo.People.employees");
+    CHECK(out != NULL && json_has(out, "[5]"));
+    free(out);
+
+    /* INSERT has no target keyspace and stays rejected */
+    out = NULL;
+    int status = edb_eql_execute(&ctx,
+                                 "INSERT INTO Demo.People (id, name) "
+                                 "VALUES ('x1', 'X')",
+                                 ~0ULL, true, &out);
+    CHECK(status == 400);
+    CHECK(out != NULL && json_has(out, "explicit"));
+    free(out);
+
+    /* UPDATE routes rows back to their owning keyspaces (age already
+     * exists on the employee docs, so no new-column assignment happens) */
+    out = run_ok(&ctx, "UPDATE Demo.People SET age = 99 "
+                       "WHERE id = 'emp001' OR id = 'mgr01'");
+    CHECK(strstr(out, "\"count\":2") != NULL);
+    free(out);
+    bool found = false;
+    char *snap = stored_json(&ctx, "emp001", &found);
+    CHECK(found && strstr(snap, "\"age\":99") != NULL);
+    free(snap);
+    cJSON *doc = edb_get(ctx.engine, "People", "managers", "mgr01");
+    CHECK(doc != NULL);
+    if (doc) {
+        char *mtxt = cJSON_PrintUnformatted(doc);
+        CHECK(strstr(mtxt, "\"age\":99") != NULL);
+        cJSON_free(mtxt);
+        cJSON_Delete(doc);
+    }
+
+    /* DELETE across keyspaces */
+    out = run_ok(&ctx, "DELETE FROM Demo.People WHERE id = 'emp005' "
+                       "OR id = 'mgr02'");
+    CHECK(strstr(out, "\"count\":2") != NULL);
+    free(out);
+    snap = stored_json(&ctx, "emp005", &found);
+    CHECK(!found && snap == NULL);
+    doc = edb_get(ctx.engine, "People", "managers", "mgr02");
+    CHECK(doc == NULL);
+
+    edb_config_close(ctx.config);
+    edb_engine_close(ctx.engine);
+}
+
 static void test_rejections(const edb_eql_ctx *ctx)
 {
     char *out = NULL;
@@ -864,6 +978,7 @@ int main(void)
     test_classification_and_refs();
 
     test_write_back(&ctx);
+    test_partition_wide();
 
     test_rejections(&ctx);
 
