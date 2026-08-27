@@ -31,4 +31,11 @@ echo "$out" | grep -q "row inserted" || { echo "eql insert failed: $out"; exit 1
 out=$(bin/eql -s "$SOCK" 'SELECT name FROM app.people.employees WHERE id = '"'"'zz1'"'"'' | tail -2 | head -1)
 echo "$out" | grep -q "Zed" || { echo "eql read-back failed: $out"; exit 1; }
 
+# ---- partition-wide reference (eql-f): db.partition with no keyspace ----
+out=$(bin/eql -s "$SOCK" 'SELECT COUNT(*) FROM app.people')
+echo "$out" | grep -q "(1 row)" || { echo "eql partition-wide select failed: $out"; exit 1; }
+
+out=$(bin/eql -s "$SOCK" 'UPDATE app.people SET role = '"'"'staff'"'"' WHERE id = '"'"'zz1'"'"'')
+echo "$out" | grep -q "row updated" || { echo "eql partition-wide update failed: $out"; exit 1; }
+
 echo "eql console tests passed"
