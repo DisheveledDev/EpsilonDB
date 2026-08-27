@@ -38,6 +38,7 @@ SERVER_BIN = bin/epsilond
 CLI_BIN = bin/epsilonctl
 BACKUP_BIN = bin/epsilonbkup
 BENCH_BIN = bin/epsilonbench
+EQL_BIN = bin/eql
 
 # cluster module (mesh core + wire codec + rebalancing)
 CLUSTER_SRC = src/socket/epsilon_cluster.c src/socket/estp_wire.c \
@@ -63,7 +64,7 @@ TEST_BINS = tests/test_crypto tests/test_engine tests/test_config \
             tests/test_console tests/test_eql tests/test_eql_api
 .PHONY: all test clean
 
-all: $(SERVER_BIN) $(CLI_BIN) $(BACKUP_BIN) $(BENCH_BIN)
+all: $(SERVER_BIN) $(CLI_BIN) $(BACKUP_BIN) $(BENCH_BIN) $(EQL_BIN)
 $(ENGINE_LIB): $(ENGINE_OBJ)
 	@mkdir -p bin
 	ar rcs $@ $^
@@ -92,6 +93,10 @@ $(CLI_BIN): $(CTL_SRC) vendor/cjson/cJSON.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ $(CTL_SRC) vendor/cjson/cJSON.c \
 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
+
+$(EQL_BIN): src/eql.c vendor/cjson/cJSON.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ src/eql.c vendor/cjson/cJSON.c 		$(LDFLAGS) $(STATIC_LDFLAGS) $(LDLIBS) $(STATIC_LDLIBS)
 
 $(BENCH_BIN): src/epsilonbench.c src/api/version.h vendor/cjson/cJSON.c
 	@mkdir -p bin
