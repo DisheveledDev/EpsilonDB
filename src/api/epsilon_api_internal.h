@@ -94,6 +94,10 @@ bool handle_admin_remove_node(const edb_http_request *req,
                               edb_http_response *res);
 
 /* epsilon_api_settings.c: named settings + status */
+/* epsilon_api_eql.c: SQL-over-HTTP surface */
+bool handle_data_eql(const edb_http_request *req, edb_http_response *res);
+bool handle_admin_eql(const edb_http_request *req, edb_http_response *res);
+
 bool handle_settings(const edb_http_request *req, edb_http_response *res);
 bool handle_status(const edb_http_request *req, edb_http_response *res);
 

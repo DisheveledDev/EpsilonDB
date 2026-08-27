@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../../vendor/sqlite/sqlite3.h"
 
@@ -25,14 +26,64 @@ typedef struct {
     char dotted[EQL_MAX_NAME];   /* canonical db.part.ks */
     char alias[16];              /* eql_t0 .. */
     char cols[EQL_MAX_COLS][128];
+    uint8_t kinds[EQL_MAX_COLS]; /* nonzero: column carried objects/arrays */
     size_t ncols;
 } eql_table;
+
+/* Statement classes edb_eql_execute understands. */
+typedef enum {
+    EQL_KIND_SELECT = 0,
+    EQL_KIND_DELETE,
+    EQL_KIND_UPDATE,
+    EQL_KIND_INSERT,
+    EQL_KIND_OTHER       /* WITH-led and unrecognized heads */
+} eql_kind;
 
 typedef struct {
     const char *sql;
     size_t pos;
     size_t len;
 } eql_scan;
+
+/* Buffers the row events sqlite fires while a user statement runs. They are
+ * only replicated once the statement reaches SQLITE_DONE, so a constraint
+ * failure rolling the statement back discards every buffered event. */
+#define EQL_MAX_EVENTS (1u << 20)
+#define EQL_ID_CAP 512
+
+typedef struct {
+    const eql_table *t;
+    int op;                  /* SQLITE_INSERT / SQLITE_UPDATE / SQLITE_DELETE */
+    sqlite3_int64 rowid;
+} eql_dml_ev;
+
+typedef struct {
+    eql_dml_ev *ev;
+    size_t n;
+    size_t cap;
+    bool overflow;           /* event cap hit: refuse to replicate */
+} eql_trapbuf;
+
+typedef struct {
+    const eql_table *t;
+    sqlite3_int64 rowid;
+    char id[EQL_ID_CAP];
+} eql_rowrec;
+
+typedef struct {
+    eql_rowrec *r;
+    size_t n;
+    size_t cap;
+} eql_rowmap;
+
+/* Per-execution authorizer state: DML is allowed on shard-backed tables
+ * for exactly one action class; everything else keeps the eql-b policy. */
+typedef struct {
+    const eql_table *tables;
+    size_t ntables;
+    int allow_op;            /* 0: read-only mode */
+} eql_acl;
+
 
 static bool is_ident_char(char c)
 {
@@ -156,8 +207,114 @@ static bool same_shard(const eql_table *t, const char *db, const char *part,
            strcmp(t->ks, ks) == 0;
 }
 
+
+typedef struct {
+    const eql_table *tables;
+    size_t ntables;
+    eql_trapbuf *buf;
+} eql_trap_bundle;
+
+static void traps_push(eql_trapbuf *b, const eql_table *t, int op,
+                       sqlite3_int64 rowid)
+{
+    if (b->overflow) {
+        return;
+    }
+    if (b->n == b->cap) {
+        size_t grown = b->cap ? b->cap * 2 : 256;
+        if (grown > EQL_MAX_EVENTS) {
+            b->overflow = true;
+            return;
+        }
+        eql_dml_ev *grown_ev = realloc(b->ev, grown * sizeof(*grown_ev));
+        if (!grown_ev) {
+            b->overflow = true;
+            return;
+        }
+        b->ev = grown_ev;
+        b->cap = grown;
+    }
+    b->ev[b->n].t = t;
+    b->ev[b->n].op = op;
+    b->ev[b->n].rowid = rowid;
+    b->n++;
+}
+
+static void trap_row_update(void *ud, int op, const char *db,
+                            const char *table, sqlite3_int64 rowid)
+{
+    (void)db;
+    eql_trap_bundle *bd = ud;
+    for (size_t i = 0; i < bd->ntables; i++) {
+        if (strcmp(bd->tables[i].alias, table) == 0) {
+            traps_push(bd->buf, &bd->tables[i], op, rowid);
+            return;
+        }
+    }
+}
+
+static void map_add(eql_rowmap *m, const eql_table *t, sqlite3_int64 rowid,
+                    const char *id)
+{
+    if (m->n == m->cap) {
+        size_t grown = m->cap ? m->cap * 2 : 128;
+        eql_rowrec *g = realloc(m->r, grown * sizeof(*g));
+        if (!g) {
+            return;   /* lookup degrades to unknown-id for that record */
+        }
+        m->r = g;
+        m->cap = grown;
+    }
+    snprintf(m->r[m->n].id, EQL_ID_CAP, "%s", id ? id : "");
+    m->r[m->n].t = t;
+    m->r[m->n].rowid = rowid;
+    m->n++;
+}
+
+static bool map_take(eql_rowmap *m, const eql_table *t,
+                     sqlite3_int64 rowid, char id_out[EQL_ID_CAP])
+{
+    for (size_t i = m->n; i > 0; i--) {
+        eql_rowrec *e = &m->r[i - 1];
+        if (e->t == t && e->rowid == rowid) {
+            memcpy(id_out, e->id, EQL_ID_CAP);
+            memmove(&m->r[i - 1], &m->r[i], (m->n - i) * sizeof(*m->r));
+            m->n--;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void map_free(eql_rowmap *m)
+{
+    free(m->r);
+    m->r = NULL;
+    m->n = m->cap = 0;
+}
+
+
+/* Parses db.part.ks at the cursor; on success advances past it. */
+static bool parse_ref(eql_scan *sc, char parts[3][256])
+{
+    bool ok = true;
+    for (int seg = 0; seg < 3 && ok; seg++) {
+        skip_spaces_comments(sc);
+        ok = read_ident(sc, parts[seg], 256);
+        if (ok && seg < 2) {
+            skip_spaces_comments(sc);
+            ok = sc->pos < sc->len && sc->sql[sc->pos] == '.';
+            if (ok) {
+                sc->pos++;
+            }
+        }
+    }
+    return ok;
+}
+
 /* Collects Database.Partition.Keyspace references following FROM/JOIN
- * keywords. Malformed positions are ignored (SQLite reports them later). */
+ * keywords and comma-separated source lists. Malformed positions are
+ * ignored (SQLite reports them later). */
 static int collect_refs(const char *sql, eql_table *tables, int ntables)
 {
     eql_scan sc = { sql, 0, strlen(sql) };
@@ -181,36 +338,22 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
             continue;
         }
         size_t wlen = sc.pos - start;
-        if (wlen != 4 && wlen != 5) {
+        if (wlen != 4 && wlen != 5 && wlen != 6) {
             continue;
         }
         char word[8];
         memcpy(word, sc.sql + start, wlen);
-        word[wlen] = '\0';
+        word[wlen] = '\0';;;
         for (size_t i = 0; i < wlen; i++) {
             word[i] = (char)tolower((unsigned char)word[i]);
         }
-        if (strcmp(word, "from") != 0 && strcmp(word, "join") != 0) {
+        if (strcmp(word, "from") != 0 && strcmp(word, "join") != 0 &&
+            strcmp(word, "into") != 0 && strcmp(word, "update") != 0) {
             continue;
         }
 
         char parts[3][256];
-        bool ok = true;
-        for (int seg = 0; seg < 3 && ok; seg++) {
-            skip_spaces_comments(&sc);
-            ok = read_ident(&sc, parts[seg], sizeof(parts[seg]));
-            if (ok && seg < 2) {
-                skip_spaces_comments(&sc);
-                ok = sc.pos < sc.len && sc.sql[sc.pos] == '.';
-                if (ok) {
-                    sc.pos++;
-                }
-            }
-        }
-        if (!ok) {
-            ok = true;
-        }
-        if (!ok || !parts[0][0] || !parts[1][0] || !parts[2][0]) {
+        if (!parse_ref(&sc, parts)) {
             /* subquery or unsupported reference shape: let SQLite complain */
             continue;
         }
@@ -232,6 +375,79 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
             snprintf(t->alias, sizeof(t->alias), "eql_t%d",
                      ntables + found);
             found++;
+        }
+
+        /* optional alias: AS ident | bare-ident (skipped; not a keyword we
+         * scan for) */
+        {
+            size_t save = sc.pos;
+            skip_spaces_comments(&sc);
+            size_t wstart = sc.pos;
+            while (sc.pos < sc.len && is_ident_char(sc.sql[sc.pos])) {
+                sc.pos++;
+            }
+            bool consumed = false;
+            if (sc.pos > wstart) {
+                char low[8] = {0};
+                size_t wl = sc.pos - wstart;
+                if (wl < sizeof(low)) {
+                    memcpy(low, sc.sql + wstart, wl);
+                    low[wl] = '\0';;
+                    for (size_t k = 0; k < wl; k++) {
+                        low[k] = (char)tolower((unsigned char)low[k]);
+                    }
+                    if (strcmp(low, "as") == 0) {
+                        skip_spaces_comments(&sc);
+                        wstart = sc.pos;
+                        while (sc.pos < sc.len &&
+                               is_ident_char(sc.sql[sc.pos])) {
+                            sc.pos++;
+                        }
+                        consumed = sc.pos > wstart;
+                    } else if (wl != 4 && wl != 5) {
+                        consumed = true;
+                    }
+                }
+            }
+            if (!consumed) {
+                sc.pos = save;
+            }
+        }
+        /* comma-separated additional sources: FROM t1 alias , t2 alias */
+        for (;;) {
+            size_t save2 = sc.pos;
+            skip_spaces_comments(&sc);
+            if (sc.pos >= sc.len || sc.sql[sc.pos] != ',') {
+                sc.pos = save2;
+                break;
+            }
+            char more[3][256];
+            sc.pos++;
+            if (!parse_ref(&sc, more)) {
+                /* not another source list element (e.g. subquery or AS):
+                 * rewind so SQLite sees the original text */
+                sc.pos = save2;
+                break;
+            }
+            bool dup2 = false;
+            for (int i = 0; i < ntables + found; i++) {
+                if (same_shard(&tables[i], more[0], more[1], more[2])) {
+                    dup2 = true;
+                    break;
+                }
+            }
+            if (!dup2 && ntables + found < EQL_MAX_TABLES) {
+                eql_table *t = &tables[ntables + found];
+                memset(t, 0, sizeof(*t));
+                snprintf(t->db, sizeof(t->db), "%s", more[0]);
+                snprintf(t->part, sizeof(t->part), "%s", more[1]);
+                snprintf(t->ks, sizeof(t->ks), "%s", more[2]);
+                snprintf(t->dotted, sizeof(t->dotted), "%s.%s.%s", t->db,
+                         t->part, t->ks);
+                snprintf(t->alias, sizeof(t->alias), "eql_t%d",
+                         ntables + found);
+                found++;
+            }
         }
     }
     return found;
@@ -346,7 +562,8 @@ static char *rewrite_sql(const char *sql, const eql_table *tables,
 /* --- shard materialization ------------------------------------------- */
 
 static bool perm_denied(const edb_eql_ctx *ctx, const eql_table *t,
-                        uint64_t groups, bool trusted)
+                        uint64_t groups, bool trusted,
+                        edb_permission perm)
 {
     if (trusted) {
         return false;
@@ -355,8 +572,131 @@ static bool perm_denied(const edb_eql_ctx *ctx, const eql_table *t,
     if (!edb_partition_get(ctx->config, t->db, t->part, &part)) {
         return false;   /* implicit partition: allow-all masks */
     }
-    return !edb_check_perm(part.read_mask, groups, EDB_PERM_READ);
+    uint64_t mask;
+    switch (perm) {
+    case EDB_PERM_CREATE: mask = part.create_mask; break;
+    case EDB_PERM_UPDATE: mask = part.update_mask; break;
+    case EDB_PERM_DELETE: mask = part.delete_mask; break;
+    default:              mask = part.read_mask;  break;
+    }
+    return !edb_check_perm(mask, groups, perm);
 }
+
+/* Classifies the statement head keyword. */
+static eql_kind classify_statement(const char *sql)
+{
+    eql_scan sc = { sql, 0, strlen(sql) };
+    skip_spaces_comments(&sc);
+    char word[16];
+    size_t wl = 0;
+    while (sc.pos < sc.len && is_ident_char(sc.sql[sc.pos]) &&
+           wl + 1 < sizeof(word)) {
+        word[wl++] = (char)tolower((unsigned char)sc.sql[sc.pos]);
+        sc.pos++;
+    }
+    word[wl] = '\0';;
+    if (strcmp(word, "delete") == 0) {
+        return EQL_KIND_DELETE;
+    }
+    if (strcmp(word, "update") == 0) {
+        return EQL_KIND_UPDATE;
+    }
+    if (strcmp(word, "insert") == 0 || strcmp(word, "replace") == 0) {
+        return EQL_KIND_INSERT;
+    }
+    if (strcmp(word, "select") == 0 || strcmp(word, "values") == 0 ||
+        strcmp(word, "explain") == 0) {
+        return EQL_KIND_SELECT;
+    }
+    return EQL_KIND_OTHER;
+}
+
+
+/* For INSERT statements, picks up an explicit column list following the
+ * INTO reference so writes into previously-empty shards create usable
+ * shadow tables. */
+static void scan_insert_columns(const char *sql, eql_table *tables,
+                                size_t ntables)
+{
+    eql_scan sc = { sql, 0, strlen(sql) };
+    while (sc.pos < sc.len) {
+        skip_spaces_comments(&sc);
+        if (sc.pos >= sc.len) {
+            break;
+        }
+        char c = sc.sql[sc.pos];
+        if (c == '\'' || c == '"' || c == '`' || c == '[') {
+            skip_quoted_raw(&sc);
+            continue;
+        }
+        size_t start = sc.pos;
+        while (sc.pos < sc.len && is_ident_char(sc.sql[sc.pos])) {
+            sc.pos++;
+        }
+        if (sc.pos == start) {
+            sc.pos++;
+            continue;
+        }
+        size_t wlen = sc.pos - start;
+        if (wlen != 4) {
+            continue;
+        }
+        char word[8];
+        memcpy(word, sc.sql + start, wlen);
+        word[wlen] = '\0';;
+        for (size_t i = 0; i < wlen; i++) {
+            word[i] = (char)tolower((unsigned char)word[i]);
+        }
+        if (strcmp(word, "into") != 0) {
+            continue;
+        }
+
+        char parts[3][256];
+        if (!parse_ref(&sc, parts)) {
+            continue;
+        }
+        eql_table *t = NULL;
+        for (size_t i = 0; i < ntables; i++) {
+            if (same_shard(&tables[i], parts[0], parts[1], parts[2])) {
+                t = &tables[i];
+                break;
+            }
+        }
+        if (!t) {
+            continue;
+        }
+        skip_spaces_comments(&sc);
+        if (sc.pos >= sc.len || sc.sql[sc.pos] != '(') {
+            continue;   /* INSERT ... VALUES without a column list */
+        }
+        sc.pos++;
+        for (;;) {
+            char col[128];
+            skip_spaces_comments(&sc);
+            if (!read_ident(&sc, col, sizeof(col))) {
+                break;
+            }
+            bool seen = false;
+            for (size_t i = 0; i < t->ncols; i++) {
+                if (strcmp(t->cols[i], col) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && t->ncols < EQL_MAX_COLS) {
+                snprintf(t->cols[t->ncols++], sizeof(t->cols[0]), "%s",
+                         col);
+            }
+            skip_spaces_comments(&sc);
+            if (sc.pos < sc.len && sc.sql[sc.pos] == ',') {
+                sc.pos++;
+                continue;
+            }
+            break;
+        }
+    }
+}
+
 
 /* Fetches the live documents of one shard as parallel arrays (ids +
  * values), mirroring REST read semantics: quorum merge when replication
@@ -439,7 +779,19 @@ static void union_columns(eql_table *t, const cJSON *doc)
             }
         }
         if (!seen && t->ncols < EQL_MAX_COLS) {
+            if (cJSON_IsObject(item) || cJSON_IsArray(item)) {
+                t->kinds[t->ncols] = 1;
+            }
             snprintf(t->cols[t->ncols++], sizeof(t->cols[0]), "%s", key);
+        }
+        /* an existing column may first appear as scalar then as object */
+        if (seen && (cJSON_IsObject(item) || cJSON_IsArray(item))) {
+            for (size_t i = 0; i < t->ncols; i++) {
+                if (strcmp(t->cols[i], key) == 0) {
+                    t->kinds[i] = 1;
+                    break;
+                }
+            }
         }
     }
 }
@@ -483,7 +835,7 @@ static void bind_json(sqlite3_stmt *stmt, int index, const cJSON *v)
  * Returns 0 on success, an HTTP-style code otherwise. Takes ownership of
  * docs (frees it); ids/nids are borrowed. */
 static int materialize(sqlite3 *db, const eql_table *t, cJSON *docs,
-                       char **ids, size_t nids)
+                       char **ids, size_t nids, eql_rowmap *map)
 {
     char sql[4096];
     size_t used = 0;
@@ -558,7 +910,9 @@ static int materialize(sqlite3 *db, const eql_table *t, cJSON *docs,
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             fprintf(stderr, "eql: insert failed: %s\n", sqlite3_errmsg(db));
             status = 500;
+            break;
         }
+        map_add(map, t, sqlite3_last_insert_rowid(db), ids[r]);
     }
     sqlite3_finalize(stmt);
     cJSON_Delete(docs);
@@ -576,22 +930,351 @@ static void harden_connection(sqlite3 *db)
     sqlite3_limit(db, SQLITE_LIMIT_COMPOUND_SELECT, 512);
 }
 
+#define EQL_EXEC_TIMEOUT_MS 5000
+
+typedef struct {
+    long long deadline_us;
+} eql_watchdog;
+
+static long long eql_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+/* Progress callback: returns nonzero once the statement has burned more
+ * than its deadline, making sqlite3_step return SQLITE_INTERRUPT. */
+static int eql_progress(void *ud)
+{
+    eql_watchdog *w = ud;
+    return eql_now_us() > w->deadline_us ? 1 : 0;
+}
+
+/* Denies every statement class a read-only query has no business running:
+ * schema mutation, transaction/savepoint control, pragmas, and database
+ * attach/detach. Row DML is allowed only for the single action class this
+ * execution declared and only on shard-backed aliases. */
 static int deny_authorizer(void *ud, int action, const char *a1,
                            const char *a2, const char *db_name,
                            const char *trigger)
 {
-    (void)a1;
     (void)a2;
     (void)db_name;
     (void)trigger;
-    switch (action) {
-    case SQLITE_DETACH:
-    case SQLITE_ATTACH:
-        return SQLITE_DENY;
-    default:
-        (void)ud;
-        return SQLITE_OK;
+    const eql_acl *acl = ud;
+    bool is_dml_act = action == SQLITE_INSERT || action == SQLITE_UPDATE ||
+                      action == SQLITE_DELETE;
+    if (!is_dml_act) {
+        switch (action) {
+        case SQLITE_ATTACH:
+        case SQLITE_DETACH:
+        case SQLITE_CREATE_INDEX:
+        case SQLITE_CREATE_TABLE:
+        case SQLITE_CREATE_TEMP_INDEX:
+        case SQLITE_CREATE_TEMP_TABLE:
+        case SQLITE_CREATE_TEMP_TRIGGER:
+        case SQLITE_CREATE_TEMP_VIEW:
+        case SQLITE_CREATE_TRIGGER:
+        case SQLITE_CREATE_VIEW:
+        case SQLITE_PRAGMA:
+        case SQLITE_TRANSACTION:
+        case SQLITE_SAVEPOINT:
+        case SQLITE_REINDEX:
+        case SQLITE_ANALYZE:
+        case SQLITE_ALTER_TABLE:
+            (void)a1;
+            return SQLITE_DENY;
+        default:
+            return SQLITE_OK;
+        }
     }
+    if (acl && acl->allow_op == action && a1) {
+        for (size_t i = 0; i < acl->ntables; i++) {
+            if (strcmp(acl->tables[i].alias, a1) == 0) {
+                return SQLITE_OK;
+            }
+        }
+    }
+    (void)a1;
+    return SQLITE_DENY;
+}
+
+/* --- replay: buffered events -> replicated changes -------------------- */
+
+#define EQL_WRITE_ATTEMPTS 3
+#define EQL_RETRY_SLEEP_MS 100
+
+/* Sends one change through the normal write paths: replication fan-out
+ * when a repl service is attached, local engine otherwise. Retries
+ * transient failures; LWW conditional apply keeps replays idempotent. */
+static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
+                            const char *id, cJSON *value, int *out_code)
+{
+    long long ts = (long long)time(NULL);
+    char *text = NULL;
+    if (value) {
+        /* value stays caller-owned: serialize manually so repeated retries
+         * reuse it without duplicating ownership into the envelope */
+        char *vtxt = cJSON_PrintUnformatted(value);
+        size_t cap = strlen(vtxt ? vtxt : "") + EQL_ID_CAP +
+                     strlen(t->db) + strlen(t->part) + strlen(t->ks) + 128;
+        text = malloc(cap);
+        if (!text) {
+            free(vtxt);
+            *out_code = 500;
+            return -1;
+        }
+        snprintf(text, cap,
+                 "\"op\":\"put\",\"db\":\"%s\",\"partition\":\"%s\",\"keyspace\":\"%s\",\"id\":\"%s\",\"value\":%s,\"ttl_abs\":-1,\"ts\":%lld\"}",
+                 t->db, t->part, t->ks, id, vtxt ? vtxt : "", ts);
+        free(vtxt);
+    } else {
+        cJSON *change = cJSON_CreateObject();
+        if (!change) {
+            *out_code = 500;
+            return -1;
+        }
+        cJSON_AddStringToObject(change, "op", "delete");
+        cJSON_AddStringToObject(change, "db", t->db);
+        cJSON_AddStringToObject(change, "partition", t->part);
+        cJSON_AddStringToObject(change, "keyspace", t->ks);
+        cJSON_AddStringToObject(change, "id", id);
+        char tsbuf[32];
+        snprintf(tsbuf, sizeof(tsbuf), "%lld", ts);
+        cJSON_AddRawToObject(change, "ts", tsbuf);
+        text = cJSON_PrintUnformatted(change);
+        cJSON_Delete(change);
+        if (!text) {
+            *out_code = 500;
+            return -1;
+        }
+    }
+    if (!text) {
+        *out_code = 500;
+        return -1;
+    }
+
+    int code = 0;
+    for (int attempt = 0; attempt < EQL_WRITE_ATTEMPTS; attempt++) {
+        if (ctx->repl) {
+            edb_repl_status st = edb_repl_write(ctx->repl, t->db, text);
+            if (st == EDB_REPL_OK) {
+                code = 200;
+                break;
+            }
+            code = st == EDB_REPL_QUORUM_LOST ? 503 : 500;
+        } else if (value) {
+            char *body = cJSON_PrintUnformatted(value);
+
+            bool ok = body &&
+                      edb_put(ctx->engine, t->part, t->ks, id, body, -1);
+
+            free(body);
+            code = ok ? 200 : 500;
+            if (ok) {
+                break;
+            }
+        } else {
+            code = edb_delete(ctx->engine, t->part, t->ks, id) ? 200 : 500;
+            if (code == 200) {
+                break;
+            }
+        }
+        struct timespec pause = { 0, EQL_RETRY_SLEEP_MS * 1000000L };
+        nanosleep(&pause, NULL);
+    }
+    free(text);
+    *out_code = code;
+    return 0;
+}
+
+/* Rebuilds the stored document for one row from its shadow-table columns.
+ * Object/array columns were bound as JSON text during materialization and
+ * are parsed back so write-back preserves nesting. The record key itself
+ * travels in the change envelope, not inside the document body. */
+static cJSON *row_to_doc(sqlite3_stmt *rd, const eql_table *t)
+{
+    cJSON *doc = cJSON_CreateObject();
+    if (!doc) {
+        return NULL;
+    }
+    int ncols = sqlite3_column_count(rd);
+    for (int c = 1; c < ncols && (size_t)c < t->ncols; c++) {
+        cJSON *val = NULL;
+        switch (sqlite3_column_type(rd, c)) {
+        case SQLITE_INTEGER:
+            val = cJSON_CreateNumber((double)sqlite3_column_int64(rd, c));
+            break;
+        case SQLITE_FLOAT:
+            val = cJSON_CreateNumber(sqlite3_column_double(rd, c));
+            break;
+        case SQLITE_TEXT: {
+            const unsigned char *txt = sqlite3_column_text(rd, c);
+            const char *str = txt ? (const char *)txt : "";
+            if (t->kinds[c]) {
+                val = cJSON_Parse(str);
+            }
+            if (!val) {
+                val = cJSON_CreateString(str);
+            }
+            break;
+        }
+        case SQLITE_BLOB: {
+            const unsigned char *blob =
+                (const unsigned char *)sqlite3_column_blob(rd, c);
+            size_t blen = (size_t)sqlite3_column_bytes(rd, c);
+            char *hex = malloc(blen * 2 + 1);
+            if (hex) {
+                static const char digits[] = "0123456789abcdef";
+                for (size_t b = 0; b < blen; b++) {
+                    hex[b * 2] = digits[blob[b] >> 4];
+                    hex[b * 2 + 1] = digits[blob[b] & 0xF];
+                }
+                hex[blen * 2] = '\0';
+                val = cJSON_CreateString(hex);
+                free(hex);
+            }
+            break;
+        }
+        default:
+            val = cJSON_CreateNull();
+            break;
+        }
+        if (!val) {
+            val = cJSON_CreateNull();
+        }
+        cJSON_AddItemToObject(doc, t->cols[c], val);
+    }
+    return doc;
+}
+
+typedef struct {
+    const eql_table *t;
+    sqlite3_stmt *rd;
+} eql_reader;
+
+static sqlite3_stmt *reader_for(eql_reader *readers, size_t *nr,
+                                const eql_table *t, sqlite3 *db)
+{
+    for (size_t i = 0; i < *nr; i++) {
+        if (readers[i].t == t) {
+            return readers[i].rd;
+        }
+    }
+    size_t cap = 128;
+    for (size_t i = 0; i < t->ncols; i++) {
+        cap += strlen(t->cols[i]) + 8;
+    }
+    char *sql = malloc(cap);
+    if (!sql) {
+        return NULL;
+    }
+    snprintf(sql, cap, "SELECT ");
+    for (size_t i = 0; i < t->ncols; i++) {
+        snprintf(sql + strlen(sql), cap - strlen(sql), "%s\"%s\"",
+                 i ? "," : "", t->cols[i]);
+    }
+    snprintf(sql + strlen(sql), cap - strlen(sql),
+             " FROM \"%s\" WHERE rowid=?", t->alias);
+    sqlite3_stmt *rd = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &rd, NULL) != SQLITE_OK) {
+        fprintf(stderr, "eql: prepare reader failed: %s\n",
+                sqlite3_errmsg(db));
+        free(sql);
+        return NULL;
+    }
+    free(sql);
+    readers[*nr].t = t;
+    readers[*nr].rd = rd;
+    (*nr)++;
+    return rd;
+}
+
+/* Applies buffered events best-effort once the statement has committed:
+ * each record is retried independently and per-id outcomes are reported
+ * to the caller rather than aborting the batch. */
+static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
+                           eql_rowmap *map, sqlite3 *db,
+                           cJSON **applied_out, cJSON **failed_out)
+{
+    cJSON *applied = cJSON_CreateArray();
+    cJSON *failed = cJSON_CreateArray();
+    eql_reader *readers = calloc(buf->n + 1, sizeof(*readers));
+    size_t nr = 0;
+    if (!applied || !failed || !readers) {
+        cJSON_Delete(applied);
+        cJSON_Delete(failed);
+        free(readers);
+        *applied_out = applied ? applied : cJSON_CreateArray();
+        *failed_out = failed ? failed : cJSON_CreateArray();
+        return;
+    }
+
+    for (size_t e = 0; e < buf->n && !buf->overflow; e++) {
+        const eql_dml_ev *ev = &buf->ev[e];
+        if (ev->op == SQLITE_DELETE) {
+            char id[EQL_ID_CAP];
+            if (!map_take(map, ev->t, ev->rowid, id)) {
+                cJSON_AddItemToArray(failed, cJSON_CreateString("-"));
+                continue;
+            }
+            int code = 0;
+            replicate_record(ctx, ev->t, id, NULL, &code);
+            cJSON_AddItemToArray(code == 200 ? applied : failed,
+                                 cJSON_CreateString(id));
+            continue;
+        }
+
+        /* INSERT / UPDATE: re-read the committed row content */
+        sqlite3_stmt *rd = reader_for(readers, &nr, ev->t, db);
+        if (!rd) {
+            cJSON_AddItemToArray(failed, cJSON_CreateString("-"));
+            continue;
+        }
+        sqlite3_reset(rd);
+        sqlite3_bind_int64(rd, 1, ev->rowid);
+        if (sqlite3_step(rd) != SQLITE_ROW) {
+            sqlite3_reset(rd);
+            char stale[EQL_ID_CAP];
+            bool known = map_take(map, ev->t, ev->rowid, stale);
+            cJSON_AddItemToArray(known ? applied : failed,
+                                 cJSON_CreateString(known ? stale : "-"));
+            continue;
+        }
+        char cur_id[EQL_ID_CAP];
+        const unsigned char *idtxt = sqlite3_column_text(rd, 0);
+        snprintf(cur_id, EQL_ID_CAP, "%s", idtxt ? (const char *)idtxt : "");
+        char old_id[EQL_ID_CAP];
+        bool had_old = map_take(map, ev->t, ev->rowid, old_id);
+        map_add(map, ev->t, ev->rowid, cur_id);
+
+        /* UPDATE renaming the primary key = delete old key + put new one */
+        if (had_old && strcmp(old_id, cur_id) != 0) {
+            int code = 0;
+            replicate_record(ctx, ev->t, old_id, NULL, &code);
+            cJSON_AddItemToArray(code == 200 ? applied : failed,
+                                 cJSON_CreateString(old_id));
+        }
+
+        cJSON *doc = row_to_doc(rd, ev->t);
+        sqlite3_reset(rd);
+        if (!doc) {
+            cJSON_AddItemToArray(failed, cJSON_CreateString(cur_id));
+            continue;
+        }
+        int code = 0;
+        replicate_record(ctx, ev->t, cur_id, doc, &code);
+        cJSON_AddItemToArray(code == 200 ? applied : failed,
+                             cJSON_CreateString(cur_id));
+    }
+
+    for (size_t i = 0; i < nr; i++) {
+        sqlite3_finalize(readers[i].rd);
+    }
+    free(readers);
+    *applied_out = applied;
+    *failed_out = failed;
 }
 
 /* --- statement execution --------------------------------------------- */
@@ -620,18 +1303,32 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
         return 400;
     }
 
+    eql_kind kind = classify_statement(sql);
+
     int status = 200;
-    eql_table tables[EQL_MAX_TABLES];
-    memset(tables, 0, sizeof(tables));
+    eql_table *tables = calloc(EQL_MAX_TABLES, sizeof(*tables));
+    if (!tables) {
+        return 500;
+    }
     int ntables = collect_refs(sql, tables, 0);
     if (ntables <= 0) {
         *json_out = error_response(
             "no Database.Partition.Keyspace reference found in FROM/JOIN");
+        free(tables);
         return 400;
     }
 
+    edb_permission need = EDB_PERM_READ;
+    if (kind == EQL_KIND_DELETE) {
+        need = EDB_PERM_DELETE;
+    } else if (kind == EQL_KIND_UPDATE) {
+        need = EDB_PERM_UPDATE;
+    } else if (kind == EQL_KIND_INSERT) {
+        need = EDB_PERM_CREATE;
+    }
+
     for (int i = 0; i < ntables && status == 200; i++) {
-        if (perm_denied(ctx, &tables[i], user_groups, trusted)) {
+        if (perm_denied(ctx, &tables[i], user_groups, trusted, need)) {
             status = 403;
         }
     }
@@ -640,13 +1337,24 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
         return status;
     }
 
+    bool is_dml = kind == EQL_KIND_DELETE || kind == EQL_KIND_UPDATE ||
+                  kind == EQL_KIND_INSERT;
+
+    eql_rowmap rowmap;
+    memset(&rowmap, 0, sizeof(rowmap));
+
     for (int i = 0; i < ntables; i++) {
         snprintf(tables[i].cols[tables[i].ncols++],
                  sizeof(tables[i].cols[0]), "id");
     }
 
+    if (kind == EQL_KIND_INSERT) {
+        scan_insert_columns(sql, tables, (size_t)ntables);
+    }
+
     char *rewritten = rewrite_sql(sql, tables, (size_t)ntables);
     if (!rewritten) {
+        free(tables);
         return 500;
     }
 
@@ -654,9 +1362,13 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_open(":memory:", &db) != SQLITE_OK) {
         free(rewritten);
+        free(tables);
         return 500;
     }
     harden_connection(db);
+
+    eql_watchdog watchdog = { eql_now_us() + EQL_EXEC_TIMEOUT_MS * 1000LL };
+    sqlite3_progress_handler(db, 20000, eql_progress, &watchdog);
 
     for (int i = 0; i < ntables && status == 200; i++) {
         size_t nids = 0;
@@ -670,28 +1382,44 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
         cJSON_ArrayForEach(doc, docs) {
             union_columns(&tables[i], doc);
         }
-        status = materialize(db, &tables[i], docs, ids, nids);
+        status = materialize(db, &tables[i], docs, ids, nids, &rowmap);
         if (status == 0) {
             status = 200;
         }
-
         for (size_t k = 0; k < nids; k++) {
             free(ids[k]);
         }
         free(ids);
     }
     if (status != 200) {
+        map_free(&rowmap);
+        free(tables);
         free(rewritten);
         sqlite3_close(db);
         return status > 0 ? status : 500;
     }
 
-    sqlite3_set_authorizer(db, deny_authorizer, NULL);
+    eql_acl acl = { tables, (size_t)ntables, 0 };
+    if (is_dml && kind == EQL_KIND_DELETE) {
+        acl.allow_op = SQLITE_DELETE;
+    } else if (is_dml && kind == EQL_KIND_UPDATE) {
+        acl.allow_op = SQLITE_UPDATE;
+    } else if (is_dml && kind == EQL_KIND_INSERT) {
+        acl.allow_op = SQLITE_INSERT;
+    }
+    sqlite3_set_authorizer(db, deny_authorizer, &acl);
 
     const char *tail = NULL;
     if (sqlite3_prepare_v2(db, rewritten, -1, &stmt, &tail) != SQLITE_OK) {
         const char *msg = sqlite3_errmsg(db);
-        *json_out = error_response(msg ? msg : "prepare failed");
+        if (!is_dml && sqlite3_extended_errcode(db) == SQLITE_AUTH) {
+            *json_out =
+                error_response("only SELECT statements are supported");
+        } else {
+            *json_out = error_response(msg ? msg : "prepare failed");
+        }
+        map_free(&rowmap);
+        free(tables);
         free(rewritten);
         sqlite3_close(db);
         return 400;
@@ -703,107 +1431,212 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
     }
     if (tail && *tail) {
         *json_out = error_response("one statement per request");
+        map_free(&rowmap);
+        free(tables);
+        free(rewritten);
         sqlite3_finalize(stmt);
         sqlite3_close(db);
-        free(rewritten);
         return 400;
     }
     free(rewritten);
-    if (!stmt || !sqlite3_stmt_readonly(stmt)) {
-        *json_out =
-            error_response("only SELECT statements are supported");
-        if (stmt) {
+    rewritten = NULL;
+
+    /* --- SELECT path ------------------------------------------------- */
+    if (!is_dml) {
+        if (!stmt || !sqlite3_stmt_readonly(stmt)) {
+            *json_out =
+                error_response("only SELECT statements are supported");
+            if (stmt) {
+                sqlite3_finalize(stmt);
+            }
+            map_free(&rowmap);
+            free(tables);
+            sqlite3_close(db);
+            return 400;
+        }
+        int ncols = sqlite3_column_count(stmt);
+        cJSON *result = cJSON_CreateObject();
+        cJSON *cols_json =
+            result ? cJSON_AddArrayToObject(result, "columns") : NULL;
+        cJSON *rows_json =
+            result ? cJSON_AddArrayToObject(result, "rows") : NULL;
+        if (!result || !cols_json || !rows_json) {
+            cJSON_Delete(result);
             sqlite3_finalize(stmt);
+            map_free(&rowmap);
+            free(tables);
+            sqlite3_close(db);
+            return 500;
         }
-        sqlite3_close(db);
-        return 400;
-    }
-
-    int ncols = sqlite3_column_count(stmt);
-    cJSON *result = cJSON_CreateObject();
-    cJSON *cols_json = result ? cJSON_AddArrayToObject(result, "columns")
-                              : NULL;
-    cJSON *rows_json = result ? cJSON_AddArrayToObject(result, "rows")
-                              : NULL;
-    if (!result || !cols_json || !rows_json) {
-        cJSON_Delete(result);
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
-        return 500;
-    }
-    cJSON_AddStringToObject(result, "status", "ok");
-    for (int c = 0; c < ncols; c++) {
-        const char *name = sqlite3_column_name(stmt, c);
-        cJSON_AddItemToArray(cols_json, cJSON_CreateString(name ? name : ""));
-    }
-
-    int step;
-    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
-        cJSON *row = cJSON_CreateArray();
-        if (!row) {
-            step = SQLITE_ERROR;
-            break;
-        }
+        cJSON_AddStringToObject(result, "status", "ok");
         for (int c = 0; c < ncols; c++) {
-            cJSON *val = NULL;
-            switch (sqlite3_column_type(stmt, c)) {
-            case SQLITE_INTEGER:
-                val = cJSON_CreateNumber(
-                    (double)sqlite3_column_int64(stmt, c));
+            const char *name = sqlite3_column_name(stmt, c);
+            cJSON_AddItemToArray(cols_json,
+                                 cJSON_CreateString(name ? name : ""));
+        }
+
+        int step;
+        while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+            cJSON *row = cJSON_CreateArray();
+            if (!row) {
+                step = SQLITE_ERROR;
                 break;
-            case SQLITE_FLOAT:
-                val = cJSON_CreateNumber(sqlite3_column_double(stmt, c));
-                break;
-            case SQLITE_TEXT:
-                val = cJSON_CreateString(
-                    (const char *)sqlite3_column_text(stmt, c));
-                break;
-            case SQLITE_BLOB: {
-                const unsigned char *blob =
-                    (const unsigned char *)sqlite3_column_blob(stmt, c);
-                size_t blen = (size_t)sqlite3_column_bytes(stmt, c);
-                char *hex = malloc(blen * 2 + 1);
-                if (!hex) {
+            }
+            for (int c = 0; c < ncols; c++) {
+                cJSON *val = NULL;
+                switch (sqlite3_column_type(stmt, c)) {
+                case SQLITE_INTEGER:
+                    val = cJSON_CreateNumber(
+                        (double)sqlite3_column_int64(stmt, c));
+                    break;
+                case SQLITE_FLOAT:
+                    val = cJSON_CreateNumber(
+                        sqlite3_column_double(stmt, c));
+                    break;
+                case SQLITE_TEXT:
+                    val = cJSON_CreateString(
+                        (const char *)sqlite3_column_text(stmt, c));
+                    break;
+                case SQLITE_BLOB: {
+                    const unsigned char *blob =
+                        (const unsigned char *)
+                            sqlite3_column_blob(stmt, c);
+                    size_t blen = (size_t)sqlite3_column_bytes(stmt, c);
+                    char *hex = malloc(blen * 2 + 1);
+                    if (!hex) {
+                        val = cJSON_CreateNull();
+                        break;
+                    }
+                    static const char digits[] = "0123456789abcdef";
+                    for (size_t b = 0; b < blen; b++) {
+                        hex[b * 2] = digits[blob[b] >> 4];
+                        hex[b * 2 + 1] = digits[blob[b] & 0xF];
+                    }
+                    hex[blen * 2] = '\0';
+                    val = cJSON_CreateString(hex);
+                    free(hex);
+                    break;
+                }
+                default:
                     val = cJSON_CreateNull();
                     break;
                 }
-                static const char digits[] = "0123456789abcdef";
-                for (size_t b = 0; b < blen; b++) {
-                    hex[b * 2] = digits[blob[b] >> 4];
-                    hex[b * 2 + 1] = digits[blob[b] & 0xF];
+                if (!val) {
+                    val = cJSON_CreateNull();
                 }
-                hex[blen * 2] = '\0';
-                val = cJSON_CreateString(hex);
-                free(hex);
-                break;
+                cJSON_AddItemToArray(row, val);
             }
-            default:
-                val = cJSON_CreateNull();
-                break;
-            }
-            if (!val) {
-                val = cJSON_CreateNull();
-            }
-            cJSON_AddItemToArray(row, val);
+            cJSON_AddItemToArray(rows_json, row);
         }
-        cJSON_AddItemToArray(rows_json, row);
-    }
-    if (step != SQLITE_DONE) {
-        const char *msg = sqlite3_errmsg(db);
-        cJSON_Delete(result);
-        *json_out = error_response(msg ? msg : "statement execution failed");
+        int sel_code;
+        if (step == SQLITE_INTERRUPT) {
+            cJSON_Delete(result);
+            *json_out = error_response(
+                "statement exceeded the execution time limit");
+            sel_code = 400;
+        } else if (step != SQLITE_DONE) {
+            const char *msg = sqlite3_errmsg(db);
+            cJSON_Delete(result);
+            *json_out =
+                error_response(msg ? msg : "statement execution failed");
+            sel_code = 400;
+        } else {
+            *json_out = cJSON_PrintUnformatted(result);
+            cJSON_Delete(result);
+            if (!*json_out) {
+                *json_out = error_response("encode failed");
+                sel_code = 500;
+            } else {
+                sel_code = 200;
+            }
+        }
         sqlite3_finalize(stmt);
+        map_free(&rowmap);
+        free(tables);
+        sqlite3_close(db);
+        return sel_code;
+    }
+
+    /* --- DML path under row hooks ------------------------------------ */
+    eql_trapbuf buf;
+    memset(&buf, 0, sizeof(buf));
+    eql_trap_bundle bundle = { tables, (size_t)ntables, &buf };
+    sqlite3_update_hook(db, trap_row_update, &bundle);
+
+    int dstep = sqlite3_step(stmt);
+    sqlite3_update_hook(db, NULL, NULL);
+    sqlite3_progress_handler(db, 0, NULL, NULL);
+
+    bool committed = dstep == SQLITE_DONE && !buf.overflow;
+    bool interrupted = dstep == SQLITE_INTERRUPT;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (!committed) {
+        const char *msg = interrupted
+                              ? "statement exceeded the execution time limit"
+                              : (buf.overflow
+                                     ? "too many changes for one statement"
+                                     : sqlite3_errmsg(db));
+        *json_out = error_response(msg ? msg : "statement failed");
+        free(buf.ev);
+        map_free(&rowmap);
+        free(tables);
         sqlite3_close(db);
         return 400;
     }
-    sqlite3_finalize(stmt);
+
+    cJSON *applied = NULL;
+    cJSON *failed = NULL;
+    process_events(ctx, &buf, &rowmap, db, &applied, &failed);
+    free(buf.ev);
+    map_free(&rowmap);
+    free(tables);
     sqlite3_close(db);
 
+    size_t napplied = applied ? (size_t)cJSON_GetArraySize(applied) : 0;
+    size_t nfailed = failed ? (size_t)cJSON_GetArraySize(failed) : 0;
+    size_t total = napplied + nfailed;
+
+    int rc_code;
+    cJSON *result = cJSON_CreateObject();
+    if (!result) {
+        cJSON_Delete(applied);
+        cJSON_Delete(failed);
+        return 500;
+    }
+    const char *opname = kind == EQL_KIND_DELETE
+                             ? "delete"
+                             : (kind == EQL_KIND_UPDATE ? "update"
+                                                        : "insert");
+    char cnt[32];
+    snprintf(cnt, sizeof(cnt), "%zu", total);
+    if (napplied > 0 || total == 0) {
+        cJSON_AddStringToObject(result, "status", "ok");
+        cJSON_AddStringToObject(result, "op", opname);
+        cJSON_AddRawToObject(result, "count", cnt);
+        cJSON_AddItemToObject(result, "applied",
+                              applied ? applied : cJSON_CreateArray());
+        cJSON_AddItemToObject(result, "failed",
+                              failed ? failed : cJSON_CreateArray());
+        rc_code = 200;
+    } else {
+        cJSON_AddStringToObject(result, "status", "error");
+        cJSON_AddStringToObject(
+            result, "message",
+            "no records were replicated for this statement");
+        cJSON_AddRawToObject(result, "count", cnt);
+        cJSON_AddItemToObject(result, "applied",
+                              applied ? applied : cJSON_CreateArray());
+        cJSON_AddItemToObject(result, "failed",
+                              failed ? failed : cJSON_CreateArray());
+        rc_code = 503;
+    }
     *json_out = cJSON_PrintUnformatted(result);
     cJSON_Delete(result);
     if (!*json_out) {
         *json_out = error_response("encode failed");
         return 500;
     }
-    return 200;
+    return rc_code;
 }
