@@ -112,7 +112,7 @@ static void setup_engine(edb_eql_ctx *ctx)
 
 
 
-    CHECK(edb_partition_create(ctx->config, "Demo", "People",
+    CHECK(edb_partition_create(ctx->config, "demo", "people",
 
                                EDB_MASK_ALLOW_ALL,
 
@@ -126,9 +126,7 @@ static void setup_engine(edb_eql_ctx *ctx)
 
 
 
-#define NEMPLOYEES 5
-
-
+#define NEMPLOYEES 10
 
 static const char *employees[NEMPLOYEES][2] = {
 
@@ -146,9 +144,79 @@ static const char *employees[NEMPLOYEES][2] = {
 
     { "emp004", "{\"name\":\"Edsger\",\"age\":41,\"manager\":\"mgr01\"}" },
 
-    { "emp005", "{\"name\":\"Barbara\",\"age\":33,\"email\":null," 
+    { "emp005", "{\"name\":\"Barbara\",\"age\":33,\"email\":null,"
 
-                "\"manager\":\"mgr02\",\"profile\":{\"level\":7}}" }
+                "\"manager\":\"mgr02\",\"profile\":{\"level\":7}}" },
+
+    { "emp006", "{\"name\":\"Dennis\",\"age\":38,\"email\":\"dennis@ex.com\","
+
+                "\"manager\":\"mgr01\"}" },
+
+    { "emp007", "{\"name\":\"Radia\",\"age\":47,\"email\":\"radia@ex.com\","
+
+                "\"manager\":\"mgr03\"}" },
+
+    { "emp008", "{\"name\":\"Linus\",\"age\":25,\"manager\":\"mgr01\"}" },
+
+    { "emp009", "{\"name\":\"Margaret\",\"age\":60,"
+
+                "\"email\":\"margaret@ex.com\",\"manager\":\"mgr03\","
+
+                "\"profile\":{\"level\":9}}" },
+
+    { "emp010", "{\"name\":\"Niklaus\",\"age\":31,"
+
+                "\"email\":\"niklaus@ex.com\",\"manager\":\"mgr02\"}" }
+
+};
+
+#define NMANAGERS 3
+#define NCONTRACTORS 5
+
+static const char *contractors[NCONTRACTORS][2] = {
+
+    { "con001", "{\"name\":\"Pete\",\"vendor\":\"acme\",\"rate\":55}" },
+
+    { "con002", "{\"name\":\"Quinn\",\"vendor\":\"acme\",\"rate\":62}" },
+
+    { "con003", "{\"name\":\"Rhea\",\"vendor\":\"beta\",\"rate\":70}" },
+
+    { "con004", "{\"name\":\"Sam\",\"vendor\":\"beta\",\"rate\":58}" },
+
+    { "con005", "{\"name\":\"Tess\",\"vendor\":\"gamma\",\"rate\":66}" }
+
+};
+
+#define NDEPARTMENTS 3
+#define NPROJECTS 4
+
+static const char *departments[NDEPARTMENTS][2] = {
+
+    { "d1", "{\"name\":\"Engineering\",\"floor\":3,\"budget\":500}" },
+
+    { "d2", "{\"name\":\"Research\",\"floor\":4,\"budget\":300}" },
+
+    { "d3", "{\"name\":\"Support\",\"floor\":2,\"budget\":120}" }
+
+};
+
+static const char *projects[NPROJECTS][2] = {
+
+    { "p1", "{\"title\":\"Atlas\",\"lead\":\"mgr01\",\"dept_id\":\"d1\","
+
+            "\"active\":true}" },
+
+    { "p2", "{\"title\":\"Borealis\",\"lead\":\"mgr02\",\"dept_id\":\"d2\","
+
+            "\"active\":true}" },
+
+    { "p3", "{\"title\":\"Cygnus\",\"lead\":\"mgr03\",\"dept_id\":\"d3\","
+
+            "\"active\":false}" },
+
+    { "p4", "{\"title\":\"Dorado\",\"lead\":\"mgr01\",\"dept_id\":\"d1\","
+
+            "\"active\":false}" }
 
 };
 
@@ -160,28 +228,71 @@ static void seed_data(const edb_eql_ctx *ctx)
 
     for (int i = 0; i < NEMPLOYEES; i++) {
 
-        CHECK(edb_put(ctx->engine, "People", "employees", employees[i][0],
+        CHECK(edb_put(ctx->engine, "people", "employees", employees[i][0],
 
                       employees[i][1], -1));
 
     }
 
-    CHECK(edb_put(ctx->engine, "People", "managers", "mgr01",
+    CHECK(edb_put(ctx->engine, "people", "managers", "mgr01",
 
                   "{\"name\":\"Joan\",\"dept\":\"eng\"}", -1));
 
-    CHECK(edb_put(ctx->engine, "People", "managers", "mgr02",
+    CHECK(edb_put(ctx->engine, "people", "managers", "mgr02",
 
                   "{\"name\":\"Ken\",\"dept\":\"research\"}", -1));
 
-    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+    CHECK(edb_put(ctx->engine, "people", "managers", "mgr03",
+
+                  "{\"name\":\"Marge\",\"dept\":\"support\"}", -1));
+
+    for (int i = 0; i < NCONTRACTORS; i++) {
+
+        CHECK(edb_put(ctx->engine, "people", "contractors", contractors[i][0],
+
+                      contractors[i][1], -1));
+
+    }
+
+    CHECK(edb_partition_create(ctx->config, "demo", "ops",
+
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
+
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL));
+
+    for (int i = 0; i < NDEPARTMENTS; i++) {
+
+        CHECK(edb_put(ctx->engine, "ops", "departments", departments[i][0],
+
+                      departments[i][1], -1));
+
+    }
+
+    for (int i = 0; i < NPROJECTS; i++) {
+
+        CHECK(edb_put(ctx->engine, "ops", "projects", projects[i][0],
+
+                      projects[i][1], -1));
+
+    }
+
+    CHECK(edb_partition_ensure(ctx->config, "demo", "people",
                                "employees", NULL));
 
-    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+    CHECK(edb_partition_ensure(ctx->config, "demo", "people",
                                "managers", NULL));
 
-    CHECK(edb_partition_ensure(ctx->config, "Demo", "People",
+    CHECK(edb_partition_ensure(ctx->config, "demo", "people",
+                               "contractors", NULL));
+
+    CHECK(edb_partition_ensure(ctx->config, "demo", "people",
                                "ghosts", NULL));
+
+    CHECK(edb_partition_ensure(ctx->config, "demo", "ops",
+                               "departments", NULL));
+
+    CHECK(edb_partition_ensure(ctx->config, "demo", "ops",
+                               "projects", NULL));
 
 }
 
@@ -201,7 +312,7 @@ static void test_select_star(const edb_eql_ctx *ctx)
 
 {
 
-    char *out = run_ok(ctx, "SELECT * FROM Demo.People.employees;");
+    char *out = run_ok(ctx, "SELECT * FROM demo.people.employees;");
 
     CHECK(out != NULL);
 
@@ -235,7 +346,7 @@ static void test_where(const edb_eql_ctx *ctx)
 
     char *out = run_ok(ctx,
 
-                       "SELECT id, name FROM Demo.People.employees "
+                       "SELECT id, name FROM demo.people.employees "
 
                        "WHERE age > 35 ORDER BY name");
 
@@ -261,11 +372,11 @@ static void test_where(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT COUNT(*) FROM Demo.People.employees "
+                 "SELECT COUNT(*) FROM demo.people.employees "
 
                  "WHERE manager = 'mgr01'");
 
-    CHECK(out != NULL && json_has(out, "[[3]]"));
+    CHECK(out != NULL && json_has(out, "[[5]]"));
 
     free(out);
 
@@ -281,7 +392,7 @@ static void test_aggregates_group_by(const edb_eql_ctx *ctx)
 
                        "SELECT manager, COUNT(*) AS n, AVG(age) AS avg_age "
 
-                       "FROM Demo.People.employees "
+                       "FROM demo.people.employees "
 
                        "GROUP BY manager ORDER BY n DESC");
 
@@ -297,11 +408,11 @@ static void test_aggregates_group_by(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT SUM(age) FROM Demo.People.employees "
+                 "SELECT SUM(age) FROM demo.people.employees "
 
                  "WHERE age IS NOT NULL");
 
-    CHECK(out != NULL && json_has(out, "[[184]]"));   /* 36+45+29+41+33 */
+    CHECK(out != NULL && json_has(out, "[[385]]"));   /* sum of 10 ages */
 
     free(out);
 
@@ -317,9 +428,9 @@ static void test_join(const edb_eql_ctx *ctx)
 
                        "SELECT e.id, e.name, m.dept "
 
-                       "FROM Demo.People.employees e "
+                       "FROM demo.people.employees e "
 
-                       "JOIN Demo.People.managers m ON e.manager = m.id "
+                       "JOIN demo.people.managers m ON e.manager = m.id "
 
                        "ORDER BY e.id");
 
@@ -343,9 +454,9 @@ static void test_self_join_dedupe(const edb_eql_ctx *ctx)
 
                        "SELECT a.name, b.name AS boss "
 
-                       "FROM Demo.People.employees a "
+                       "FROM demo.people.employees a "
 
-                       "JOIN Demo.People.employees b "
+                       "JOIN demo.people.employees b "
 
                        "ON a.manager = b.id WHERE b.age > 40");
 
@@ -373,9 +484,9 @@ static void test_quoted_identifiers(const edb_eql_ctx *ctx)
 
     char *out = run_ok(ctx,
 
-                       "SELECT \"id\" FROM \"Demo\".\"People\"."
+                       "SELECT \"id\" FROM \"demo\".\"people\"."
 
-                       "`employees` LIMIT 1");
+                       "`employees` ORDER BY id LIMIT 1");
 
     CHECK(out != NULL && json_has(out, "emp001"));
 
@@ -391,7 +502,7 @@ static void test_nested_values_as_text(const edb_eql_ctx *ctx)
 
     char *out = run_ok(ctx,
 
-                       "SELECT profile FROM Demo.People.employees "
+                       "SELECT profile FROM demo.people.employees "
 
                        "WHERE profile IS NOT NULL");
 
@@ -413,9 +524,9 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
                        "SELECT manager, COUNT(*) AS n "
 
-                       "FROM Demo.People.employees "
+                       "FROM demo.people.employees "
 
-                       "GROUP BY manager HAVING n >= 3");
+                       "GROUP BY manager HAVING n >= 4");
 
     CHECK(out != NULL && json_has(out, "\"mgr01\"") &&
 
@@ -429,9 +540,9 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT e.id FROM Demo.People.employees e "
+                 "SELECT e.id FROM demo.people.employees e "
 
-                 "LEFT JOIN Demo.People.ghosts m ON e.manager = m.id "
+                 "LEFT JOIN demo.people.ghosts m ON e.manager = m.id "
 
                  "WHERE m.id IS NULL LIMIT 2");
 
@@ -449,7 +560,7 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
                  "SELECT DISTINCT CASE WHEN age > 40 THEN 'senior' "
 
-                 "ELSE 'junior' END AS band FROM Demo.People.employees "
+                 "ELSE 'junior' END AS band FROM demo.people.employees "
 
                  "ORDER BY band DESC");
 
@@ -465,9 +576,9 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT id FROM Demo.People.employees "
+                 "SELECT id FROM demo.people.employees "
 
-                 "UNION ALL SELECT id FROM Demo.People.managers");
+                 "UNION ALL SELECT id FROM demo.people.managers");
 
     CHECK(out != NULL);
 
@@ -481,9 +592,9 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT a.id FROM Demo.People.employees a, "
+                 "SELECT a.id FROM demo.people.employees a, "
 
-                 "Demo.People.managers b WHERE b.dept = 'eng' AND "
+                 "demo.people.managers b WHERE b.dept = 'eng' AND "
 
 
                  "a.age < 30");
@@ -500,7 +611,7 @@ static void test_aggregate_and_join_polish(const edb_eql_ctx *ctx)
 
     out = run_ok(ctx,
 
-                 "SELECT upper(name) FROM Demo.People.employees "
+                 "SELECT upper(name) FROM demo.people.employees "
 
                  "WHERE manager IN ('mgr01','mgrXX') AND age BETWEEN 29 "
 
@@ -536,7 +647,7 @@ static void test_null_and_missing_fields(const edb_eql_ctx *ctx)
 
     char *out = run_ok(ctx,
 
-                       "SELECT id FROM Demo.People.employees "
+                       "SELECT id FROM demo.people.employees "
 
                        "WHERE email IS NULL");
 
@@ -560,7 +671,7 @@ static void test_permissions(void)
 
     setup_engine(&ctx);
 
-    CHECK(edb_put(ctx.engine, "People", "employees", "e1",
+    CHECK(edb_put(ctx.engine, "people", "employees", "e1",
 
                   "{\"n\":1}", -1));
 
@@ -568,7 +679,7 @@ static void test_permissions(void)
 
     uint64_t readers = 1ULL << 1;
 
-    CHECK(edb_partition_set_masks(&*ctx.config, "Demo", "People",
+    CHECK(edb_partition_set_masks(&*ctx.config, "demo", "people",
 
                                   EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
 
@@ -580,7 +691,7 @@ static void test_permissions(void)
 
     int status = edb_eql_execute(&ctx,
 
-                                 "SELECT * FROM Demo.People.employees",
+                                 "SELECT * FROM demo.people.employees",
 
                                  readers, false, &out);
 
@@ -594,7 +705,7 @@ static void test_permissions(void)
 
     status = edb_eql_execute(&ctx,
 
-                             "SELECT * FROM Demo.People.employees",
+                             "SELECT * FROM demo.people.employees",
 
                              0ULL, false, &out);
 
@@ -610,7 +721,7 @@ static void test_permissions(void)
 
     out = NULL;
 
-    status = edb_eql_execute(&ctx, "SELECT * FROM Ghost.Nope.things",
+    status = edb_eql_execute(&ctx, "SELECT * FROM ghost.nope.things",
 
                              0ULL, false, &out);
 
@@ -629,7 +740,7 @@ static void test_permissions(void)
 static char *stored_json(const edb_eql_ctx *ctx, const char *id,
                           bool *found)
 {
-    cJSON *doc = edb_get(ctx->engine, "People", "employees", id);
+    cJSON *doc = edb_get(ctx->engine, "people", "employees", id);
     *found = doc != NULL;
     if (!doc) {
         return NULL;
@@ -652,7 +763,7 @@ static void test_write_back(const edb_eql_ctx *ctx)
     char *snap = NULL;
     int status = 0;
 
-        out = run_ok(ctx, "UPDATE Demo.People.employees SET profile = "
+        out = run_ok(ctx, "UPDATE demo.people.employees SET profile = "
                       "'{\"level\":9}' WHERE id = 'emp003'");
     CHECK(strstr(out, "\"applied\":[\"emp003\"]") != NULL);
     free(out);
@@ -661,7 +772,7 @@ static void test_write_back(const edb_eql_ctx *ctx)
     free(snap);
 
 
-out = run_ok(ctx, "DELETE FROM Demo.People.employees "
+out = run_ok(ctx, "DELETE FROM demo.people.employees "
                       "WHERE id IN ('emp002','emp005')");
     CHECK(strstr(out, "\"op\":\"delete\"") != NULL);
     CHECK(strstr(out, "\"count\":2") != NULL);
@@ -672,16 +783,16 @@ out = run_ok(ctx, "DELETE FROM Demo.People.employees "
     CHECK(found);
     free(snap);
 
-    out = run_ok(ctx, "UPDATE Demo.People.employees SET age = age + 1 "
+    out = run_ok(ctx, "UPDATE demo.people.employees SET age = age + 1 "
                       "WHERE manager = 'mgr01'");
     CHECK(strstr(out, "\"op\":\"update\"") != NULL);
-    CHECK(strstr(out, "\"count\":3") != NULL);
+    CHECK(strstr(out, "\"count\":5") != NULL);   /* mgr01 reports */
     free(out);
     snap = stored_json(ctx, "emp001", &found);
     CHECK(found && strstr(snap, "\"age\":37") != NULL);
     free(snap);
 
-    out = run_ok(ctx, "INSERT INTO Demo.People.employees (id, name, age) "
+    out = run_ok(ctx, "INSERT INTO demo.people.employees (id, name, age) "
                       "VALUES ('zz1', 'Zed', 50)");
     CHECK(strstr(out, "\"op\":\"insert\"") != NULL);
     CHECK(strstr(out, "\"applied\":[\"zz1\"]") != NULL);
@@ -690,7 +801,7 @@ out = run_ok(ctx, "DELETE FROM Demo.People.employees "
     CHECK(found && strstr(snap, "\"name\":\"Zed\"") != NULL);
     free(snap);
 
-    out = run_ok(ctx, "UPDATE Demo.People.employees SET id = 'emp001b' "
+    out = run_ok(ctx, "UPDATE demo.people.employees SET id = 'emp001b' "
                       "WHERE id = 'emp001'");
     CHECK(strstr(out, "\"count\":2") != NULL);
     free(out);
@@ -706,7 +817,7 @@ out = run_ok(ctx, "DELETE FROM Demo.People.employees "
     out = NULL;
     status = edb_eql_execute(
         ctx,
-        "INSERT INTO Demo.People.employees (id, name) "
+        "INSERT INTO demo.people.employees (id, name) "
         "VALUES ('fresh1','F'),('zz1','dup')",
         ~0ULL, true, &out);
     CHECK(status == 400);
@@ -718,7 +829,7 @@ out = run_ok(ctx, "DELETE FROM Demo.People.employees "
     free(after);
     free(before_copy);
 
-    out = run_ok(ctx, "DELETE FROM Demo.People.employees WHERE id = 'none'");
+    out = run_ok(ctx, "DELETE FROM demo.people.employees WHERE id = 'none'");
     CHECK(strstr(out, "\"count\":0") != NULL);
     free(out);
 }
@@ -727,46 +838,46 @@ static void test_dml_permissions(void)
 {
     edb_eql_ctx ctx;
     setup_engine(&ctx);
-    CHECK(edb_put(ctx.engine, "People", "employees", "e1",
+    CHECK(edb_put(ctx.engine, "people", "employees", "e1",
                   "{\"n\":1}", -1));
 
     uint64_t writers = 1ULL << 2;
-    CHECK(edb_partition_set_masks(&*ctx.config, "Demo", "People",
+    CHECK(edb_partition_set_masks(&*ctx.config, "demo", "people",
                                   EDB_MASK_ALLOW_ALL, writers,
                                   writers, writers));
 
     char *out = NULL;
     int status = edb_eql_execute(
         &ctx,
-        "INSERT INTO Demo.People.employees (id,name) VALUES ('new1','N')",
+        "INSERT INTO demo.people.employees (id,name) VALUES ('new1','N')",
         ~0ULL, true, &out);
     CHECK(status == 200);
     free(out);
 
     out = NULL;
     status = edb_eql_execute(
-        &ctx, "UPDATE Demo.People.employees SET name='X'",
+        &ctx, "UPDATE demo.people.employees SET name='X'",
         0ULL, false, &out);
     CHECK(status == 403);
     free(out);
 
     out = NULL;
     status = edb_eql_execute(
-        &ctx, "UPDATE Demo.People.employees SET name='X'",
+        &ctx, "UPDATE demo.people.employees SET name='X'",
         writers, false, &out);
     CHECK(status == 200);
     free(out);
 
     out = NULL;
     status = edb_eql_execute(
-        &ctx, "DELETE FROM Demo.People.employees WHERE id='new1'",
+        &ctx, "DELETE FROM demo.people.employees WHERE id='new1'",
         0ULL, false, &out);
     CHECK(status == 403);
     free(out);
 
     out = NULL;
     status = edb_eql_execute(
-        &ctx, "DELETE FROM Demo.People.employees WHERE id='new1'",
+        &ctx, "DELETE FROM demo.people.employees WHERE id='new1'",
         writers, false, &out);
     CHECK(status == 200);
     free(out);
@@ -775,30 +886,87 @@ static void test_dml_permissions(void)
     edb_engine_close(ctx.engine);
 }
 
+/* demo.ops partition: contractors keyspace reads, cross-partition joins
+ * (projects -> managers), and partition-wide counts spanning every
+ * keyspace. Read-only: safe to run before the mutating suites. */
+static void test_more_tables(const edb_eql_ctx *ctx)
+
+{
+
+    char *out = run_ok(ctx,
+
+                       "SELECT name FROM demo.people.contractors "
+
+                       "WHERE vendor = 'beta' ORDER BY name");
+
+    CHECK(out != NULL);
+
+    CHECK(json_has(out, "\"Rhea\"") && json_has(out, "\"Sam\""));
+
+    CHECK(!json_has(out, "\"Pete\""));
+
+    free(out);
+
+
+
+    out = run_ok(ctx,
+
+                 "SELECT p.title, m.name FROM demo.ops.projects p "
+
+                 "JOIN demo.people.managers m ON p.lead = m.id "
+
+                 "WHERE p.active = 1 ORDER BY p.title");
+
+    CHECK(out != NULL);
+
+    CHECK(json_has(out, "\"Atlas\"") && json_has(out, "\"Joan\""));
+
+    CHECK(json_has(out, "\"Borealis\"") && !json_has(out, "\"Cygnus\""));
+
+    free(out);
+
+
+
+    /* partition-wide counts span every keyspace of the partition */
+
+    out = run_ok(ctx, "SELECT COUNT(*) FROM demo.people");
+
+    CHECK(out != NULL && json_has(out, "[[18]]"));   /* 10 emp + 3 mgr + 5 con */
+
+    free(out);
+
+    out = run_ok(ctx, "SELECT COUNT(*) FROM demo.ops");
+
+    CHECK(out != NULL && json_has(out, "[[7]]"));    /* 3 dept + 4 projects */
+
+    free(out);
+
+}
+
 static void test_classification_and_refs(void)
 {
-    CHECK(edb_eql_classify("SELECT * FROM Demo.People.employees") ==
+    CHECK(edb_eql_classify("SELECT * FROM demo.people.employees") ==
           EQL_KIND_SELECT);
-    CHECK(edb_eql_classify("  DELETE FROM Demo.People.employees") ==
+    CHECK(edb_eql_classify("  DELETE FROM demo.people.employees") ==
           EQL_KIND_DELETE);
-    CHECK(edb_eql_classify("UPDATE Demo.People.employees SET x=1") ==
+    CHECK(edb_eql_classify("UPDATE demo.people.employees SET x=1") ==
           EQL_KIND_UPDATE);
-    CHECK(edb_eql_classify("INSERT INTO Demo.People.employees (id,name) "
+    CHECK(edb_eql_classify("INSERT INTO demo.people.employees (id,name) "
                            "VALUES ('a','b')") == EQL_KIND_INSERT);
     CHECK(edb_eql_classify("PRAGMA foo") == EQL_KIND_OTHER);
     CHECK(edb_eql_classify("") == EQL_KIND_OTHER);
 
     char refs[8][512];
     size_t n = edb_eql_references(
-        "SELECT * FROM Demo.People.employees JOIN Other.Foo.bar "
+        "SELECT * FROM demo.people.employees JOIN other.foo.bar "
         "ON x=y", refs, 8);
     CHECK(n == 2);
-    CHECK(strcmp(refs[0], "Demo.People.employees") == 0);
-    CHECK(strcmp(refs[1], "Other.Foo.bar") == 0);
+    CHECK(strcmp(refs[0], "demo.people.employees") == 0);
+    CHECK(strcmp(refs[1], "other.foo.bar") == 0);
 
-    n = edb_eql_references("SELECT COUNT(*) FROM Demo.People.employees",
+    n = edb_eql_references("SELECT COUNT(*) FROM demo.people.employees",
                            refs, 8);
-    CHECK(n == 1 && strcmp(refs[0], "Demo.People.employees") == 0);
+    CHECK(n == 1 && strcmp(refs[0], "demo.people.employees") == 0);
 
     n = edb_eql_references("SELECT 1", refs, 8);
     CHECK(n == 0);
@@ -820,44 +988,52 @@ static void test_partition_wide(void)
     ctx.config = edb_config_open(ctx.engine);
     CHECK(ctx.config != NULL);
     ctx.repl = NULL;
-    CHECK(edb_partition_create(ctx.config, "Demo", "People",
+    CHECK(edb_partition_create(ctx.config, "demo", "people",
                                EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
                                EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL));
     for (int i = 0; i < NEMPLOYEES; i++) {
-        CHECK(edb_put(ctx.engine, "People", "employees", employees[i][0],
+        CHECK(edb_put(ctx.engine, "people", "employees", employees[i][0],
                       employees[i][1], -1));
     }
-    CHECK(edb_put(ctx.engine, "People", "managers", "mgr01",
+    CHECK(edb_put(ctx.engine, "people", "managers", "mgr01",
                   "{\"name\":\"Joan\",\"dept\":\"eng\"}", -1));
-    CHECK(edb_put(ctx.engine, "People", "managers", "mgr02",
+    CHECK(edb_put(ctx.engine, "people", "managers", "mgr02",
                   "{\"name\":\"Ken\",\"dept\":\"research\"}", -1));
-    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+    CHECK(edb_put(ctx.engine, "people", "managers", "mgr03",
+                  "{\"name\":\"Marge\",\"dept\":\"support\"}", -1));
+    for (int i = 0; i < NCONTRACTORS; i++) {
+        CHECK(edb_put(ctx.engine, "people", "contractors", contractors[i][0],
+                      contractors[i][1], -1));
+    }
+    CHECK(edb_partition_ensure(ctx.config, "demo", "people",
                                "employees", NULL));
-    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+    CHECK(edb_partition_ensure(ctx.config, "demo", "people",
                                "managers", NULL));
+    CHECK(edb_partition_ensure(ctx.config, "demo", "people",
+                               "contractors", NULL));
 
     /* merged SELECT: rows from employees + managers, union of columns */
-    char *out = run_ok(&ctx, "SELECT id, name, dept FROM Demo.People "
+    char *out = run_ok(&ctx, "SELECT id, name, dept FROM demo.people "
                              "ORDER BY id");
     CHECK(out != NULL && json_has(out, "\"emp001\""));
     CHECK(json_has(out, "\"mgr01\"") && json_has(out, "\"eng\""));
     CHECK(json_has(out, "\"Grace\"") && json_has(out, "\"Joan\""));
     free(out);
 
-    /* merged COUNT across both keyspaces: 5 employees + 2 managers */
-    out = run_ok(&ctx, "SELECT COUNT(*) FROM Demo.People");
-    CHECK(out != NULL && json_has(out, "[7]"));
+    /* merged COUNT across all three keyspaces: 10 emp + 3 mgr + 5 con */
+    out = run_ok(&ctx, "SELECT COUNT(*) FROM demo.people");
+    CHECK(out != NULL && json_has(out, "[18]"));
     free(out);
 
     /* WHERE across keyspaces */
-    out = run_ok(&ctx, "SELECT id FROM Demo.People WHERE dept = 'eng'");
+    out = run_ok(&ctx, "SELECT id FROM demo.people WHERE dept = 'eng'");
     CHECK(out != NULL && json_has(out, "\"mgr01\""));
     CHECK(!json_has(out, "\"mgr02\""));
     free(out);
 
     /* join a pw reference with a specific keyspace table */
-    out = run_ok(&ctx, "SELECT e.id FROM Demo.People e "
-                       "JOIN Demo.People.managers m ON e.manager = m.id "
+    out = run_ok(&ctx, "SELECT e.id FROM demo.people e "
+                       "JOIN demo.people.managers m ON e.manager = m.id "
                        "WHERE m.dept = 'eng' ORDER BY e.id");
     CHECK(out != NULL && json_has(out, "\"emp001\""));
     CHECK(json_has(out, "\"emp003\"") && json_has(out, "\"emp004\""));
@@ -865,14 +1041,14 @@ static void test_partition_wide(void)
 
     /* 3-part text is never swallowed by a pw table sharing the prefix:
      * the specific keyspace still resolves to its own shard */
-    out = run_ok(&ctx, "SELECT COUNT(*) FROM Demo.People.employees");
-    CHECK(out != NULL && json_has(out, "[5]"));
+    out = run_ok(&ctx, "SELECT COUNT(*) FROM demo.people.employees");
+    CHECK(out != NULL && json_has(out, "[10]"));
     free(out);
 
     /* INSERT has no target keyspace and stays rejected */
     out = NULL;
     int status = edb_eql_execute(&ctx,
-                                 "INSERT INTO Demo.People (id, name) "
+                                 "INSERT INTO demo.people (id, name) "
                                  "VALUES ('x1', 'X')",
                                  ~0ULL, true, &out);
     CHECK(status == 400);
@@ -881,7 +1057,7 @@ static void test_partition_wide(void)
 
     /* UPDATE routes rows back to their owning keyspaces (age already
      * exists on the employee docs, so no new-column assignment happens) */
-    out = run_ok(&ctx, "UPDATE Demo.People SET age = 99 "
+    out = run_ok(&ctx, "UPDATE demo.people SET age = 99 "
                        "WHERE id = 'emp001' OR id = 'mgr01'");
     CHECK(strstr(out, "\"count\":2") != NULL);
     free(out);
@@ -889,7 +1065,7 @@ static void test_partition_wide(void)
     char *snap = stored_json(&ctx, "emp001", &found);
     CHECK(found && strstr(snap, "\"age\":99") != NULL);
     free(snap);
-    cJSON *doc = edb_get(ctx.engine, "People", "managers", "mgr01");
+    cJSON *doc = edb_get(ctx.engine, "people", "managers", "mgr01");
     CHECK(doc != NULL);
     if (doc) {
         char *mtxt = cJSON_PrintUnformatted(doc);
@@ -899,13 +1075,13 @@ static void test_partition_wide(void)
     }
 
     /* DELETE across keyspaces */
-    out = run_ok(&ctx, "DELETE FROM Demo.People WHERE id = 'emp005' "
+    out = run_ok(&ctx, "DELETE FROM demo.people WHERE id = 'emp005' "
                        "OR id = 'mgr02'");
     CHECK(strstr(out, "\"count\":2") != NULL);
     free(out);
     snap = stored_json(&ctx, "emp005", &found);
     CHECK(!found && snap == NULL);
-    doc = edb_get(ctx.engine, "People", "managers", "mgr02");
+    doc = edb_get(ctx.engine, "people", "managers", "mgr02");
     CHECK(doc == NULL);
 
     edb_config_close(ctx.config);
@@ -925,22 +1101,22 @@ static void test_schema_assigning(void)
     ctx.config = edb_config_open(ctx.engine);
     CHECK(ctx.config != NULL);
     ctx.repl = NULL;
-    CHECK(edb_partition_create(ctx.config, "Demo", "People",
+    CHECK(edb_partition_create(ctx.config, "demo", "people",
                                EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
                                EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL));
     for (int i = 0; i < NEMPLOYEES; i++) {
-        CHECK(edb_put(ctx.engine, "People", "employees", employees[i][0],
+        CHECK(edb_put(ctx.engine, "people", "employees", employees[i][0],
                       employees[i][1], -1));
     }
-    CHECK(edb_put(ctx.engine, "People", "managers", "mgr01",
+    CHECK(edb_put(ctx.engine, "people", "managers", "mgr01",
                   "{\"name\":\"Joan\",\"dept\":\"eng\"}", -1));
-    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+    CHECK(edb_partition_ensure(ctx.config, "demo", "people",
                                "employees", NULL));
-    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+    CHECK(edb_partition_ensure(ctx.config, "demo", "people",
                                "managers", NULL));
 
     /* UPDATE introducing a column no document has */
-    char *out = run_ok(&ctx, "UPDATE Demo.People.employees SET score = 7 "
+    char *out = run_ok(&ctx, "UPDATE demo.people.employees SET score = 7 "
                              "WHERE id = 'emp001'");
     CHECK(strstr(out, "\"applied\":[\"emp001\"]") != NULL);
     free(out);
@@ -956,7 +1132,7 @@ static void test_schema_assigning(void)
     /* multiple targets, expression referencing another column, and
      * bare CASE/WHEN/THEN keywords inside the value expression */
     out = run_ok(&ctx,
-                 "UPDATE Demo.People.employees "
+                 "UPDATE demo.people.employees "
                  "SET score = age + 1, "
                  "band = CASE WHEN age > 40 THEN 'senior' ELSE 'junior' END "
                  "WHERE id = 'emp004'");
@@ -968,11 +1144,11 @@ static void test_schema_assigning(void)
     free(snap);
 
     /* partition-wide UPDATE assigns across keyspaces */
-    out = run_ok(&ctx, "UPDATE Demo.People SET badge = 'gold' "
+    out = run_ok(&ctx, "UPDATE demo.people SET badge = 'gold' "
                        "WHERE id = 'emp003' OR id = 'mgr01'");
     CHECK(strstr(out, "\"count\":2") != NULL);
     free(out);
-    cJSON *doc = edb_get(ctx.engine, "People", "employees", "emp003");
+    cJSON *doc = edb_get(ctx.engine, "people", "employees", "emp003");
     CHECK(doc != NULL);
     if (doc) {
         char *txt = cJSON_PrintUnformatted(doc);
@@ -980,7 +1156,7 @@ static void test_schema_assigning(void)
         cJSON_free(txt);
         cJSON_Delete(doc);
     }
-    doc = edb_get(ctx.engine, "People", "managers", "mgr01");
+    doc = edb_get(ctx.engine, "people", "managers", "mgr01");
     CHECK(doc != NULL);
     if (doc) {
         char *txt = cJSON_PrintUnformatted(doc);
@@ -990,11 +1166,11 @@ static void test_schema_assigning(void)
     }
 
     /* INSERT with a column new to the shard */
-    out = run_ok(&ctx, "INSERT INTO Demo.People.managers (id, name, level) "
-                       "VALUES ('mgr03','Mo',5)");
-    CHECK(strstr(out, "\"applied\":[\"mgr03\"]") != NULL);
+    out = run_ok(&ctx, "INSERT INTO demo.people.managers (id, name, level) "
+                       "VALUES ('mgr09','Mo',5)");
+    CHECK(strstr(out, "\"applied\":[\"mgr09\"]") != NULL);
     free(out);
-    doc = edb_get(ctx.engine, "People", "managers", "mgr03");
+    doc = edb_get(ctx.engine, "people", "managers", "mgr09");
     CHECK(doc != NULL);
     if (doc) {
         char *txt = cJSON_PrintUnformatted(doc);
@@ -1004,13 +1180,13 @@ static void test_schema_assigning(void)
     }
 
     /* id rename plus a new column in one statement */
-    out = run_ok(&ctx, "UPDATE Demo.People.employees "
-                       "SET id = 'emp009', score = 1 WHERE id = 'emp005'");
+    out = run_ok(&ctx, "UPDATE demo.people.employees "
+                       "SET id = 'emp777', score = 1 WHERE id = 'emp005'");
     CHECK(strstr(out, "\"count\":2") != NULL);
     free(out);
     snap = stored_json(&ctx, "emp005", &found);
     CHECK(!found && snap == NULL);
-    doc = edb_get(ctx.engine, "People", "employees", "emp009");
+    doc = edb_get(ctx.engine, "people", "employees", "emp777");
     CHECK(doc != NULL);
     if (doc) {
         char *txt = cJSON_PrintUnformatted(doc);
@@ -1020,7 +1196,7 @@ static void test_schema_assigning(void)
     }
 
     /* NULL assignment writes explicit null (documented semantics) */
-    out = run_ok(&ctx, "UPDATE Demo.People.employees SET score = NULL "
+    out = run_ok(&ctx, "UPDATE demo.people.employees SET score = NULL "
                        "WHERE id = 'emp001'");
     CHECK(strstr(out, "\"applied\":[\"emp001\"]") != NULL);
     free(out);
@@ -1044,7 +1220,7 @@ static void test_rejections(const edb_eql_ctx *ctx)
     out = NULL;
     status = edb_eql_execute(
         ctx,
-        "SELECT 1; DELETE FROM Demo.People.employees WHERE 1",
+        "SELECT 1; DELETE FROM demo.people.employees WHERE 1",
         ~0ULL, true, &out);
     CHECK(status == 400);
     free(out);
@@ -1095,6 +1271,7 @@ int main(void)
 
     test_null_and_missing_fields(&ctx);
     test_aggregate_and_join_polish(&ctx);
+    test_more_tables(&ctx);
     test_classification_and_refs();
 
     test_write_back(&ctx);

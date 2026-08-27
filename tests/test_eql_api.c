@@ -178,6 +178,12 @@ int main(int argc, char **argv)
                    "\"manager\":\"mgr02\"}") == 200);
     CHECK(http_req("PUT", "/data/app/people/managers/mgr01", "root", PW,
                    "{\"name\":\"Joan\",\"dept\":\"eng\"}") == 200);
+    CHECK(http_req("PUT", "/data/app/people/contractors/c1", "root", PW,
+                   "{\"name\":\"Pete\",\"vendor\":\"acme\",\"rate\":55}")
+          == 200);
+    CHECK(http_req("PUT", "/data/app/people/contractors/c2", "root", PW,
+                   "{\"name\":\"Quinn\",\"vendor\":\"beta\",\"rate\":62}")
+          == 200);
 
     /* SELECT passthrough */
     CHECK(http_request("POST", "/eql", "root", PW,
@@ -212,6 +218,13 @@ int main(int argc, char **argv)
     CHECK(http_request("GET", "/data/app/people/employees/zz9", "root",
                        PW, NULL, &body) == 200 &&
           strstr(body, "Zaphod") != NULL);
+
+    /* partition-wide reference spans employees + managers + contractors:
+     * e1 + zz9 + mgr01 + c1 + c2 = 5 records at this point */
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"SELECT COUNT(*) FROM app.people\"}",
+                       &body) == 200);
+    CHECK(strstr(body, "[[5]]") != NULL);
 
     /* UPDATE rewrites stored documents */
     CHECK(http_request("POST", "/eql", "root", PW,
