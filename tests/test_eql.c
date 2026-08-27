@@ -766,6 +766,38 @@ static void test_dml_permissions(void)
     edb_engine_close(ctx.engine);
 }
 
+static void test_classification_and_refs(void)
+{
+    CHECK(edb_eql_classify("SELECT * FROM Demo.People.employees") ==
+          EQL_KIND_SELECT);
+    CHECK(edb_eql_classify("  DELETE FROM Demo.People.employees") ==
+          EQL_KIND_DELETE);
+    CHECK(edb_eql_classify("UPDATE Demo.People.employees SET x=1") ==
+          EQL_KIND_UPDATE);
+    CHECK(edb_eql_classify("INSERT INTO Demo.People.employees (id,name) "
+                           "VALUES ('a','b')") == EQL_KIND_INSERT);
+    CHECK(edb_eql_classify("PRAGMA foo") == EQL_KIND_OTHER);
+    CHECK(edb_eql_classify("") == EQL_KIND_OTHER);
+
+    char refs[8][512];
+    size_t n = edb_eql_references(
+        "SELECT * FROM Demo.People.employees JOIN Other.Foo.bar "
+        "ON x=y", refs, 8);
+    CHECK(n == 2);
+    CHECK(strcmp(refs[0], "Demo.People.employees") == 0);
+    CHECK(strcmp(refs[1], "Other.Foo.bar") == 0);
+
+    n = edb_eql_references("SELECT COUNT(*) FROM Demo.People.employees",
+                           refs, 8);
+    CHECK(n == 1 && strcmp(refs[0], "Demo.People.employees") == 0);
+
+    n = edb_eql_references("SELECT 1", refs, 8);
+    CHECK(n == 0);
+
+    n = edb_eql_references(NULL, refs, 8);
+    CHECK(n == 0);
+}
+
 static void test_rejections(const edb_eql_ctx *ctx)
 {
     char *out = NULL;
@@ -829,6 +861,7 @@ int main(void)
 
     test_null_and_missing_fields(&ctx);
     test_aggregate_and_join_polish(&ctx);
+    test_classification_and_refs();
 
     test_write_back(&ctx);
 

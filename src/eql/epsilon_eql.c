@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "../epsilon_log.h"
 #include "../../vendor/sqlite/sqlite3.h"
 
 #define EQL_MAX_TABLES 16
@@ -22,22 +23,17 @@
 typedef struct {
     char db[128];
     char part[256];
-    char ks[128];
-    char dotted[EQL_MAX_NAME];   /* canonical db.part.ks */
+    char ks[128];                /* empty for partition-wide groups */
+    char dotted[EQL_MAX_NAME];   /* canonical db.part.ks (db.part for pw) */
     char alias[16];              /* eql_t0 .. */
     char cols[EQL_MAX_COLS][128];
     uint8_t kinds[EQL_MAX_COLS]; /* nonzero: column carried objects/arrays */
     size_t ncols;
+    bool pw;                     /* partition-wide: merged keyspace table */
+    char keyspaces[64][128];     /* pw: materialized keyspaces */
+    size_t nkeys;
 } eql_table;
 
-/* Statement classes edb_eql_execute understands. */
-typedef enum {
-    EQL_KIND_SELECT = 0,
-    EQL_KIND_DELETE,
-    EQL_KIND_UPDATE,
-    EQL_KIND_INSERT,
-    EQL_KIND_OTHER       /* WITH-led and unrecognized heads */
-} eql_kind;
 
 typedef struct {
     const char *sql;
@@ -68,6 +64,7 @@ typedef struct {
     const eql_table *t;
     sqlite3_int64 rowid;
     char id[EQL_ID_CAP];
+    char ks[128];                /* owning keyspace (pw tables) */
 } eql_rowrec;
 
 typedef struct {
@@ -253,8 +250,8 @@ static void trap_row_update(void *ud, int op, const char *db,
     }
 }
 
-static void map_add(eql_rowmap *m, const eql_table *t, sqlite3_int64 rowid,
-                    const char *id)
+static void map_add_ks(eql_rowmap *m, const eql_table *t,
+                       sqlite3_int64 rowid, const char *id, const char *ks)
 {
     if (m->n == m->cap) {
         size_t grown = m->cap ? m->cap * 2 : 128;
@@ -266,6 +263,7 @@ static void map_add(eql_rowmap *m, const eql_table *t, sqlite3_int64 rowid,
         m->cap = grown;
     }
     snprintf(m->r[m->n].id, EQL_ID_CAP, "%s", id ? id : "");
+    snprintf(m->r[m->n].ks, sizeof(m->r[m->n].ks), "%s", ks ? ks : "");
     m->r[m->n].t = t;
     m->r[m->n].rowid = rowid;
     m->n++;
@@ -294,18 +292,28 @@ static void map_free(eql_rowmap *m)
 }
 
 
-/* Parses db.part.ks at the cursor; on success advances past it. */
-static bool parse_ref(eql_scan *sc, char parts[3][256])
+/* Parses db.part.ks at the cursor; on success advances past it. A
+ * trailing db.part (no third segment) is also accepted: parts[2] is left
+ * empty and the reference is partition-wide. */
+static bool parse_ref2(eql_scan *sc, char parts[3][256])
 {
     bool ok = true;
     for (int seg = 0; seg < 3 && ok; seg++) {
         skip_spaces_comments(sc);
         ok = read_ident(sc, parts[seg], 256);
-        if (ok && seg < 2) {
+        if (!ok) {
+            break;
+        }
+        if (seg < 2) {
             skip_spaces_comments(sc);
-            ok = sc->pos < sc->len && sc->sql[sc->pos] == '.';
-            if (ok) {
+            if (sc->pos < sc->len && sc->sql[sc->pos] == '.') {
                 sc->pos++;
+            } else {
+                if (seg == 1) {
+                    parts[2][0] = '\0';   /* partition-wide reference */
+                    return true;
+                }
+                ok = false;   /* db. alone is not a usable reference */
             }
         }
     }
@@ -343,7 +351,7 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
         }
         char word[8];
         memcpy(word, sc.sql + start, wlen);
-        word[wlen] = '\0';;;
+        word[wlen] = '\0';
         for (size_t i = 0; i < wlen; i++) {
             word[i] = (char)tolower((unsigned char)word[i]);
         }
@@ -353,25 +361,33 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
         }
 
         char parts[3][256];
-        if (!parse_ref(&sc, parts)) {
+        if (!parse_ref2(&sc, parts)) {
             /* subquery or unsupported reference shape: let SQLite complain */
             continue;
         }
+        bool pw = parts[2][0] == '\0';
         bool dup = false;
         for (int i = 0; i < ntables + found; i++) {
-            if (same_shard(&tables[i], parts[0], parts[1], parts[2])) {
+            if (same_shard(&tables[i], parts[0], parts[1], parts[2]) &&
+                tables[i].pw == pw) {
                 dup = true;
                 break;
             }
         }
-        if (!dup) {
+        if (!dup && ntables + found < EQL_MAX_TABLES) {
             eql_table *t = &tables[ntables + found];
             memset(t, 0, sizeof(*t));
             snprintf(t->db, sizeof(t->db), "%s", parts[0]);
             snprintf(t->part, sizeof(t->part), "%s", parts[1]);
             snprintf(t->ks, sizeof(t->ks), "%s", parts[2]);
-            snprintf(t->dotted, sizeof(t->dotted), "%s.%s.%s", t->db,
-                     t->part, t->ks);
+            if (pw) {
+                snprintf(t->dotted, sizeof(t->dotted), "%s.%s", t->db,
+                         t->part);
+            } else {
+                snprintf(t->dotted, sizeof(t->dotted), "%s.%s.%s", t->db,
+                         t->part, t->ks);
+            }
+            t->pw = pw;
             snprintf(t->alias, sizeof(t->alias), "eql_t%d",
                      ntables + found);
             found++;
@@ -392,7 +408,7 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
                 size_t wl = sc.pos - wstart;
                 if (wl < sizeof(low)) {
                     memcpy(low, sc.sql + wstart, wl);
-                    low[wl] = '\0';;
+                    low[wl] = '\0';
                     for (size_t k = 0; k < wl; k++) {
                         low[k] = (char)tolower((unsigned char)low[k]);
                     }
@@ -423,7 +439,7 @@ static int collect_refs(const char *sql, eql_table *tables, int ntables)
             }
             char more[3][256];
             sc.pos++;
-            if (!parse_ref(&sc, more)) {
+            if (!parse_ref2(&sc, more)) {
                 /* not another source list element (e.g. subquery or AS):
                  * rewind so SQLite sees the original text */
                 sc.pos = save2;
@@ -594,7 +610,7 @@ static eql_kind classify_statement(const char *sql)
         word[wl++] = (char)tolower((unsigned char)sc.sql[sc.pos]);
         sc.pos++;
     }
-    word[wl] = '\0';;
+    word[wl] = '\0';
     if (strcmp(word, "delete") == 0) {
         return EQL_KIND_DELETE;
     }
@@ -610,6 +626,29 @@ static eql_kind classify_statement(const char *sql)
     }
     return EQL_KIND_OTHER;
 }
+
+int edb_eql_classify(const char *sql)
+{
+    return sql && *sql ? (int)classify_statement(sql) : (int)EQL_KIND_OTHER;
+}
+
+size_t edb_eql_references(const char *sql, char out[][512], size_t cap)
+{
+    if (!sql || !*sql || cap == 0) {
+        return 0;
+    }
+    eql_table *tables = calloc(EQL_MAX_TABLES, sizeof(*tables));
+    int n = collect_refs(sql, tables, 0);
+    if (n > (int)cap) {
+        n = (int)cap;
+    }
+    for (int i = 0; i < n; i++) {
+        snprintf(out[i], 512, "%s", tables[i].dotted);
+    }
+    free(tables);
+    return (size_t)n;
+}
+
 
 
 /* For INSERT statements, picks up an explicit column list following the
@@ -652,7 +691,7 @@ static void scan_insert_columns(const char *sql, eql_table *tables,
         }
 
         char parts[3][256];
-        if (!parse_ref(&sc, parts)) {
+        if (!parse_ref2(&sc, parts)) {
             continue;
         }
         eql_table *t = NULL;
@@ -912,7 +951,7 @@ static int materialize(sqlite3 *db, const eql_table *t, cJSON *docs,
             status = 500;
             break;
         }
-        map_add(map, t, sqlite3_last_insert_rowid(db), ids[r]);
+        map_add_ks(map, t, sqlite3_last_insert_rowid(db), ids[r], t->ks);
     }
     sqlite3_finalize(stmt);
     cJSON_Delete(docs);
@@ -1026,7 +1065,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
             return -1;
         }
         snprintf(text, cap,
-                 "\"op\":\"put\",\"db\":\"%s\",\"partition\":\"%s\",\"keyspace\":\"%s\",\"id\":\"%s\",\"value\":%s,\"ttl_abs\":-1,\"ts\":%lld\"}",
+                 "{\"op\":\"put\",\"db\":\"%s\",\"partition\":\"%s\",\"keyspace\":\"%s\",\"id\":\"%s\",\"value\":%s,\"ttl_abs\":-1,\"ts\":%lld}",
                  t->db, t->part, t->ks, id, vtxt ? vtxt : "", ts);
         free(vtxt);
     } else {
@@ -1086,6 +1125,12 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
     }
     free(text);
     *out_code = code;
+    if (*out_code == 200 && ctx->config && value) {
+        /* keep the config registry in sync like REST puts do so new
+         * databases/partitions/keyspaces created by EQL statements appear
+         * in admin listings; replication fans the records to peers */
+        edb_partition_ensure(ctx->config, t->db, t->part, t->ks, NULL);
+    }
     return 0;
 }
 
@@ -1247,7 +1292,7 @@ static void process_events(const edb_eql_ctx *ctx, eql_trapbuf *buf,
         snprintf(cur_id, EQL_ID_CAP, "%s", idtxt ? (const char *)idtxt : "");
         char old_id[EQL_ID_CAP];
         bool had_old = map_take(map, ev->t, ev->rowid, old_id);
-        map_add(map, ev->t, ev->rowid, cur_id);
+        map_add_ks(map, ev->t, ev->rowid, cur_id, "");
 
         /* UPDATE renaming the primary key = delete old key + put new one */
         if (had_old && strcmp(old_id, cur_id) != 0) {
