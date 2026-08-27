@@ -26,3 +26,5 @@ tests/test_chaos
 tests/test_console
 tests/test_crypto
 tests/test_http
+tests/test_eql
+tests/test_eql_api
