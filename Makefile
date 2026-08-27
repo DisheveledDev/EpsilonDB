@@ -47,16 +47,19 @@ CLUSTER_SRC = src/socket/epsilon_cluster.c src/socket/estp_wire.c \
 REPL_SRC = src/socket/epsilon_repl.c src/socket/epsilon_repl_cache.c \
            src/socket/epsilon_repl_read.c
 
+# EQL module (stage 8)
+EQL_SRC = src/eql/epsilon_eql.c
+
 TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \
            tests/test_http.c tests/test_replication.c \
            tests/test_structure.c tests/test_snapshot.c tests/test_delta.c \
            tests/test_rebalance.c tests/test_join.c tests/test_chaos.c \
-           tests/test_console.c
+           tests/test_console.c tests/test_eql.c
 TEST_BINS = tests/test_crypto tests/test_engine tests/test_config \
             tests/test_http tests/test_cluster tests/test_replication \
             tests/test_structure tests/test_snapshot tests/test_delta \
             tests/test_rebalance tests/test_join tests/test_chaos \
-            tests/test_console
+            tests/test_console tests/test_eql
 .PHONY: all test clean
 
 all: $(SERVER_BIN) $(CLI_BIN) $(BACKUP_BIN) $(BENCH_BIN)
@@ -117,7 +120,7 @@ src/admin/admin_console.o: src/admin/admin_console.c
 test: all $(TEST_BINS)
 	mkdir -p tests/data
 	./tests/test_crypto && ./tests/test_engine && ./tests/test_config \
-		&& ./tests/test_http_run.sh \
+		&& ./tests/test_eql && ./tests/test_http_run.sh \
 		&& ./tests/test_cluster && ./tests/test_replication \
 		&& ./tests/test_structure && ./tests/test_snapshot \
 		&& ./tests/test_delta && ./tests/test_rebalance \
@@ -173,6 +176,10 @@ tests/test_join: tests/test_join.c $(ENGINE_LIB)
 
 tests/test_chaos: tests/test_chaos.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
+
+tests/test_eql: tests/test_eql.c $(ENGINE_LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(EQL_SRC) $(REPL_SRC) $(CLUSTER_SRC) \
+		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf bin
