@@ -698,6 +698,20 @@ size_t edb_eql_references(const char *sql, char out[][512], size_t cap)
 
 
 
+/* Adds a column to a shadow table's schema unless already present.
+ * Shared by the INSERT/UPDATE column scanners. */
+static void table_add_column(eql_table *t, const char *name)
+{
+    for (size_t i = 0; i < t->ncols; i++) {
+        if (strcmp(t->cols[i], name) == 0) {
+            return;
+        }
+    }
+    if (t->ncols < EQL_MAX_COLS) {
+        snprintf(t->cols[t->ncols++], sizeof(t->cols[0]), "%s", name);
+    }
+}
+
 /* For INSERT statements, picks up an explicit column list following the
  * INTO reference so writes into previously-empty shards create usable
  * shadow tables. */
@@ -762,23 +776,164 @@ static void scan_insert_columns(const char *sql, eql_table *tables,
             if (!read_ident(&sc, col, sizeof(col))) {
                 break;
             }
-            bool seen = false;
-            for (size_t i = 0; i < t->ncols; i++) {
-                if (strcmp(t->cols[i], col) == 0) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen && t->ncols < EQL_MAX_COLS) {
-                snprintf(t->cols[t->ncols++], sizeof(t->cols[0]), "%s",
-                         col);
-            }
+            table_add_column(t, col);
             skip_spaces_comments(&sc);
             if (sc.pos < sc.len && sc.sql[sc.pos] == ',') {
                 sc.pos++;
                 continue;
             }
             break;
+        }
+    }
+}
+
+/* For UPDATE statements, picks up the assignment targets in the SET
+ * clause so a write can introduce JSON keys no fetched document has
+ * (schema-assigning DML): the shadow table is created with those columns
+ * up front, otherwise prepare would fail with "no such column". Only the
+ * assignment LHS is collected; the value expression is skipped with
+ * quote/paren awareness until a top-level clause keyword or the next
+ * top-level comma starts another assignment. */
+static void scan_update_columns(const char *sql, eql_table *tables,
+                                size_t ntables)
+{
+    eql_scan sc = { sql, 0, strlen(sql) };
+    while (sc.pos < sc.len) {
+        skip_spaces_comments(&sc);
+        if (sc.pos >= sc.len) {
+            break;
+        }
+        char c = sc.sql[sc.pos];
+        if (c == '\'' || c == '"' || c == '`' || c == '[') {
+            skip_quoted_raw(&sc);
+            continue;
+        }
+        size_t start = sc.pos;
+        while (sc.pos < sc.len && is_ident_char(sc.sql[sc.pos])) {
+            sc.pos++;
+        }
+        if (sc.pos == start) {
+            sc.pos++;
+            continue;
+        }
+        size_t wlen = sc.pos - start;
+        if (wlen != 6) {
+            continue;
+        }
+        char word[8];
+        memcpy(word, sc.sql + start, wlen);
+        word[wlen] = '\0';
+        for (size_t i = 0; i < wlen; i++) {
+            word[i] = (char)tolower((unsigned char)word[i]);
+        }
+        if (strcmp(word, "update") != 0) {
+            continue;
+        }
+
+        char parts[3][256];
+        if (!parse_ref2(&sc, parts)) {
+            continue;
+        }
+        bool pw = parts[2][0] == '\0';
+        eql_table *t = NULL;
+        for (size_t i = 0; i < ntables; i++) {
+            if (same_shard(&tables[i], parts[0], parts[1], parts[2]) &&
+                tables[i].pw == pw) {
+                t = &tables[i];
+                break;
+            }
+        }
+        if (!t) {
+            continue;
+        }
+
+        /* optional table alias, then the SET keyword */
+        bool found_set = false;
+        for (;;) {
+            skip_spaces_comments(&sc);
+            if (sc.pos >= sc.len) {
+                break;
+            }
+            char alias[128];
+            if (!read_ident(&sc, alias, sizeof(alias))) {
+                sc.pos++;
+                continue;
+            }
+            for (size_t i = 0; alias[i]; i++) {
+                alias[i] = (char)tolower((unsigned char)alias[i]);
+            }
+            if (strcmp(alias, "as") == 0) {
+                skip_spaces_comments(&sc);
+                read_ident(&sc, alias, sizeof(alias));
+                continue;
+            }
+            if (strcmp(alias, "set") == 0) {
+                found_set = true;
+                break;
+            }
+        }
+        if (!found_set) {
+            continue;
+        }
+
+        int depth = 0;
+        for (;;) {
+            skip_spaces_comments(&sc);
+            if (sc.pos >= sc.len) {
+                break;
+            }
+            char c2 = sc.sql[sc.pos];
+            if (c2 == '\'' || c2 == '"' || c2 == '`' || c2 == '[') {
+                skip_quoted_raw(&sc);
+                continue;
+            }
+            if (c2 == '(') {
+                depth++;
+                sc.pos++;
+                continue;
+            }
+            if (c2 == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                sc.pos++;
+                continue;
+            }
+            if (c2 == ',' && depth == 0) {
+                sc.pos++;
+                continue;
+            }
+            if (!is_ident_char(c2)) {
+                sc.pos++;
+                continue;
+            }
+            char col[128];
+            bool quoted = c2 == '"' || c2 == '`' || c2 == '[';
+            if (!read_ident(&sc, col, sizeof(col))) {
+                sc.pos++;
+                continue;
+            }
+            /* clause keywords (bare, unquoted) end the SET clause */
+            char low[128];
+            snprintf(low, sizeof(low), "%s", col);
+            for (size_t i = 0; low[i]; i++) {
+                low[i] = (char)tolower((unsigned char)low[i]);
+            }
+            if (!quoted && depth == 0 &&
+                (strcmp(low, "where") == 0 || strcmp(low, "returning") == 0 ||
+                 strcmp(low, "limit") == 0 || strcmp(low, "order") == 0 ||
+                 strcmp(low, "offset") == 0 || strcmp(low, "from") == 0 ||
+                 strcmp(low, "select") == 0 || strcmp(low, "values") == 0)) {
+                break;
+            }
+            size_t after = sc.pos;
+            skip_spaces_comments(&sc);
+            if (depth == 0 && sc.pos < sc.len && sc.sql[sc.pos] == '=') {
+                table_add_column(t, col);
+                sc.pos++;
+                continue;
+            }
+            sc.pos = after;
         }
     }
 }
@@ -1598,6 +1753,8 @@ int edb_eql_execute(const edb_eql_ctx *ctx, const char *sql,
 
     if (kind == EQL_KIND_INSERT) {
         scan_insert_columns(sql, tables, (size_t)ntables);
+    } else if (kind == EQL_KIND_UPDATE) {
+        scan_update_columns(sql, tables, (size_t)ntables);
     }
 
     char *rewritten = rewrite_sql(sql, tables, (size_t)ntables);

@@ -912,6 +912,126 @@ static void test_partition_wide(void)
     edb_engine_close(ctx.engine);
 }
 
+/* eql-g: schema-assigning DML. UPDATE assignment targets (and INSERT
+ * column lists) are pre-declared as shadow-table columns, so a write can
+ * introduce a JSON key no fetched document has yet; the assigned value
+ * lands in the stored document on write-back. Uses a private engine. */
+static void test_schema_assigning(void)
+{
+    edb_eql_ctx ctx;
+    rm_rf("tests/data/eql_g");
+    ctx.engine = edb_engine_open("tests/data/eql_g");
+    CHECK(ctx.engine != NULL);
+    ctx.config = edb_config_open(ctx.engine);
+    CHECK(ctx.config != NULL);
+    ctx.repl = NULL;
+    CHECK(edb_partition_create(ctx.config, "Demo", "People",
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL,
+                               EDB_MASK_ALLOW_ALL, EDB_MASK_ALLOW_ALL));
+    for (int i = 0; i < NEMPLOYEES; i++) {
+        CHECK(edb_put(ctx.engine, "People", "employees", employees[i][0],
+                      employees[i][1], -1));
+    }
+    CHECK(edb_put(ctx.engine, "People", "managers", "mgr01",
+                  "{\"name\":\"Joan\",\"dept\":\"eng\"}", -1));
+    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+                               "employees", NULL));
+    CHECK(edb_partition_ensure(ctx.config, "Demo", "People",
+                               "managers", NULL));
+
+    /* UPDATE introducing a column no document has */
+    char *out = run_ok(&ctx, "UPDATE Demo.People.employees SET score = 7 "
+                             "WHERE id = 'emp001'");
+    CHECK(strstr(out, "\"applied\":[\"emp001\"]") != NULL);
+    free(out);
+    bool found = false;
+    char *snap = stored_json(&ctx, "emp001", &found);
+    CHECK(found && strstr(snap, "\"score\":7") != NULL);
+    free(snap);
+    /* rows outside the WHERE stay untouched */
+    snap = stored_json(&ctx, "emp002", &found);
+    CHECK(found && strstr(snap, "score") == NULL);
+    free(snap);
+
+    /* multiple targets, expression referencing another column, and
+     * bare CASE/WHEN/THEN keywords inside the value expression */
+    out = run_ok(&ctx,
+                 "UPDATE Demo.People.employees "
+                 "SET score = age + 1, "
+                 "band = CASE WHEN age > 40 THEN 'senior' ELSE 'junior' END "
+                 "WHERE id = 'emp004'");
+    CHECK(strstr(out, "\"applied\":[\"emp004\"]") != NULL);
+    free(out);
+    snap = stored_json(&ctx, "emp004", &found);
+    CHECK(found && strstr(snap, "\"score\":42") != NULL);
+    CHECK(found && strstr(snap, "\"band\":\"senior\"") != NULL);
+    free(snap);
+
+    /* partition-wide UPDATE assigns across keyspaces */
+    out = run_ok(&ctx, "UPDATE Demo.People SET badge = 'gold' "
+                       "WHERE id = 'emp003' OR id = 'mgr01'");
+    CHECK(strstr(out, "\"count\":2") != NULL);
+    free(out);
+    cJSON *doc = edb_get(ctx.engine, "People", "employees", "emp003");
+    CHECK(doc != NULL);
+    if (doc) {
+        char *txt = cJSON_PrintUnformatted(doc);
+        CHECK(strstr(txt, "\"badge\":\"gold\"") != NULL);
+        cJSON_free(txt);
+        cJSON_Delete(doc);
+    }
+    doc = edb_get(ctx.engine, "People", "managers", "mgr01");
+    CHECK(doc != NULL);
+    if (doc) {
+        char *txt = cJSON_PrintUnformatted(doc);
+        CHECK(strstr(txt, "\"badge\":\"gold\"") != NULL);
+        cJSON_free(txt);
+        cJSON_Delete(doc);
+    }
+
+    /* INSERT with a column new to the shard */
+    out = run_ok(&ctx, "INSERT INTO Demo.People.managers (id, name, level) "
+                       "VALUES ('mgr03','Mo',5)");
+    CHECK(strstr(out, "\"applied\":[\"mgr03\"]") != NULL);
+    free(out);
+    doc = edb_get(ctx.engine, "People", "managers", "mgr03");
+    CHECK(doc != NULL);
+    if (doc) {
+        char *txt = cJSON_PrintUnformatted(doc);
+        CHECK(strstr(txt, "\"level\":5") != NULL);
+        cJSON_free(txt);
+        cJSON_Delete(doc);
+    }
+
+    /* id rename plus a new column in one statement */
+    out = run_ok(&ctx, "UPDATE Demo.People.employees "
+                       "SET id = 'emp009', score = 1 WHERE id = 'emp005'");
+    CHECK(strstr(out, "\"count\":2") != NULL);
+    free(out);
+    snap = stored_json(&ctx, "emp005", &found);
+    CHECK(!found && snap == NULL);
+    doc = edb_get(ctx.engine, "People", "employees", "emp009");
+    CHECK(doc != NULL);
+    if (doc) {
+        char *txt = cJSON_PrintUnformatted(doc);
+        CHECK(strstr(txt, "\"score\":1") != NULL);
+        cJSON_free(txt);
+        cJSON_Delete(doc);
+    }
+
+    /* NULL assignment writes explicit null (documented semantics) */
+    out = run_ok(&ctx, "UPDATE Demo.People.employees SET score = NULL "
+                       "WHERE id = 'emp001'");
+    CHECK(strstr(out, "\"applied\":[\"emp001\"]") != NULL);
+    free(out);
+    snap = stored_json(&ctx, "emp001", &found);
+    CHECK(found && strstr(snap, "\"score\":null") != NULL);
+    free(snap);
+
+    edb_config_close(ctx.config);
+    edb_engine_close(ctx.engine);
+}
+
 static void test_rejections(const edb_eql_ctx *ctx)
 {
     char *out = NULL;
@@ -979,6 +1099,7 @@ int main(void)
 
     test_write_back(&ctx);
     test_partition_wide();
+    test_schema_assigning();
 
     test_rejections(&ctx);
 
