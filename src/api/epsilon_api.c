@@ -683,6 +683,11 @@ bool edb_api_register(edb_http_server *srv, edb_engine *engine,
     /* GET: id lookups and .../all|ids (collect checks the last segment) */
     ok &= edb_http_add_handler(srv, "GET", "/data/", handle_data_collect);
     ok &= edb_http_add_handler(srv, "POST", "/data/", handle_data_collect);
+    /* EQL (stage 8): POST /eql on the client port; POST /admin/eql works
+     * both on the admin socket and over TCP with admin credentials */
+    ok &= edb_http_add_handler(srv, "POST", "/eql", handle_data_eql);
+    ok &= edb_http_add_handler(srv, "POST", "/admin/eql",
+                               handle_admin_eql);
     ok &= edb_http_add_handler(srv, "GET", "/admin/databases",
                                handle_admin_databases);
     ok &= edb_http_add_handler(srv, "POST", "/admin/databases",
