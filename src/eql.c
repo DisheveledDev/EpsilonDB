@@ -455,13 +455,55 @@ static void normalize_statement(const char *in, char *out, size_t cap)
 static void print_help(void)
 {
     printf("EQL console commands:\n");
-    printf("  <sql>                 run any single SQL-like statement:\n");
-    printf("                          SELECT id FROM Demo.People.employees\n");
-    printf("                            WHERE age > 30 ORDER BY name;\n");
-    printf("                          UPDATE ... / DELETE ... / INSERT ...\n");
+    printf("  <sql>                 run any single SQL-like statement\n");
+    printf("  help                  the same help, without the dot\n");
     printf("  .help                 this help\n");
     printf("  .raw                  toggle raw JSON output\n");
-    printf("  .quit | .exit         leave the console\n");
+    printf("  .quit | .exit | exit  leave the console\n");
+    printf("\n");
+    printf("References are Database.Partition.Keyspace. Three parts read one\n");
+    printf("table; two parts (db.partition) merge every keyspace in the\n");
+    printf("partition into one table.\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  -- one keyspace\n");
+    printf("  SELECT * FROM demo.people.employees;\n");
+    printf("  SELECT id, name FROM demo.people.employees WHERE age > 30 ORDER BY name;\n");
+    printf("  SELECT manager, COUNT(*) AS n, AVG(age) AS avg_age\n");
+    printf("    FROM demo.people.employees GROUP BY manager ORDER BY n DESC;\n");
+    printf("  SELECT e.name, m.dept FROM demo.people.employees e\n");
+    printf("    JOIN demo.people.managers m ON e.manager = m.id;\n");
+    printf("\n");
+    printf("  -- partition-wide: employees + managers + contractors in one query\n");
+    printf("  SELECT * FROM demo.people;\n");
+    printf("  SELECT COUNT(*) FROM demo.people WHERE department IS NOT NULL;\n");
+    printf("  UPDATE demo.people SET active = false WHERE id = 'e1003';\n");
+    printf("  DELETE FROM demo.people WHERE id = 'con003';\n");
+    printf("\n");
+    printf("  -- cross-partition joins\n");
+    printf("  SELECT p.title, m.dept FROM demo.ops.projects p\n");
+    printf("    JOIN demo.people.managers m ON p.lead = m.id WHERE p.active;\n");
+    printf("\n");
+    printf("  -- schema-assigning writes: new keys are created on the record\n");
+    printf("  UPDATE demo.people.employees SET score = 7 WHERE id = 'e1001';\n");
+    printf("  INSERT INTO demo.people.employees (id, name, age)\n");
+    printf("    VALUES ('e2001', 'Zoe', 28);\n");
+    printf("  -- removing a key: SET the key to NULL\n");
+    printf("  UPDATE demo.people.employees SET score = NULL WHERE id = 'e1001';\n");
+}
+
+static void print_banner(void)
+{
+    printf(
+        "  ______ _____ _                    _     _ \n"
+        " |  ____/ ____| |        /\\        | |   | |\n"
+        " | |__ | |    | |       /  \\   __ _| |_ _| |\n"
+        " |  __|| |    | |      / /\\ \\ / _` | |/ _` |\n"
+        " | |___| |____| |____ / ____ \\ (_| | | (_| |\n"
+        " |______\\_____|______/_/    \\_\\__,_|_|\\__,_|\n"
+        "\n"
+        " Epsilon Query Language console. Type 'help' for examples,\n"
+        " '.quit' or 'exit' to leave.\n\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -520,6 +562,9 @@ int main(int argc, char **argv)
     char body[131072];
     char *input = oneshot;
     bool interactive = isatty(fileno(stdin));
+    if (interactive && !oneshot[0]) {
+        print_banner();
+    }
 
     for (;;) {
         if (interactive && !input[0]) {
@@ -542,10 +587,11 @@ int main(int argc, char **argv)
         if (stmt[0] == '\0') {
             continue;
         }
-        if (strcasecmp(stmt, ".quit") == 0 || strcasecmp(stmt, ".exit") == 0) {
+        if (strcasecmp(stmt, ".quit") == 0 || strcasecmp(stmt, ".exit") == 0 ||
+            strcasecmp(stmt, "exit") == 0 || strcasecmp(stmt, "quit") == 0) {
             break;
         }
-        if (strcasecmp(stmt, ".help") == 0) {
+        if (strcasecmp(stmt, ".help") == 0 || strcasecmp(stmt, "help") == 0) {
             print_help();
             continue;
         }
