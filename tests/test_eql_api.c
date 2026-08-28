@@ -249,8 +249,95 @@ int main(int argc, char **argv)
                    "{\"name\":\"viewer\",\"groups\":2,\"password\":\"" PW
                    "\"}") == 201);
 
-    /* admin alias works over TCP with credentials */
+    /* ---- EQL permission matrix over HTTP --------------------------------
+     * A masked partition (app.watched) allows bit2 (viewer) to read but
+     * only bit1 (root) to create/update/delete. Every statement class is
+     * checked for both users, including a partition-wide reference, and
+     * each denial is cross-checked against the equivalent REST call so
+     * EQL can never be a permission side door. */
+    char pj[512];
+    snprintf(pj, sizeof(pj),
+             "{\"database\":\"app\",\"name\":\"watched\","
+             "\"create_mask\":1,\"update_mask\":1,"
+             "\"read_mask\":2,\"delete_mask\":1}");
+    CHECK(http_req("POST", "/admin/partitions", "root", PW, pj) == 201);
+    CHECK(http_req("PUT", "/data/app/watched/main/w1", "root", PW,
+                   "{\"n\":1}") == 200);
+
+    /* SELECT: viewer (bit2) has read, root (bit1) does not */
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"SELECT * FROM app.watched.main\"}",
+                       &body) == 200);
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"SELECT * FROM app.watched.main\"}",
+                       &body) == 403);
+    CHECK(strstr(body, "permission denied") != NULL);
+    /* parity: same denial on the REST read path */
+    CHECK(http_req("GET", "/data/app/watched/main/w1", "root", PW, NULL)
+          == 403);
+
+    /* INSERT (create mask): root allowed, viewer denied */
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"INSERT INTO app.watched.main (id, n) "
+                       "VALUES ('w2', 2)\"}", &body) == 200);
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"INSERT INTO app.watched.main (id, n) "
+                       "VALUES ('w3', 3)\"}", &body) == 403);
+    /* parity: REST put denied for viewer too */
+    CHECK(http_req("PUT", "/data/app/watched/main/w3", "viewer", PW,
+                   "{\"n\":3}") == 403);
+
+    /* UPDATE (update mask): root allowed, viewer denied */
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"UPDATE app.watched.main SET n = 10 "
+                       "WHERE id = 'w2'\"}", &body) == 200);
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"UPDATE app.watched.main SET n = 11 "
+                       "WHERE id = 'w2'\"}", &body) == 403);
+
+    /* DELETE (delete mask): root allowed, viewer denied */
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"DELETE FROM app.watched.main "
+                       "WHERE id = 'w2'\"}", &body) == 200);
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"DELETE FROM app.watched.main "
+                       "WHERE id = 'w1'\"}", &body) == 403);
+    /* parity: REST delete denied for viewer too */
+    CHECK(http_req("DELETE", "/data/app/watched/main/w1", "viewer", PW,
+                   NULL) == 403);
+    /* the viewer-denied deletes did not run: w1 is still there (read via
+     * the viewer's own read permission since root has no read bit) */
+    CHECK(http_req("GET", "/data/app/watched/main/w1", "viewer", PW, NULL)
+          == 200);
+
+    /* partition-wide reference: the mask applies to the whole partition */
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"SELECT COUNT(*) FROM app.watched\"}",
+                       &body) == 200);
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"UPDATE app.watched SET n = 0\"}",
+                       &body) == 403);
+    CHECK(http_request("POST", "/eql", "viewer", PW,
+                       "{\"sql\":\"DELETE FROM app.watched\"}",
+                       &body) == 403);
+
+    /* a statement referencing a masked partition the caller cannot read
+     * is denied even when other references are readable */
+    CHECK(http_request("POST", "/eql", "root", PW,
+                       "{\"sql\":\"SELECT e.id FROM app.people.employees e "
+                       "JOIN app.watched.main w ON e.id = w.id\"}",
+                       &body) == 403);
+
+    /* admin alias over TCP honours group membership too: /admin/eql is an
+     * EQL surface, not an admin-group bypass; viewer (bit2) is denied on
+     * the masked partition while root passes */
     CHECK(http_request("POST", "/admin/eql", "root", PW,
+                       "{\"sql\":\"SELECT COUNT(*) AS n FROM "
+                       "app.people.employees\"}", &body) == 200);
+    CHECK(http_request("POST", "/admin/eql", "viewer", PW,
+                       "{\"sql\":\"UPDATE app.watched.main SET n = 1\"}",
+                       &body) == 403);
+    CHECK(http_request("POST", "/admin/eql", "viewer", PW,
                        "{\"sql\":\"SELECT COUNT(*) AS n FROM "
                        "app.people.employees\"}", &body) == 200);
 
