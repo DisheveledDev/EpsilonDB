@@ -1078,7 +1078,7 @@ static const char console_html[] =
     "  c.innerHTML =\n"
     "    '<h5>EQL console</h5>' +\n"
     "    '<div class=\"small text-muted mb-2\">SQL-like statements against demo.people.employees and friends. Enter runs the statement; up/down walks history.</div>' +\n"
-    "    '<div id=\"eql-out\" class=\"border rounded bg-dark text-light p-2 font-monospace small\" style=\"height:26rem; overflow-y:auto; white-space:pre-wrap;\"></div>' +\n"
+    "    '<div id=\"eql-out\" class=\"border rounded bg-dark text-light p-2 font-monospace small\" style=\"height:26rem; overflow:auto; white-space:pre;\"></div>' +\n"
     "    '<div class=\"row g-2 mt-1\">' +\n"
     "      '<div class=\"col-auto\"><span class=\"font-monospace fw-bold\" style=\"line-height:2.4;\">eql&gt;</span></div>' +\n"
     "      '<div class=\"col\"><input id=\"eql-in\" class=\"form-control font-monospace\" placeholder=\"SELECT id FROM demo.people.employees\" autocomplete=\"off\" spellcheck=\"false\"></div>' +\n"
