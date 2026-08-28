@@ -236,6 +236,46 @@ static const demo_record DEMO_RECORDS[] = {
       "{\"name\":\"Eve Davis\",\"title\":\"Head of Data\","
       "\"department\":\"Data\",\"email\":\"eve@acme.example\","
       "\"salary\":130000,\"manager\":null,\"active\":true}" },
+    { "people", "employees", "e1006",
+      "{\"name\":\"Frank Lee\",\"title\":\"Sales Director\","
+      "\"department\":\"Sales\",\"email\":\"frank@acme.example\","
+      "\"salary\":112000,\"manager\":null,\"active\":true}" },
+    { "people", "employees", "e1007",
+      "{\"name\":\"Grace Kim\",\"title\":\"HR Manager\","
+      "\"department\":\"HR\",\"email\":\"grace@acme.example\","
+      "\"salary\":76000,\"manager\":null,\"active\":true}" },
+    { "people", "employees", "e1008",
+      "{\"name\":\"Henry Adams\",\"title\":\"QA Engineer\","
+      "\"department\":\"Engineering\",\"email\":\"henry@acme.example\","
+      "\"salary\":68000,\"manager\":\"e1004\",\"active\":true}" },
+    { "people", "employees", "e1009",
+      "{\"name\":\"Isla Murray\",\"title\":\"UI Designer\","
+      "\"department\":\"Product\",\"email\":\"isla@acme.example\","
+      "\"salary\":71000,\"manager\":\"e1002\",\"active\":true}" },
+    { "people", "employees", "e1010",
+      "{\"name\":\"Jack Turner\",\"title\":\"Platform Engineer\","
+      "\"department\":\"Engineering\",\"email\":\"jack@acme.example\","
+      "\"salary\":92000,\"manager\":\"e1004\",\"active\":false}" },
+    { "people", "contractors", "c1001",
+      "{\"name\":\"Ivan Petrov\",\"agency\":\"TechTemps\","
+      "\"role\":\"Backend Contractor\",\"department\":\"Engineering\","
+      "\"day_rate\":450,\"contract_end\":\"2026-12-31\"}" },
+    { "people", "contractors", "c1002",
+      "{\"name\":\"Julia Reyes\",\"agency\":\"CodeCrew\","
+      "\"role\":\"Frontend Contractor\",\"department\":\"Engineering\","
+      "\"day_rate\":400,\"contract_end\":\"2026-09-30\"}" },
+    { "people", "contractors", "c1003",
+      "{\"name\":\"Mike Chen\",\"agency\":\"DataBridge\","
+      "\"role\":\"Data Engineer\",\"department\":\"Data\","
+      "\"day_rate\":480,\"contract_end\":\"2027-03-31\"}" },
+    { "people", "contractors", "c1004",
+      "{\"name\":\"Nadia Osei\",\"agency\":\"CodeCrew\","
+      "\"role\":\"UX Contractor\",\"department\":\"Product\","
+      "\"day_rate\":380,\"contract_end\":\"2026-11-30\"}" },
+    { "people", "contractors", "c1005",
+      "{\"name\":\"Omar Ali\",\"agency\":\"StaffLine\","
+      "\"role\":\"Support Contractor\",\"department\":\"Sales\","
+      "\"day_rate\":320,\"contract_end\":\"2026-10-31\"}" },
     { "departments", "depts", "eng",
       "{\"name\":\"Engineering\",\"head\":\"Dave Brown\","
       "\"budget\":2500000,\"headcount\":42}" },
@@ -260,6 +300,46 @@ static const demo_record DEMO_RECORDS[] = {
     { "projects", "projects", "p300",
       "{\"name\":\"Data Warehouse\",\"owner\":\"Data\","
       "\"status\":\"planned\",\"budget\":150000,\"progress\":0.0}" },
+    { "products", "products", "sku1001",
+      "{\"name\":\"Acme Laptop 14\",\"category\":\"Hardware\","
+      "\"price\":1299.00,\"cost\":900.00,\"stock\":42,\"active\":true}" },
+    { "products", "products", "sku1002",
+      "{\"name\":\"Acme Wireless Mouse\",\"category\":\"Peripherals\","
+      "\"price\":24.99,\"cost\":8.50,\"stock\":320,\"active\":true}" },
+    { "products", "products", "sku1003",
+      "{\"name\":\"Acme Mechanical Keyboard\",\"category\":\"Peripherals\","
+      "\"price\":89.00,\"cost\":45.00,\"stock\":150,\"active\":true}" },
+    { "products", "products", "sku1004",
+      "{\"name\":\"Acme 27 4K Monitor\",\"category\":\"Hardware\","
+      "\"price\":449.00,\"cost\":300.00,\"stock\":75,\"active\":true}" },
+    { "products", "products", "sku1005",
+      "{\"name\":\"Acme USB-C Dock\",\"category\":\"Peripherals\","
+      "\"price\":129.00,\"cost\":70.00,\"stock\":0,\"active\":false}" },
+    { "products", "products", "sku1006",
+      "{\"name\":\"Acme HD Webcam\",\"category\":\"Peripherals\","
+      "\"price\":59.00,\"cost\":30.00,\"stock\":90,\"active\":true}" },
+    { "products", "products", "sku1007",
+      "{\"name\":\"Acme Desk Lamp\",\"category\":\"Accessories\","
+      "\"price\":39.00,\"cost\":15.00,\"stock\":210,\"active\":true}" },
+    { "products", "products", "sku1008",
+      "{\"name\":\"Acme Laptop Stand\",\"category\":\"Accessories\","
+      "\"price\":49.00,\"cost\":20.00,\"stock\":130,\"active\":true}" },
+    { "products", "suppliers", "sup1001",
+      "{\"name\":\"SinoTech Components\",\"country\":\"China\","
+      "\"email\":\"sales@sinotech.example\",\"lead_time_days\":21,"
+      "\"rating\":4.2}" },
+    { "products", "suppliers", "sup1002",
+      "{\"name\":\"EuroParts GmbH\",\"country\":\"Germany\","
+      "\"email\":\"orders@europarts.example\",\"lead_time_days\":14,"
+      "\"rating\":4.6}" },
+    { "products", "suppliers", "sup1003",
+      "{\"name\":\"Pacific Trade Co\",\"country\":\"Japan\","
+      "\"email\":\"contact@pacifictrade.example\",\"lead_time_days\":18,"
+      "\"rating\":4.0}" },
+    { "products", "suppliers", "sup1004",
+      "{\"name\":\"LocalMakers Ltd\",\"country\":\"United Kingdom\","
+      "\"email\":\"hello@localmakers.example\",\"lead_time_days\":5,"
+      "\"rating\":4.8}" },
     { "locations", "offices", "l1",
       "{\"city\":\"London\",\"country\":\"United Kingdom\","
       "\"address\":\"1 Acme Way\",\"headcount\":58,\"hq\":true}" },
