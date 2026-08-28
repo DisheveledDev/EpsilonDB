@@ -159,6 +159,32 @@ typedef enum {
 bool edb_check_perm(uint64_t mask, uint64_t user_groups,
                     edb_permission perm);
 
+/* --- code store (stage 9: Lua function records) ----------------------- */
+
+/* All code records live in the reserved config_code keyspace of
+ * __system__ (see CFG_KEYSPACE_CODE), so they replicate to every node
+ * with the same machinery as the rest of the config.
+ * Named function: {"type":"function","name":..,"code":..}
+ * Database action: {"type":"action","name":"<db>_<partition>_<keyspace>_
+ *   <event>","database":..,"partition":..,"keyspace":..,"event":..,
+ *   "code":..} */
+
+/* Saves (upserts) one code record under `name`; the record must carry a
+ * "type" and a "name" field (the name field is overridden with `name`).
+ * Replicates through the normal config path. */
+bool edb_code_save(edb_config *cfg, const char *name, cJSON *record);
+
+/* Deletes the record named `name`. Returns true when it existed. */
+bool edb_code_delete(edb_config *cfg, const char *name);
+
+/* Loads one record by name (caller frees with cJSON_Delete), or NULL
+ * when absent. */
+cJSON *edb_code_load(edb_config *cfg, const char *name);
+
+/* Every code record as an array of objects, ordered by name (caller
+ * frees with cJSON_Delete). */
+cJSON *edb_code_list(edb_config *cfg);
+
 /* --- server/cluster settings ------------------------------------------ */
 
 /* Arbitrary named JSON settings (cluster topology knobs, server options).

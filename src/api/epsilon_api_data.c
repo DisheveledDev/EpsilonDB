@@ -41,12 +41,6 @@ bool handle_data_put(const edb_http_request *req,
         cJSON_Delete(doc);
         return true;
     }
-    char *json = cJSON_PrintUnformatted(doc);
-    cJSON_Delete(doc);
-    if (!json) {
-        respond_error(res, 500, "encode failed");
-        return true;
-    }
 
     long long ttl = -1;
     char ttlbuf[32];
@@ -58,7 +52,39 @@ bool handle_data_put(const edb_http_request *req,
     edb_permission permission = existing ? EDB_PERM_UPDATE : EDB_PERM_CREATE;
     cJSON_Delete(existing);
     if (!authorize_partition(g_ctx.config, db, part, groups, permission, res)) {
-        free(json);
+        cJSON_Delete(doc);
+        return true;
+    }
+
+    /* stage 9: beforeInsert/beforeUpdate scripts may replace the
+     * document (returned entity) or veto the write (scripts never run
+     * for __system__ config writes) */
+    {
+        char *veto = NULL;
+        edb_lua_result lr = api_fire_lua(
+            is_update ? EDB_LUA_BEFORE_UPDATE : EDB_LUA_BEFORE_INSERT,
+            db, part, ks, id, &doc, groups, false, &veto);
+        if (lr == EDB_LUA_ROLLBACK) {
+            char msg[640];
+            snprintf(msg, sizeof(msg), "rejected: %s",
+                     veto ? veto : "script rollback");
+            free(veto);
+            cJSON_Delete(doc);
+            respond_error(res, 403, msg);
+            return true;
+        }
+        free(veto);
+        if (lr == EDB_LUA_ERROR) {
+            cJSON_Delete(doc);
+            respond_error(res, 500, "script error");
+            return true;
+        }
+    }
+
+    char *json = cJSON_PrintUnformatted(doc);
+    cJSON_Delete(doc);
+    if (!json) {
+        respond_error(res, 500, "encode failed");
         return true;
     }
 
@@ -115,6 +141,17 @@ bool handle_data_put(const edb_http_request *req,
     if (!ok) {
         respond_error(res, 500, "storage failed");
         return true;
+    }
+    /* stage 9: afterInsert/afterUpdate scripts are best-effort and never
+     * block. With a repl service attached the local apply already fired
+     * the event (once per node, trusted), so only the single-node path
+     * fires here. */
+    if (!g_repl) {
+        char *veto = NULL;
+        (void)api_fire_lua(
+            is_update ? EDB_LUA_AFTER_UPDATE : EDB_LUA_AFTER_INSERT,
+            db, part, ks, id, NULL, groups, false, &veto);
+        free(veto);
     }
     respond_json(res, 200, NULL);
     res->body = edb_http_body_printf(&res->body_len,
@@ -187,6 +224,33 @@ bool handle_data_delete(const edb_http_request *req,
         return true;
     }
 
+    /* stage 9: before_delete scripts may veto the delete. The current
+     * document is captured once and handed to both handlers (the
+     * before_* handler receives the entity, the after_* handler sees
+     * what was deleted). */
+    cJSON *deleted = edb_get(g_ctx.engine, part, ks, id);
+    {
+        char *veto = NULL;
+        edb_lua_result lr = api_fire_lua(EDB_LUA_BEFORE_DELETE, db, part,
+                                         ks, id, &deleted, groups, false,
+                                         &veto);
+        if (lr == EDB_LUA_ROLLBACK) {
+            char msg[640];
+            snprintf(msg, sizeof(msg), "rejected: %s",
+                     veto ? veto : "script rollback");
+            free(veto);
+            cJSON_Delete(deleted);
+            respond_error(res, 403, msg);
+            return true;
+        }
+        free(veto);
+        if (lr == EDB_LUA_ERROR) {
+            cJSON_Delete(deleted);
+            respond_error(res, 500, "script error");
+            return true;
+        }
+    }
+
     bool ok;
     long long started = api_now_us();
     if (g_repl) {
@@ -230,6 +294,15 @@ bool handle_data_delete(const edb_http_request *req,
         respond_error(res, 500, "delete failed");
         return true;
     }
+    /* stage 9: after_delete scripts are best-effort and never block; the
+     * local apply already fired the event when replication is attached */
+    if (!g_repl) {
+        char *veto = NULL;
+        (void)api_fire_lua(EDB_LUA_AFTER_DELETE, db, part, ks, id,
+                           &deleted, groups, false, &veto);
+        free(veto);
+    }
+    cJSON_Delete(deleted);
     if (g_analytics) {
         edb_analytics_record_delete(g_analytics, part, ks,
                                     api_now_us() - started);

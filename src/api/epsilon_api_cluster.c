@@ -601,8 +601,8 @@ bool handle_admin_join(const edb_http_request *req,
     char fail_detail[128] = "";
     edb_cluster_set_auto_compliant(g_cluster, false);
 
-    const char *sys_ks[8];
-    size_t nsys = edb_config_system_keyspaces(sys_ks, 8);
+    const char *sys_ks[9];
+    size_t nsys = edb_config_system_keyspaces(sys_ks, 9);
     for (size_t i = 0; i < nsys && synced; i++) {
         if (!edb_repl_catchup(g_repl, seed_addr, seed_port,
                               EDB_SYSTEM_DB, sys_ks[i])) {

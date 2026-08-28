@@ -18,6 +18,7 @@
 #define CFG_KEYSPACE_PARTITIONS  "config_partitions"
 #define CFG_KEYSPACE_KEYSPACES   "config_keyspaces"
 #define CFG_KEYSPACE_SETTINGS    "config_settings"
+#define CFG_KEYSPACE_CODE        "config_code"
 
 struct edb_config {
     edb_engine *engine;

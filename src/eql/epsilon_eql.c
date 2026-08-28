@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "../epsilon_log.h"
+#include "../lua/epsilon_lua.h"
 #include "../../vendor/sqlite/sqlite3.h"
 
 #define EQL_MAX_TABLES 16
@@ -1432,6 +1433,12 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         return -1;
     }
 
+    /* stage 9: classify the write before applying it (after_* scripts
+     * distinguish inserts from updates; the delete handler receives the
+     * record that was removed) */
+    cJSON *existing = ctx->engine ? edb_get(ctx->engine, t->part, ks, id)
+                                  : NULL;
+
     int code = 0;
     for (int attempt = 0; attempt < EQL_WRITE_ATTEMPTS; attempt++) {
         if (ctx->repl) {
@@ -1469,6 +1476,25 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
          * in admin listings; replication fans the records to peers */
         edb_partition_ensure(ctx->config, t->db, t->part, ks, NULL);
     }
+    if (code == 200 && strcmp(t->db, EDB_SYSTEM_DB) != 0 && !ctx->repl) {
+        /* stage 9: EQL writes fire after_* scripts (trusted: scripts
+         * authored by admins run with full rights); best-effort only.
+         * With replication attached the local apply already fired the
+         * event once per node, so only the single-node path fires. */
+        edb_lua_ctx lctx = { ctx->engine, ctx->config, ctx->repl, NULL };
+        edb_lua_event_arg larg = { t->db, t->part, ks, id, NULL, 0, true };
+        char *veto = NULL;
+        edb_lua_event luev;
+        if (value) {
+            luev = existing ? EDB_LUA_AFTER_UPDATE : EDB_LUA_AFTER_INSERT;
+        } else {
+            luev = EDB_LUA_AFTER_DELETE;
+            larg.value = &existing;
+        }
+        (void)edb_lua_fire(&lctx, luev, &larg, &veto);
+        free(veto);
+    }
+    cJSON_Delete(existing);
     return 0;
 }
 
