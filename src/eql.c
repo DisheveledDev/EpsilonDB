@@ -456,7 +456,7 @@ static void print_help(void)
 {
     printf("EQL console commands:\n");
     printf("  <sql>                 run any single SQL-like statement:\n");
-    printf("                          SELECT id FROM Demo.People.employees\n");
+    printf("                          SELECT id FROM demo.people.employees\n");
     printf("                            WHERE age > 30 ORDER BY name;\n");
     printf("                          UPDATE ... / DELETE ... / INSERT ...\n");
     printf("  .help                 this help\n");

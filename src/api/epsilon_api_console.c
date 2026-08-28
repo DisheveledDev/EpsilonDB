@@ -216,57 +216,57 @@ typedef struct {
 } demo_record;
 
 static const demo_record DEMO_RECORDS[] = {
-    { "People", "employees", "e1001",
+    { "people", "employees", "e1001",
       "{\"name\":\"Alice Johnson\",\"title\":\"Software Engineer\","
       "\"department\":\"Engineering\",\"email\":\"alice@acme.example\","
       "\"salary\":95000,\"manager\":\"e1004\",\"active\":true}" },
-    { "People", "employees", "e1002",
+    { "people", "employees", "e1002",
       "{\"name\":\"Bob Smith\",\"title\":\"Product Manager\","
       "\"department\":\"Product\",\"email\":\"bob@acme.example\","
       "\"salary\":88000,\"manager\":\"e1004\",\"active\":true}" },
-    { "People", "employees", "e1003",
+    { "people", "employees", "e1003",
       "{\"name\":\"Carol Williams\",\"title\":\"Data Analyst\","
       "\"department\":\"Data\",\"email\":\"carol@acme.example\","
       "\"salary\":72000,\"manager\":\"e1005\",\"active\":true}" },
-    { "People", "employees", "e1004",
+    { "people", "employees", "e1004",
       "{\"name\":\"Dave Brown\",\"title\":\"Engineering Director\","
       "\"department\":\"Engineering\",\"email\":\"dave@acme.example\","
       "\"salary\":140000,\"manager\":null,\"active\":true}" },
-    { "People", "employees", "e1005",
+    { "people", "employees", "e1005",
       "{\"name\":\"Eve Davis\",\"title\":\"Head of Data\","
       "\"department\":\"Data\",\"email\":\"eve@acme.example\","
       "\"salary\":130000,\"manager\":null,\"active\":true}" },
-    { "Departments", "depts", "eng",
+    { "departments", "depts", "eng",
       "{\"name\":\"Engineering\",\"head\":\"Dave Brown\","
       "\"budget\":2500000,\"headcount\":42}" },
-    { "Departments", "depts", "prod",
+    { "departments", "depts", "prod",
       "{\"name\":\"Product\",\"head\":\"Bob Smith\","
       "\"budget\":900000,\"headcount\":12}" },
-    { "Departments", "depts", "data",
+    { "departments", "depts", "data",
       "{\"name\":\"Data\",\"head\":\"Eve Davis\","
       "\"budget\":1200000,\"headcount\":18}" },
-    { "Departments", "depts", "sales",
+    { "departments", "depts", "sales",
       "{\"name\":\"Sales\",\"head\":\"Frank Lee\","
       "\"budget\":1500000,\"headcount\":30}" },
-    { "Departments", "depts", "hr",
+    { "departments", "depts", "hr",
       "{\"name\":\"Human Resources\",\"head\":\"Grace Kim\","
       "\"budget\":400000,\"headcount\":6}" },
-    { "Projects", "projects", "p100",
+    { "projects", "projects", "p100",
       "{\"name\":\"Website Redesign\",\"owner\":\"Product\","
       "\"status\":\"active\",\"budget\":180000,\"progress\":0.65}" },
-    { "Projects", "projects", "p200",
+    { "projects", "projects", "p200",
       "{\"name\":\"Mobile App\",\"owner\":\"Engineering\","
       "\"status\":\"active\",\"budget\":320000,\"progress\":0.4}" },
-    { "Projects", "projects", "p300",
+    { "projects", "projects", "p300",
       "{\"name\":\"Data Warehouse\",\"owner\":\"Data\","
       "\"status\":\"planned\",\"budget\":150000,\"progress\":0.0}" },
-    { "Locations", "offices", "l1",
+    { "locations", "offices", "l1",
       "{\"city\":\"London\",\"country\":\"United Kingdom\","
       "\"address\":\"1 Acme Way\",\"headcount\":58,\"hq\":true}" },
-    { "Locations", "offices", "l2",
+    { "locations", "offices", "l2",
       "{\"city\":\"New York\",\"country\":\"United States\","
       "\"address\":\"500 Park Ave\",\"headcount\":34,\"hq\":false}" },
-    { "Locations", "offices", "l3",
+    { "locations", "offices", "l3",
       "{\"city\":\"Berlin\",\"country\":\"Germany\","
       "\"address\":\"Mitte 12\",\"headcount\":16,\"hq\":false}" },
 };
