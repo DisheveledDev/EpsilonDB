@@ -1,4 +1,4 @@
-/* epsilon_api_eql.c - HTTP surface for the EQL engine (stage 8, eql-d).
+/* epsilon_api_eql.c - HTTP surface for the EQL engine.
  *
  * POST /eql          untrusted port: normal Bearer+password auth; partition
  *                    permission masks are enforced by the engine itself.

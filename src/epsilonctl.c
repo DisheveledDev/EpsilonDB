@@ -555,7 +555,7 @@ int execute_command(int argc, char **argv)
         return 1;
     }
 
-    /* ---- cluster (stage 4) ---- */
+    /* ---- cluster ---- */
     if (strcmp(cmd, "cluster") == 0) {
         return run("GET", "/admin/cluster", NULL);
     }
@@ -742,7 +742,7 @@ int execute_command(int argc, char **argv)
         return result;
     }
 
-    /* ---- cluster (stage 4): handled above with the other joins ---- */
+    /* ---- cluster: handled above with the other joins ---- */
 
     print_usage();
     return 1;

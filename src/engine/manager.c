@@ -443,7 +443,7 @@ bool edb_shard_path(edb_engine *mgr, const char *partition,
 /* True when the sqlite database behind an open shard passes
  * "PRAGMA integrity_check". Caller does not hold sh->lock.
  * (Currently unused: invalidate runs integrity_check via sqlite3_exec
- * on the replaced handle; kept for the stage 6c delta-catch-up work.) */
+ * on the replaced handle; kept for the delta-catch-up work.) */
 #if 0
 static bool shard_integrity_ok(edb_shard *sh)
 {

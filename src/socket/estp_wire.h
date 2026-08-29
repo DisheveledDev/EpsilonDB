@@ -1,5 +1,5 @@
 /* estp_wire.h - ESTP frame codec shared between the cluster mesh
- * (stage 4) and the replication layer (stage 5).
+ * and the replication layer.
  *
  * Frame layout:
  *   offset 0: magic 'Z''S''T''P'
@@ -8,9 +8,9 @@
  *   offset 6: payload length, 4-byte big-endian
  *   offset 10: JSON payload
  *
- * Stage 4 types carry membership gossip. Stage 5 adds request/reply
+ * The membership types carry gossip. Replication adds request/reply
  * pairs for data replication: REPL/ACK for writes, QUERY/RESULT for
- * quorum reads. Stage 6b adds SNAP_REQ/SNAP_DATA for shard snapshot
+ * quorum reads. Snapshot transfer adds SNAP_REQ/SNAP_DATA for shard snapshot
  * transfer (raw file bytes, not JSON). Every connection still starts
  * with HELLO.
  */

@@ -1,4 +1,4 @@
-/* test_delta.c - stage 6c tests: delta catch-up after shard snapshot.
+/* test_delta.c - tests: delta catch-up after shard snapshot.
  *
  * Scenario: a,b,c hold replicated data in "main"/"kv". A fourth node d
  * joins (triggering a rebalance wave), snapshots the shard from its live

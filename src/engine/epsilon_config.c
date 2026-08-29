@@ -277,6 +277,98 @@ char **edb_setting_list(edb_config *cfg, size_t *count_out)
     return names;
 }
 
+/* --- code store (Lua function records) --------------------------------- */
+
+bool edb_code_save(edb_config *cfg, const char *name, cJSON *record)
+{
+    if (!cfg || !name || !*name || !cJSON_IsObject(record)) {
+        return false;
+    }
+    cJSON *copy = cJSON_Duplicate(record, 1);
+    if (!copy) {
+        return false;
+    }
+    cJSON_DeleteItemFromObject(copy, "name");
+    cJSON_AddStringToObject(copy, "name", name);
+    bool ok = store(cfg, CFG_KEYSPACE_CODE, name, copy);
+    cJSON_Delete(copy);
+    return ok;
+}
+
+bool edb_code_delete(edb_config *cfg, const char *name)
+{
+    if (!cfg || !name || !*name) {
+        return false;
+    }
+    cJSON *rec = fetch(cfg, CFG_KEYSPACE_CODE, name);
+    if (!rec) {
+        return false;
+    }
+    cJSON_Delete(rec);
+    return remove_record(cfg, CFG_KEYSPACE_CODE, name);
+}
+
+cJSON *edb_code_load(edb_config *cfg, const char *name)
+{
+    if (!cfg || !name || !*name) {
+        return NULL;
+    }
+    return fetch(cfg, CFG_KEYSPACE_CODE, name);
+}
+
+static int code_name_cmp(const void *a, const void *b)
+{
+    const cJSON *const *x = a;
+    const cJSON *const *y = b;
+    const char *na = "";
+    const char *nb = "";
+    const cJSON *fa = cJSON_GetObjectItemCaseSensitive(*x, "name");
+    const cJSON *fb = cJSON_GetObjectItemCaseSensitive(*y, "name");
+    if (cJSON_IsString(fa) && fa->valuestring) {
+        na = fa->valuestring;
+    }
+    if (cJSON_IsString(fb) && fb->valuestring) {
+        nb = fb->valuestring;
+    }
+    return strcmp(na, nb);
+}
+
+cJSON *edb_code_list(edb_config *cfg)
+{
+    if (!cfg) {
+        return cJSON_CreateArray();
+    }
+    cJSON *all = collect(cfg, CFG_KEYSPACE_CODE);
+    if (!all) {
+        return cJSON_CreateArray();
+    }
+    size_t n = (size_t)cJSON_GetArraySize(all);
+    if (n > 1) {
+        cJSON **ptrs = malloc(n * sizeof(*ptrs));
+        if (ptrs) {
+            for (size_t i = 0; i < n; i++) {
+                ptrs[i] = cJSON_GetArrayItem(all, (int)i);
+            }
+            qsort(ptrs, n, sizeof(*ptrs), code_name_cmp);
+            cJSON *sorted = cJSON_CreateArray();
+            if (sorted) {
+                for (size_t i = 0; i < n; i++) {
+                    /* duplicate: the sorted array must own its items
+                     * independently of `all` */
+                    cJSON_AddItemToArray(sorted,
+                                         cJSON_Duplicate(ptrs[i], 1));
+                }
+            }
+            free(ptrs);
+            if (sorted) {
+                cJSON_Delete(all);
+                return sorted;
+            }
+        }
+    }
+    return all;
+}
+
 bool edb_config_is_system_key(edb_config *cfg, const char key[33])
 {
     if (!cfg || !key || strlen(key) != 32) {
@@ -285,7 +377,7 @@ bool edb_config_is_system_key(edb_config *cfg, const char key[33])
     static const char *const keyspaces[] = {
         CFG_KEYSPACE_DATABASES, CFG_KEYSPACE_GROUPS,   CFG_KEYSPACE_USERS,
         CFG_KEYSPACE_PARTITIONS, CFG_KEYSPACE_KEYSPACES,
-        CFG_KEYSPACE_SETTINGS,
+        CFG_KEYSPACE_SETTINGS,  CFG_KEYSPACE_CODE,
     };
     for (size_t i = 0;
          i < sizeof(keyspaces) / sizeof(keyspaces[0]); i++) {
@@ -305,7 +397,7 @@ size_t edb_config_system_keyspaces(const char **out, size_t cap)
     static const char *const keyspaces[] = {
         CFG_KEYSPACE_DATABASES, CFG_KEYSPACE_GROUPS,   CFG_KEYSPACE_USERS,
         CFG_KEYSPACE_PARTITIONS, CFG_KEYSPACE_KEYSPACES,
-        CFG_KEYSPACE_SETTINGS,
+        CFG_KEYSPACE_SETTINGS,  CFG_KEYSPACE_CODE,
     };
     size_t n = sizeof(keyspaces) / sizeof(keyspaces[0]);
     for (size_t i = 0; out && i < n && i < cap; i++) {

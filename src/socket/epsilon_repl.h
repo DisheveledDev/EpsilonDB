@@ -1,5 +1,5 @@
-/* epsilon_repl.h - stage 5 replication: write fan-out, per-node change
- * caches and quorum reads on top of the stage 4 mesh.
+/* epsilon_repl.h - replication: write fan-out, per-node change
+ * caches and quorum reads on top of the cluster mesh.
  *
  * Write path (edb_repl_write):
  *   1. apply the change locally through the registered apply handler,
@@ -105,7 +105,7 @@ char **edb_repl_read_ids(edb_repl *rp, const char *db, const char *partition,
                          const char *keyspace, const cJSON *filters,
                          size_t *count_out);
 
-/* --- stage 6c: delta catch-up ---------------------------------------- */
+/* --- delta catch-up -------------------------------------------------- */
 
 /* Puts this node into (or out of) the "syncing" state. While syncing,
  * inbound REPL frames are answered ok:false (rather than applied) so

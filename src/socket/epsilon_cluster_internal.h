@@ -68,13 +68,13 @@ struct edb_cluster {
     size_t nranges;
     size_t ranges_cap;
 
-    /* stage 6: pending target structure (generation 0 = none pending) */
+    /* pending target structure (generation 0 = none pending) */
     long long target_generation;
     edb_range_info *target_ranges;
     size_t ntarget_ranges;
     size_t target_ranges_cap;
 
-    /* stage 6e: when true (default), the maintainer marks this node
+    /* when true (default), the maintainer marks this node
      * compliant as soon as it holds everything the target assigns to
      * it. Disabled around a join's snapshot/catch-up phase so a fresh
      * node cannot mark itself compliant before its data lands. */

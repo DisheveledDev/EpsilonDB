@@ -296,8 +296,8 @@ The embedded Bootstrap web console is served at `/admin` straight from the
 `epsilond` binary. On first run it shows a setup form that creates the `admin`
 user with a password; afterwards it presents a login form. The console then
 exposes the same operations as `epsilonctl` (status, databases, groups, users,
-partitions, keyspaces, settings, data, analytics, benchmark, and cluster)
-backed by the JSON API.
+partitions, keyspaces, settings, data, EQL, code, analytics, benchmark, and
+cluster) backed by the JSON API.
 
 The **Analytics** tab gives you the live cluster picture: summary cards for
 nodes, reads, writes, updates, deletes, average read/write latency, total
@@ -316,6 +316,51 @@ proxy in front of the HTTP port in production.
 
 The Unix admin socket speaks HTTP without authentication and is what
 `epsilonctl` uses by default (full local admin rights).
+
+## Lua scripting
+
+Admins can attach Lua code to database events from the console's **Code**
+tab (or the `/admin/code` JSON API). Scripts live in the system database,
+replicate to every node, and run there against every write:
+
+- **Events**: `beforeInsert`, `afterInsert`, `beforeUpdate`, `afterUpdate`,
+  `beforeDelete`, `afterDelete`. A put of a new record fires the insert
+  pair, a put of an existing record the update pair.
+- **Functions**: the Code tab's Create Function button opens a modal for
+  two kinds of entries. A *named function* is a plain library function.
+  A *database action* is a function named
+  `database_partition_keyspace_event` (picked from dropdowns of database,
+  partition, keyspace and activity); the engine calls it automatically
+  when that event fires for that scope. Creating an entry pre-fills the
+  skeleton, e.g. `function generateId ()` or
+  `function demo_people_staff_beforeDelete (entity, id)`.
+- **Handlers** receive the record's document as `entity` (a table of its
+  JSON fields) and the record key as `id`. A `beforeInsert`/
+  `beforeUpdate` handler may `return` the entity table to replace the
+  written document; returns elsewhere are ignored (`beforeDelete` cannot
+  change the delete, `after*` handlers are best-effort).
+  `rollback(reason)` vetoes the originating write with a 4xx
+  (before* only).
+- **Stdlib**: `get/query/count/put/remove/rollback/log/cluster`, plus a
+  sandboxed `string`/`table`/`math`/`utf8`/base (no `io`, `os`, `debug`,
+  `package`, or file/GC escapes; `print` writes to the server log). A
+  global `date` table covers time handling instead of `os`:
+  `date.now()`, `date.time([table])`, `date.format(fmt [, t])` and
+  `date.diff(t1, t2)`. Reads respect partition masks against the
+  originating caller; replication apply and other trusted flows skip
+  checks.
+
+    # named function
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
+         -X POST localhost:8123/admin/code \
+         -d '{"type":"function","name":"generateId"}'
+    # database action: normalize writes to app.main.kv
+    curl -H 'Authorization: Bearer root' -H 'X-Epsilon-Password: change-me' \
+         -X POST localhost:8123/admin/code \
+         -d '{"type":"action","database":"app","partition":"main",
+              "keyspace":"kv","event":"beforeInsert",
+              "code":"function app_main_kv_beforeInsert(entity, id) \
+    entity.created = true return entity end"}'
 
 ## Monitoring
 

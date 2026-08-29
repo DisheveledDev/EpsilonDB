@@ -8,6 +8,7 @@
 
 #include "epsilon_api.h"
 #include "../engine/epsilon_analytics.h"
+#include "../lua/epsilon_lua.h"
 
 /* Handlers receive no user pointer; a single server per process. */
 typedef struct {
@@ -54,6 +55,17 @@ void edb_auth_throttle_fail(const char *ip);
 /* Clears the source's failure counter (call on successful auth). */
 void edb_auth_throttle_reset(const char *ip);
 
+/* --- Lua event dispatch (epsilon_api.c) ----------------------------- */
+/* Fires one scripting event against the server-wide engine/config/repl/
+ * cluster. `value` (optional, borrowed) points at the document for
+ * beforeInsert/beforeUpdate flows (before_* events may replace it) or
+ * carries the captured current/deleted document for delete flows. On
+ * EDB_LUA_ROLLBACK *reason receives a malloc'd veto reason. */
+edb_lua_result api_fire_lua(edb_lua_event event, const char *db,
+                            const char *part, const char *ks,
+                            const char *id, cJSON **value,
+                            uint64_t groups, bool trusted, char **reason);
+
 /* --- route handlers (defined across the split files) ---------------- */
 
 /* epsilon_api_data.c: data CRUD */
@@ -99,6 +111,13 @@ bool handle_admin_remove_node(const edb_http_request *req,
 /* epsilon_api_eql.c: SQL-over-HTTP surface */
 bool handle_data_eql(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_eql(const edb_http_request *req, edb_http_response *res);
+
+/* epsilon_api_lua.c: Lua scripting admin surface */
+bool handle_admin_code(const edb_http_request *req, edb_http_response *res);
+bool handle_admin_code_validate(const edb_http_request *req,
+                                edb_http_response *res);
+bool handle_admin_code_item(const edb_http_request *req,
+                            edb_http_response *res);
 
 bool handle_settings(const edb_http_request *req, edb_http_response *res);
 bool handle_status(const edb_http_request *req, edb_http_response *res);

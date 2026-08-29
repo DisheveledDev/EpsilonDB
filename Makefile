@@ -23,7 +23,18 @@ ifeq ($(STATIC),1)
 endif
 
 # Vendored third-party sources (do not modify; see AGENTS.md)
-VENDOR_SRC = vendor/cjson/cJSON.c vendor/sqlite/sqlite3.c
+VENDOR_SRC = vendor/cjson/cJSON.c vendor/sqlite/sqlite3.c \
+             vendor/lua/lapi.c vendor/lua/lauxlib.c vendor/lua/lbaselib.c \
+             vendor/lua/lcode.c vendor/lua/lcorolib.c vendor/lua/lctype.c \
+             vendor/lua/ldblib.c vendor/lua/ldebug.c vendor/lua/ldo.c \
+             vendor/lua/ldump.c vendor/lua/lfunc.c vendor/lua/lgc.c \
+             vendor/lua/linit.c vendor/lua/liolib.c vendor/lua/llex.c \
+             vendor/lua/lmathlib.c vendor/lua/lmem.c vendor/lua/loadlib.c \
+             vendor/lua/lobject.c vendor/lua/lopcodes.c vendor/lua/loslib.c \
+             vendor/lua/lparser.c vendor/lua/lstate.c vendor/lua/lstring.c \
+             vendor/lua/lstrlib.c vendor/lua/ltable.c vendor/lua/ltablib.c \
+             vendor/lua/ltm.c vendor/lua/lundump.c vendor/lua/lutf8lib.c \
+             vendor/lua/lvm.c vendor/lua/lzio.c
 
 ENGINE_SRC = src/engine/md5.c src/engine/sha256.c src/engine/random.c \
              src/engine/epsilon_crypto.c src/engine/shard.c \
@@ -48,20 +59,24 @@ CLUSTER_SRC = src/socket/epsilon_cluster.c src/socket/estp_wire.c \
 REPL_SRC = src/socket/epsilon_repl.c src/socket/epsilon_repl_cache.c \
            src/socket/epsilon_repl_read.c
 
-# EQL module (stage 8)
+# EQL module
 EQL_SRC = src/eql/epsilon_eql.c
+
+# Lua scripting engine
+LUA_SRC = src/lua/epsilon_lua.c
 
 TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \
            tests/test_http.c tests/test_replication.c \
            tests/test_structure.c tests/test_snapshot.c tests/test_delta.c \
            tests/test_rebalance.c tests/test_join.c tests/test_chaos.c \
            tests/test_console.c tests/test_eql.c \
-           tests/test_eql_api.c
+           tests/test_eql_api.c tests/test_lua.c tests/test_lua_api.c
 TEST_BINS = tests/test_crypto tests/test_engine tests/test_config \
             tests/test_http tests/test_cluster tests/test_replication \
             tests/test_structure tests/test_snapshot tests/test_delta \
             tests/test_rebalance tests/test_join tests/test_chaos \
-            tests/test_console tests/test_eql tests/test_eql_api
+            tests/test_console tests/test_eql tests/test_eql_api \
+            tests/test_lua tests/test_lua_api
 .PHONY: all test clean
 
 all: $(SERVER_BIN) $(CLI_BIN) $(BACKUP_BIN) $(BENCH_BIN) $(EQL_BIN)
@@ -72,16 +87,16 @@ $(ENGINE_LIB): $(ENGINE_OBJ)
 API_SRC = src/api/epsilon_api.c src/api/epsilon_api_data.c \
           src/api/epsilon_api_admin.c src/api/epsilon_api_cluster.c \
           src/api/epsilon_api_settings.c src/api/epsilon_api_console.c \
-          src/api/epsilon_api_eql.c
+          src/api/epsilon_api_eql.c src/api/epsilon_api_lua.c
 
 $(SERVER_BIN): src/epsilond.c $(API_SRC) src/httpd/epsilon_http.c \
-               $(CLUSTER_SRC) $(REPL_SRC) \
+               $(CLUSTER_SRC) $(REPL_SRC) $(LUA_SRC) \
                src/socket/epsilon_snap.c src/admin/admin_console.o \
                src/api/version.h $(ENGINE_LIB)
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/epsilond.c $(API_SRC) \
 		src/httpd/epsilon_http.c $(CLUSTER_SRC) \
-		$(REPL_SRC) $(EQL_SRC) src/socket/epsilon_snap.c \
+		$(REPL_SRC) $(EQL_SRC) $(LUA_SRC) src/socket/epsilon_snap.c \
 		src/admin/admin_console.o \
 		$(ENGINE_SRC:.c=.o) \
 		$(filter %.o,$(VENDOR_SRC:.c=.o)) $(LDFLAGS) $(STATIC_LDFLAGS) \
@@ -119,6 +134,11 @@ $(BACKUP_BIN): src/epsilonbkup.c src/epsilonbkup_http.c src/api/version.h \
 vendor/sqlite/sqlite3.o: vendor/sqlite/sqlite3.c
 	$(CC) -std=c11 -w -O2 -c -o $@ $<
 
+# Lua is a C89 codebase; build it with C11 relaxed the same way so its
+# implicit-int/prototype-legacy code compiles cleanly under our default flags.
+vendor/lua/%.o: vendor/lua/%.c
+	$(CC) -std=c11 -w -O2 -c -o $@ $<
+
 # The embedded admin console is a single long string literal; relax the
 # C99 4095-byte string-literal warning for it.
 src/admin/admin_console.o: src/admin/admin_console.c
@@ -127,12 +147,13 @@ src/admin/admin_console.o: src/admin/admin_console.c
 test: all $(TEST_BINS)
 	mkdir -p tests/data
 	./tests/test_crypto && ./tests/test_engine && ./tests/test_config \
-		&& ./tests/test_eql && ./tests/test_http_run.sh \
+		&& ./tests/test_eql && ./tests/test_lua \
+		&& ./tests/test_http_run.sh \
 		&& ./tests/test_cluster && ./tests/test_replication \
 		&& ./tests/test_structure && ./tests/test_snapshot \
 		&& ./tests/test_delta && ./tests/test_rebalance \
 		&& ./tests/test_join_run.sh && ./tests/test_chaos \
-		&& ./tests/test_console_run.sh
+		&& ./tests/test_console_run.sh && ./tests/test_lua_apirun.sh
 
 tests/test_crypto: tests/test_crypto.c $(ENGINE_LIB)
 	$(CC) $(CFLAGS) -o $@ $< -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
@@ -188,8 +209,15 @@ tests/test_eql_api: tests/test_eql_api.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 tests/test_eql: tests/test_eql.c $(ENGINE_LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(EQL_SRC) $(REPL_SRC) $(CLUSTER_SRC) \
+	$(CC) $(CFLAGS) -o $@ $< $(EQL_SRC) $(LUA_SRC) $(REPL_SRC) $(CLUSTER_SRC) \
 		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
+
+tests/test_lua: tests/test_lua.c $(ENGINE_LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LUA_SRC) $(REPL_SRC) $(CLUSTER_SRC) \
+		src/socket/epsilon_snap.c -Lbin -lepsilon $(LDFLAGS) $(LDLIBS)
+
+tests/test_lua_api: tests/test_lua_api.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -rf bin

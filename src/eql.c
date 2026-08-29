@@ -1,4 +1,4 @@
-/* eql.c - Epsilon Query Language console (stage 8, milestone eql-e).
+/* eql.c - Epsilon Query Language console.
  *
  * Thin REPL front-end for the EQL engine exposed by epsilond:
  *   - connects like epsilonctl: local admin socket by default (-s to

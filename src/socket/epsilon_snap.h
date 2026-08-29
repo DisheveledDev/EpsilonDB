@@ -1,4 +1,4 @@
-/* epsilon_snap.h - stage 6b shard snapshot transfer.
+/* epsilon_snap.h - shard snapshot transfer.
  *
  * Moves a consistent copy of one shard file between nodes:
  *   - edb_snap_fetch dials a peer, requests the shard identified by its

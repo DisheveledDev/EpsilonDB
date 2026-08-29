@@ -1,4 +1,4 @@
-/* Stage 6e end-to-end test: a real node joins a running cluster through
+/* End-to-end join test: a real node joins a running cluster through
  * POST /admin/join (HTTP), receives the shards the new target structure
  * assigns to it, reports compliance, and the leader promotes the wave.
  *

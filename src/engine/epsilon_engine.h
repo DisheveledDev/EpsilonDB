@@ -44,7 +44,7 @@ void edb_engine_close(edb_engine *mgr);
  * touch shard files directly, e.g. snapshot transfer). */
 const char *edb_engine_path(edb_engine *mgr);
 
-/* --- stage 6b: shard snapshot support --------------------------------- */
+/* --- shard snapshot support ------------------------------------------- */
 
 /* Fills path_out with the shard file path for partition/keyspace
  * (the framed partition/keyspace digest under the store root) and key_out
@@ -70,7 +70,7 @@ bool edb_shard_is_open(edb_engine *mgr, const char *partition,
 bool edb_shard_validate(edb_engine *mgr, const char *partition,
                         const char *keyspace);
 
-/* --- stage 6d: shard GC ------------------------------------------------ */
+/* --- shard GC ---------------------------------------------------------- */
 
 /* Fills keys[] with up to cap 32-char md5 shard keys present on disk in
  * the store root. Returns the number written. */
@@ -114,7 +114,7 @@ bool edb_filters_valid(const cJSON *filters);
 bool edb_force_cleanup(edb_engine *mgr, const char *partition,
                        const char *keyspace);
 
-/* --- stage 5: replication-aware variants ------------------------------ */
+/* --- replication-aware variants --------------------------------------- */
 
 /* Apply a replicated write carrying an explicit origin timestamp.
  * Last-write-wins: the write is skipped when the locally stored row (if

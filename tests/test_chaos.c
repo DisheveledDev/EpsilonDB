@@ -1,4 +1,4 @@
-/* test_chaos.c - stage 7: multi-node chaos/failure integration test.
+/* test_chaos.c - multi-node chaos/failure integration test.
  *
  * Spawns three real epsilond processes (fork/exec), joins them into one
  * cluster through the HTTP admin API and then fails nodes with SIGKILL

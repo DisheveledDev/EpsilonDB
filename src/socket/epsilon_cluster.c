@@ -280,7 +280,7 @@ static bool merge_state(edb_cluster *cl, const cJSON *doc)
         }
     }
 
-    /* stage 6: pending target table merges independently */
+    /* pending target table merges independently */
     const cJSON *jt = cJSON_GetObjectItemCaseSensitive(doc, "target");
     const cJSON *jtgen =
         cJSON_GetObjectItemCaseSensitive(jt, "generation");
@@ -339,7 +339,7 @@ static bool merge_state(edb_cluster *cl, const cJSON *doc)
             }
         }
     } else if (cl->target_generation > 0) {
-        /* stage 6e: the leader gossips state with no pending target
+        /* the leader gossips state with no pending target
          * while we still hold one: the wave was voided (failed join).
          * Only the current leader may clear our copy so a lagging
          * node's stale gossip cannot kill a fresh wave. */
@@ -653,7 +653,7 @@ static void leader_react(edb_cluster *cl, bool changed)
         edb_cluster_acquire_rebalance_lock(cl);
     }
 
-    /* stage 6d: once every node reports compliance the leader promotes
+    /* once every node reports compliance the leader promotes
      * automatically (the data migration steps happen via 6c catch-up) */
     if (am_leader && target_generation > 0) {
         edb_cluster_maybe_promote(cl);
@@ -733,7 +733,7 @@ static void *conn_thread(void *arg)
                          jid->valuestring);
                 is_self = strcmp(c->node_id, cl->self_id) == 0;
             }
-            /* stage 6a: one node may join at a time. A brand-new node
+            /* one node may join at a time. A brand-new node
              * dialling in while a rebalance wave is pending is refused:
              * reply with a rejecting HELLO and hang up without
              * registering it. Known peers (redials, restarts), our own
@@ -900,7 +900,7 @@ static void *conn_thread(void *arg)
             recompute_leader(cl);
             pthread_mutex_unlock(&cl->lock);
         } else if (t == ESTP_SNAP_REQ) {
-            /* stage 6b/6c: shard snapshot request. Served directly
+            /* shard snapshot request. Served directly
              * (not via the dispatcher) so the engine behind the config
              * store streams a consistent copy; runs without cl->lock
              * held because it blocks on SQLite + socket I/O. */
@@ -911,7 +911,7 @@ static void *conn_thread(void *arg)
                            payload ? (uint32_t)strlen(payload) : 0,
                            payload, edb_config_engine(cl->cfg));
         } else if (t == ESTP_VOID) {
-            /* stage 6e: rollback request. Only the leader acts; the
+            /* rollback request. Only the leader acts; the
              * reply tells the requester whether a wave was voided. */
             pthread_mutex_lock(&cl->lock);
             c->last_recv = epoch_now();
@@ -1234,7 +1234,7 @@ static void maintainer_tick(edb_cluster *cl)
 
     edb_cluster_maybe_promote(cl);
 
-    /* stage 6e: auto-compliance. A node that already holds everything
+    /* auto-compliance. A node that already holds everything
      * the pending target assigns to it reports compliance without
      * waiting for an explicit API call; the joiner's catch-up flow
      * disables this until its snapshots have landed. */
