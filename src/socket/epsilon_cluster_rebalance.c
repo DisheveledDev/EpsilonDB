@@ -1,4 +1,4 @@
-/* epsilon_cluster_rebalance.c - stage 6 rebalancing: live/target
+/* epsilon_cluster_rebalance.c - rebalancing: live/target
  * structure versions, the leader-held rebalance lock, per-node compliance,
  * target promotion, redundant-shard GC and the join/remove flows.
  * Part of the cluster module; see epsilon_cluster_internal.h.
@@ -350,7 +350,7 @@ void edb_cluster_mark_compliant(edb_cluster *cl)
     }
     pthread_mutex_unlock(&cl->lock);
 
-    /* keep the persisted flag for crash recovery / stage 6a compat */
+    /* keep the persisted flag for crash recovery */
     char name[96];
     char val[32];
     snprintf(name, sizeof(name), "%s%.63s", SETTING_DONE_PREFIX,
@@ -363,7 +363,7 @@ void edb_cluster_mark_compliant(edb_cluster *cl)
     gossip_state(cl);
 }
 
-/* --- stage 6d: promotion trigger + shard GC -------------------------- */
+/* --- promotion trigger + shard GC ------------------------------------ */
 
 /* Leader-only: promote the pending target when every online node has
  * reported compliance. Safe to call from any thread (takes the lock).
@@ -517,7 +517,7 @@ void edb_cluster_release_rebalance_lock(edb_cluster *cl)
     edb_setting_delete(cl->cfg, SETTING_LOCK);
 }
 
-/* --- stage 6e: end-to-end rebalance wiring ---------------------------- */
+/* --- end-to-end rebalance wiring -------------------------------------- */
 
 bool edb_cluster_needs_sync(edb_cluster *cl)
 {

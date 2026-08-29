@@ -47,7 +47,7 @@ struct edb_repl {
     bool running;
     pthread_t maint_thread;
 
-    /* stage 6c: syncing gate (see edb_repl_set_syncing) */
+    /* syncing gate (see edb_repl_set_syncing) */
     pthread_mutex_t sync_lock;
     bool syncing;
 

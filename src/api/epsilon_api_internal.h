@@ -55,7 +55,7 @@ void edb_auth_throttle_fail(const char *ip);
 /* Clears the source's failure counter (call on successful auth). */
 void edb_auth_throttle_reset(const char *ip);
 
-/* --- stage 9: Lua event dispatch (epsilon_api.c) -------------------- */
+/* --- Lua event dispatch (epsilon_api.c) ----------------------------- */
 /* Fires one scripting event against the server-wide engine/config/repl/
  * cluster. `value` (optional, borrowed) points at the document for
  * beforeInsert/beforeUpdate flows (before_* events may replace it) or
@@ -112,7 +112,7 @@ bool handle_admin_remove_node(const edb_http_request *req,
 bool handle_data_eql(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_eql(const edb_http_request *req, edb_http_response *res);
 
-/* epsilon_api_lua.c: Lua scripting admin surface (stage 9) */
+/* epsilon_api_lua.c: Lua scripting admin surface */
 bool handle_admin_code(const edb_http_request *req, edb_http_response *res);
 bool handle_admin_code_validate(const edb_http_request *req,
                                 edb_http_response *res);

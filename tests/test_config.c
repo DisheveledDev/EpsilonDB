@@ -1,4 +1,4 @@
-/* Tests for the EpsilonDB system configuration layer (stage 2). */
+/* Tests for the EpsilonDB system configuration layer. */
 
 #include <stdio.h>
 #include <stdlib.h>

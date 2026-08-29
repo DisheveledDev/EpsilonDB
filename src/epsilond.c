@@ -9,7 +9,7 @@
  * The HTTP port serves client REST traffic (authenticated). The Unix
  * domain admin socket serves local management traffic (epsilonctl): no
  * authentication, full admin rights. With -n the node also serves its
- * raw peer socket and joins/forms a cluster mesh (stage 4).
+ * raw peer socket and joins/forms a cluster mesh.
  */
 
 #include <signal.h>
@@ -243,7 +243,7 @@ int main(int argc, char **argv)
             }
         }
 
-        /* stage 5 replication on top of the mesh */
+        /* replication on top of the mesh */
         repl = edb_repl_start(cluster, config, data_dir);
         if (!repl) {
             edb_log("ERROR", "failed to start replication service");

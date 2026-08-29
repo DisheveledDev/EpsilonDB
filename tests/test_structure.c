@@ -1,4 +1,4 @@
-/* test_structure.c - stage 6a tests: live/target structure versioning.
+/* test_structure.c - tests: live/target structure versioning.
  * Covers: target publication on join, identical convergence of the
  * target tables across nodes, persistence of the pending target,
  * promotion gating on per-node compliance, promotion clearing the
@@ -240,7 +240,7 @@ static void test_two_node_wave_lock_and_promotion(void)
     char done_name[96];
     snprintf(done_name, sizeof(done_name), DONE_PREFIX"%.63s", other_id);
     CHECK(edb_setting_set(leader_cfg, done_name, val));
-    /* stage 6d: the maintainer auto-promotes once compliance is fully
+    /* the maintainer auto-promotes once compliance is fully
      * visible to the leader, so the wave may already be promoted by now
      * (pending target cleared). Promote explicitly only if still pending. */
     if (edb_cluster_target_generation(leader) != 0) {

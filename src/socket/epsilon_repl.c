@@ -1,9 +1,9 @@
-/* epsilon_repl.c - stage 5 replication implementation. See epsilon_repl.h.
+/* epsilon_repl.c - replication implementation. See epsilon_repl.h.
  *
  * Transport: every fan-out message uses its own short-lived peer
  * connection (dial, HELLO, payload frame, reply frame, close). This
  * keeps the data plane off the mesh connection objects, whose lifecycle
- * is owned by the stage 4 reader threads. Inbound REPL/QUERY frames on
+ * is owned by the mesh reader threads. Inbound REPL/QUERY frames on
  * mesh connections are answered through the dispatcher hook installed
  * by edb_repl_start, so both transports work.
  *
@@ -169,7 +169,7 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
     }
 
     if (msg_type == ESTP_REPL && rp && rp->apply) {
-        /* stage 6c: while this node is syncing shard snapshots, refuse
+        /* while this node is syncing shard snapshots, refuse
          * incoming writes so the sender caches them for later replay */
         pthread_mutex_lock(&rp->sync_lock);
         bool syncing = rp->syncing;
@@ -192,7 +192,7 @@ static bool repl_dispatch(void *ctx, int msg_type, const char *payload,
     }
 
     if (msg_type == ESTP_FLUSH && rp) {
-        /* stage 6c: a peer asks us to flush our cached changes for it.
+        /* a peer asks us to flush our cached changes for it.
          * Drain synchronously and report how many remain. */
         const cJSON *jt =
             cJSON_GetObjectItemCaseSensitive(req, "target");

@@ -1,5 +1,5 @@
 /* epsilon_api_lua.c - HTTP admin surface for the Lua scripting engine
- * (stage 9). Management endpoints for function records, all gated by
+ * Management endpoints for function records, all gated by
  * admin auth:
  *
  *   GET    /admin/code[?type=function|action]   list records

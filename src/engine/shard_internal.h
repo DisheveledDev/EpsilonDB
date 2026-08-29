@@ -50,7 +50,7 @@ bool edb_shard_cleanup(edb_shard *sh);
 bool edb_shard_vacuum(edb_shard *sh);
 bool edb_shard_reindex(edb_shard *sh);
 
-/* stage 5: replication-aware variants (see epsilon_engine.h) */
+/* replication-aware variants (see epsilon_engine.h) */
 bool edb_shard_replica_put(edb_shard *sh, const char *id,
                            const char *json_value, long long ttl_absolute,
                            long long timestamp, const char *origin);

@@ -1,4 +1,4 @@
-/* test_snapshot.c - stage 6b tests: shard snapshot transfer between two
+/* test_snapshot.c - tests: shard snapshot transfer between two
  * in-process nodes. Populates shards on node A, transfers them to node
  * B over the ESTP snapshot protocol, and verifies byte-equivalent row
  * contents plus the engine invalidate/reopen path. Plain assert-style

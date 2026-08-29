@@ -1,4 +1,4 @@
-/* Integration tests for the Lua scripting admin surface (stage 9).
+/* Integration tests for the Lua scripting admin surface.
  *
  * Driven by tests/test_lua_apirun.sh, which starts a throwaway epsilond
  * and passes the port as argv[1]. Covers: admin auth on /admin/code,

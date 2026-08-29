@@ -1,4 +1,4 @@
-/* epsilon_lua.h - embedded Lua scripting engine (stage 9).
+/* epsilon_lua.h - embedded Lua scripting engine.
  *
  * Administrators attach Lua functions to database events. Scripts live
  * in the system database (config_code keyspace) and replicate to every

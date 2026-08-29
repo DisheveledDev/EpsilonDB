@@ -1,4 +1,4 @@
-/* test_replication.c - stage 5 tests: three in-process nodes form a
+/* test_replication.c - tests: three in-process nodes form a
  * mesh, writes fan out to all peers, quorum reads compare copies,
  * changes made while a peer is down are cached and replayed when it
  * returns, and writes below the replication-factor quorum are rejected.

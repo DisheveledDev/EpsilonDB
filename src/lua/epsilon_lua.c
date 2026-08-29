@@ -1,4 +1,4 @@
-/* epsilon_lua.c - embedded Lua scripting engine (stage 9).
+/* epsilon_lua.c - embedded Lua scripting engine.
  *
  * See epsilon_lua.h for the execution model. This file implements the
  * sandboxed runtime, the scripting standard library, JSON <-> Lua

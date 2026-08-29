@@ -1,4 +1,4 @@
-/* test_rebalance.c - stage 6d tests: target promotion + shard GC.
+/* test_rebalance.c - tests: target promotion + shard GC.
  *
  * Covers, on top of 6a/6c:
  *   - gossip-based compliance: a node marking itself compliant is visible

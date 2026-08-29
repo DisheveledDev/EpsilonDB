@@ -1,4 +1,4 @@
-/* epsilon_cluster.h - stage 4 cluster mesh: membership, hash-range
+/* epsilon_cluster.h - cluster mesh: membership, hash-range
  * placement registry, leader election, and the raw peer socket layer.
  *
  * Design (see AGENTS.md):
@@ -44,7 +44,7 @@ typedef struct {
     bool online;              /* mesh connection alive */
     bool removed;             /* tombstoned: permanently out of the cluster
                                * until explicitly re-joined */
-    long long compliant_gen;  /* stage 6d: highest target gen this node
+    long long compliant_gen;  /* highest target gen this node
                                * has reported compliance for (0 = none) */
 } edb_peer_info;
 
@@ -85,7 +85,7 @@ long long edb_cluster_generation(edb_cluster *cl);
 /* Snapshot of range assignments. */
 size_t edb_cluster_ranges(edb_cluster *cl, edb_range_info *out, size_t cap);
 
-/* Snapshot of the TARGET range assignments (stage 6 rebalancing), or 0
+/* Snapshot of the TARGET range assignments (rebalancing), or 0
  * when no rebalance is pending. Target generation > 0 means the cluster
  * is mid-rebalance: nodes must converge on the target before it is
  * promoted to live. */
@@ -123,7 +123,7 @@ bool edb_cluster_remove_node(edb_cluster *cl, const char *node_id);
 void edb_cluster_set_dispatcher(edb_cluster *cl, estp_dispatch_fn fn,
                                 void *ctx);
 
-/* --- stage 6: rebalancing support ------------------------------------- */
+/* --- rebalancing support ---------------------------------------------- */
 
 /* Leader-only: computes a TARGET range table over the current online
  * membership (generation = live generation + 1) when the online member
@@ -151,7 +151,7 @@ bool edb_cluster_acquire_rebalance_lock(edb_cluster *cl);
 /* Releases the global rebalance lock (leader, after promotion). */
 void edb_cluster_release_rebalance_lock(edb_cluster *cl);
 
-/* --- stage 6d: promotion trigger + shard GC --------------------------- */
+/* --- promotion trigger + shard GC ------------------------------------- */
 
 /* Leader-only: promote the pending target if every online node reports
  * compliance. Returns true when a promotion happened. */
@@ -162,7 +162,7 @@ bool edb_cluster_maybe_promote(edb_cluster *cl);
  * never removed. Returns the number GC'd (0 or 1). */
 size_t edb_cluster_gc_redundant(edb_cluster *cl);
 
-/* --- stage 6e: end-to-end rebalance wiring ---------------------------- */
+/* --- end-to-end rebalance wiring -------------------------------------- */
 
 /* True when this node still lacks data for a non-system shard the
  * pending target assigns to it (target owner is self, live owner is

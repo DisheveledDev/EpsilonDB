@@ -1,4 +1,4 @@
-/* Integration tests for the stage 3 REST API.
+/* Integration tests for the REST API.
  * Starts a real epsilond instance on an ephemeral port and talks HTTP over
  * real sockets. */
 

@@ -1,8 +1,8 @@
-/* epsilon_eql.c - EQL execution engine (stage 8, milestone eql-a).
+/* epsilon_eql.c - EQL execution engine.
  *
  * See epsilon_eql.h for the overview. This file implements the SELECT
  * path: FROM-reference scanning, shard materialization, SQL rewriting,
- * and JSON result serialization. DML replication arrives with eql-c.
+ * and JSON result serialization. DML replication arrives with the write-back path.
  */
 
 #include "epsilon_eql.h"
@@ -75,7 +75,7 @@ typedef struct {
 } eql_rowmap;
 
 /* Per-execution authorizer state: DML is allowed on shard-backed tables
- * for exactly one action class; everything else keeps the eql-b policy. */
+ * for exactly one action class; everything else keeps the hardening policy. */
 typedef struct {
     const eql_table *tables;
     size_t ntables;
@@ -1433,7 +1433,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         return -1;
     }
 
-    /* stage 9: classify the write before applying it (after_* scripts
+    /* classify the write before applying it (after_* scripts
      * distinguish inserts from updates; the delete handler receives the
      * record that was removed) */
     cJSON *existing = ctx->engine ? edb_get(ctx->engine, t->part, ks, id)
@@ -1477,7 +1477,7 @@ static int replicate_record(const edb_eql_ctx *ctx, const eql_table *t,
         edb_partition_ensure(ctx->config, t->db, t->part, ks, NULL);
     }
     if (code == 200 && strcmp(t->db, EDB_SYSTEM_DB) != 0 && !ctx->repl) {
-        /* stage 9: EQL writes fire after_* scripts (trusted: scripts
+        /* EQL writes fire after_* scripts (trusted: scripts
          * authored by admins run with full rights); best-effort only.
          * With replication attached the local apply already fired the
          * event once per node, so only the single-node path fires. */

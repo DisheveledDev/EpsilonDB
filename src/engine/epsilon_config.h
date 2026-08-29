@@ -159,7 +159,7 @@ typedef enum {
 bool edb_check_perm(uint64_t mask, uint64_t user_groups,
                     edb_permission perm);
 
-/* --- code store (stage 9: Lua function records) ----------------------- */
+/* --- code store (Lua function records) -------------------------------- */
 
 /* All code records live in the reserved config_code keyspace of
  * __system__ (see CFG_KEYSPACE_CODE), so they replicate to every node
@@ -209,7 +209,7 @@ bool edb_config_is_system_key(edb_config *cfg, const char key[33]);
 
 /* Fills `out` (up to `cap` entries) with the reserved __system__ config
  * keyspace names (in stable order) and returns the count. Used by the
- * stage 6e join flow to snapshot config shards onto a joining node. */
+ * join flow to snapshot config shards onto a joining node. */
 size_t edb_config_system_keyspaces(const char **out, size_t cap);
 
 #endif

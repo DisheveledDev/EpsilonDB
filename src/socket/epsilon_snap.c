@@ -1,4 +1,4 @@
-/* epsilon_snap.c - stage 6b shard snapshot transfer. See epsilon_snap.h.
+/* epsilon_snap.c - shard snapshot transfer. See epsilon_snap.h.
  *
  * Transport: a dedicated short-lived peer connection per snapshot,
  * mirroring the replication layer's one-shot RPC style:

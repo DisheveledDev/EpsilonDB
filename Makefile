@@ -59,10 +59,10 @@ CLUSTER_SRC = src/socket/epsilon_cluster.c src/socket/estp_wire.c \
 REPL_SRC = src/socket/epsilon_repl.c src/socket/epsilon_repl_cache.c \
            src/socket/epsilon_repl_read.c
 
-# EQL module (stage 8)
+# EQL module
 EQL_SRC = src/eql/epsilon_eql.c
 
-# Lua scripting engine (stage 9)
+# Lua scripting engine
 LUA_SRC = src/lua/epsilon_lua.c
 
 TEST_SRC = tests/test_crypto.c tests/test_engine.c tests/test_config.c \

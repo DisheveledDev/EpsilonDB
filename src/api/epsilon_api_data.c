@@ -56,7 +56,7 @@ bool handle_data_put(const edb_http_request *req,
         return true;
     }
 
-    /* stage 9: beforeInsert/beforeUpdate scripts may replace the
+    /* beforeInsert/beforeUpdate scripts may replace the
      * document (returned entity) or veto the write (scripts never run
      * for __system__ config writes) */
     {
@@ -142,7 +142,7 @@ bool handle_data_put(const edb_http_request *req,
         respond_error(res, 500, "storage failed");
         return true;
     }
-    /* stage 9: afterInsert/afterUpdate scripts are best-effort and never
+    /* afterInsert/afterUpdate scripts are best-effort and never
      * block. With a repl service attached the local apply already fired
      * the event (once per node, trusted), so only the single-node path
      * fires here. */
@@ -224,7 +224,7 @@ bool handle_data_delete(const edb_http_request *req,
         return true;
     }
 
-    /* stage 9: before_delete scripts may veto the delete. The current
+    /* before_delete scripts may veto the delete. The current
      * document is captured once and handed to both handlers (the
      * before_* handler receives the entity, the after_* handler sees
      * what was deleted). */
@@ -294,7 +294,7 @@ bool handle_data_delete(const edb_http_request *req,
         respond_error(res, 500, "delete failed");
         return true;
     }
-    /* stage 9: after_delete scripts are best-effort and never block; the
+    /* after_delete scripts are best-effort and never block; the
      * local apply already fired the event when replication is attached */
     if (!g_repl) {
         char *veto = NULL;

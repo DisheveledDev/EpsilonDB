@@ -1,4 +1,4 @@
-/* Tests for the Lua scripting engine (stage 9): sandbox validation,
+/* Tests for the Lua scripting engine: sandbox validation,
  * config code storage, action dispatch by naming convention, the
  * insert/update split, return-based write-back, rollback veto, stdlib
  * data ops, and transient state isolation. */

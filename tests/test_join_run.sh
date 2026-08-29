@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stage 6e end-to-end: spawns a seed node and a joiner as real epsilond
+# End-to-end: spawns a seed node and a joiner as real epsilond
 # processes, then drives the join through the HTTP admin API.
 set -e
 cd "$(dirname "$0")/.."

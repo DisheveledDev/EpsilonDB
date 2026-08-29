@@ -1,4 +1,4 @@
-/* test_cluster.c - stage 4 mesh tests: two in-process nodes discover
+/* test_cluster.c - mesh tests: two in-process nodes discover
  * each other, agree on leader and generation, and the placement table
  * covers the hash space. Plain assert-style harness like test_engine. */
 
@@ -51,7 +51,7 @@ static bool converged(void *ctx)
         return false;
     }
 
-    /* stage 6: with a pending target, the live tables legitimately
+    /* with a pending target, the live tables legitimately
      * differ (each node still owns the full space from when it was
      * alone) until the rebalance service promotes the target. The mesh
      * itself only needs to converge on membership and the target view. */
@@ -161,7 +161,7 @@ static void test_two_node_mesh(const char *dir)
     CHECK(lb && strcmp(lb, expected) == 0);
 
     /* both sides agree on the range table: 2 contiguous slices. With
-     * stage 6 the joined node lands in the TARGET table until the
+     * the joined node lands in the TARGET table until the
      * rebalance service promotes it; live may still show 1 slice. The
      * invariant tested here is that both nodes hold identical views of
      * whichever tables exist (already checked by converged()), and

@@ -32,7 +32,7 @@ bool handle_admin_cluster(const edb_http_request *req,
         cJSON_AddStringToObject(o, "leader", leader ? leader : "none");
         cJSON_AddBoolToObject(o, "is_leader",
                               edb_cluster_is_leader(g_cluster));
-        /* stage 6e: live/target structure versions, rebalance lock state
+        /* live/target structure versions, rebalance lock state
          * and per-node compliance for observability */
         long long tgen = edb_cluster_target_generation(g_cluster);
         cJSON_AddNumberToObject(o, "generation",
@@ -590,7 +590,7 @@ bool handle_admin_join(const edb_http_request *req,
     }
     respond_json(res, 200, NULL);
 
-    /* --- stage 6e: run the full rebalance flow for this node -------- */
+    /* --- run the full rebalance flow for this node ------------------ */
     /* Snapshot the reserved config shards first so lists/auth/settings
      * work here, then wait for the leader to publish the target and
      * snapshot every data shard the wave assigns to us. While that runs,

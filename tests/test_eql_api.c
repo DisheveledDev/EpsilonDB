@@ -1,4 +1,4 @@
-/* Integration tests for the EQL HTTP surface (stage 8, milestone eql-d).
+/* Integration tests for the EQL HTTP surface.
  *
  * Driven by tests/test_eql_apirun.sh, which starts a throwaway epsilond
  * and passes the port as argv[1]. Covers: auth required once bootstrapped,

@@ -819,4 +819,4 @@ cJSON *edb_repl_read_query_meta(edb_repl *rp, const char *db,
 }
 
 /* ------------------------------------------------------------------ */
-/* stage 6c: delta catch-up                                            */
+/* delta catch-up                                                      */

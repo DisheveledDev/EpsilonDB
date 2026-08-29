@@ -15,7 +15,7 @@ trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 
 ./tests/test_eql_api "$PORT"
 
-# ---- eql console (eql-e) ----
+# ---- eql console ----
 SOCK="$DATA/epsilon-admin.sock"
 ls -la /tmp >/dev/null   # noop to keep set -e happy between blocks
 
@@ -31,7 +31,7 @@ echo "$out" | grep -q "row inserted" || { echo "eql insert failed: $out"; exit 1
 out=$(bin/eql -s "$SOCK" 'SELECT name FROM app.people.employees WHERE id = '"'"'zz1'"'"'' | tail -2 | head -1)
 echo "$out" | grep -q "Zed" || { echo "eql read-back failed: $out"; exit 1; }
 
-# ---- partition-wide reference (eql-f): db.partition with no keyspace ----
+# ---- partition-wide reference: db.partition with no keyspace ----
 out=$(bin/eql -s "$SOCK" 'SELECT COUNT(*) FROM app.people')
 echo "$out" | grep -q "(1 row)" || { echo "eql partition-wide select failed: $out"; exit 1; }
 

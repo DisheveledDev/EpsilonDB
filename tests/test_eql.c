@@ -1,4 +1,4 @@
-/* Tests for the Epsilon Query Language engine (stage 8, milestone eql-a).
+/* Tests for the Epsilon Query Language engine.
 
  *
 
@@ -755,7 +755,7 @@ static char *stored_json(const edb_eql_ctx *ctx, const char *id,
 /* Full DML replay: delete -> update -> insert -> rename -> rollback. */
 /* Full DML replay: delete -> update -> insert -> rename -> rollback. */
 
-/* eql-c DML replay tests; see epsilon_eql.c hooks + process_events() */
+/* DML replay tests; see epsilon_eql.c hooks + process_events() */
 static void test_write_back(const edb_eql_ctx *ctx)
 {
     char *out = NULL;
@@ -975,7 +975,7 @@ static void test_classification_and_refs(void)
     CHECK(n == 0);
 }
 
-/* eql-f: partition-wide (db.partition) references merge every keyspace
+/* partition-wide (db.partition) references merge every keyspace
  * of the partition into one shadow table; DML routes each row back to
  * its owning keyspace through the row map. Uses a private engine so the
  * mutations below cannot pollute the shared-seed tests. */
@@ -1088,7 +1088,7 @@ static void test_partition_wide(void)
     edb_engine_close(ctx.engine);
 }
 
-/* eql-g: schema-assigning DML. UPDATE assignment targets (and INSERT
+/* schema-assigning DML. UPDATE assignment targets (and INSERT
  * column lists) are pre-declared as shadow-table columns, so a write can
  * introduce a JSON key no fetched document has yet; the assigned value
  * lands in the stored document on write-back. Uses a private engine. */

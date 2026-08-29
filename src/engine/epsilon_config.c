@@ -277,7 +277,7 @@ char **edb_setting_list(edb_config *cfg, size_t *count_out)
     return names;
 }
 
-/* --- code store (stage 9: Lua libraries + event triggers) -------------- */
+/* --- code store (Lua function records) --------------------------------- */
 
 bool edb_code_save(edb_config *cfg, const char *name, cJSON *record)
 {
